@@ -168,6 +168,19 @@ fn parse_error_is_exit_3() {
 }
 
 #[test]
+fn deep_nesting_is_a_parse_error() {
+    // §1.4: however deep the input, the process exits 3 with one `j:` line
+    // rather than aborting on a stack overflow in the parser
+    let r = setup();
+    let n = 100_000;
+    for src in [format!("{}1{}", "(".repeat(n), ")".repeat(n)), "[".repeat(n)] {
+        let out = r.j_stdin(&src, &[]);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(out.stderr.starts_with("j: ") && out.stderr.lines().count() == 1, "{}", out.stderr);
+    }
+}
+
+#[test]
 fn crash_is_exit_1_with_trace() {
     let r = setup();
     let out = r.j(&["crash \"boom\""]);

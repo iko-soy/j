@@ -294,6 +294,9 @@ Notes:
   Records keep commas.
 - Lambda, `if`, `let`, and `or` extend as far right as possible.
 - Patterns are variables and `_` only. No literal, list, or record patterns.
+- Nesting is bounded: input nested deeper than the parser allows (thousands
+  of levels of brackets, `\`/`if`/`let` bodies, or right-associative operator
+  chains) is a parse error, never a stack overflow.
 
 ---
 

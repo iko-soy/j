@@ -294,3 +294,50 @@ fn render_roundtrip_simple_exprs() {
         assert_eq!(render_expr(&e2), rendered, "for {:?}", src);
     }
 }
+
+/// Run `f` on a thread with the binary's worker stack (main.rs): the parser's
+/// depth bound is sized against that stack, not the test harness's default.
+fn on_worker_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
+    // §1.4: bad input exits 3 with one `j:` line. The parser is recursive
+    // descent, so it bounds its depth rather than overflow the stack.
+    on_worker_stack(|| {
+        let n = 100_000;
+        for src in [
+            format!("{}1{}", "(".repeat(n), ")".repeat(n)),
+            "(".repeat(n),
+            format!("{}{}", "[".repeat(n), "]".repeat(n)),
+            format!("{}1{}", "{ a = ".repeat(n), " }".repeat(n)),
+            format!("x{}", " { a = x".repeat(n)),
+            format!("{}1{}", "(+ ".repeat(n), ")".repeat(n)),
+            format!("{}1", "\\x -> ".repeat(n)),
+            format!("{}1", "if true then 1 else ".repeat(n)),
+            format!("{}1", "let a = 1 in ".repeat(n)),
+            format!("{}[]", "1 :: ".repeat(n)),
+            format!("{}true", "true or ".repeat(n)),
+        ] {
+            let msg = perr(&src);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &src[..20], msg);
+        }
+        let deep_type = format!("f : {}Int{}\n", "[".repeat(n), "]".repeat(n));
+        match parse_config(&deep_type, outer()) {
+            Ok(_) => panic!("a type nested {} deep parsed", n),
+            Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+        }
+        // nesting far beyond anything written by hand still parses
+        let m = 2_000;
+        p(&format!("{}1{}", "(".repeat(m), ")".repeat(m)));
+        p(&format!("{}{}", "[".repeat(m), "]".repeat(m)));
+        p(&format!("{}[]", "1 :: ".repeat(m)));
+        cfg(&format!("f : {}Int{}\n", "[".repeat(m), "]".repeat(m)));
+    });
+}

@@ -38,7 +38,16 @@ pub struct Parser {
     /// set when an operator expression ends with a trailing operator before
     /// `)`, i.e. a left section
     section_op: Option<&'static str>,
+    /// levels of recursive descent currently open, bounded by `MAX_DEPTH`
+    depth: usize,
 }
+
+/// How many levels of recursive descent may be open at once. Each costs
+/// native stack (several KB in a debug build), so input nested past this is
+/// a parse error (§1.4) instead of an overflow of the worker thread's stack
+/// (main.rs); the bound keeps the deepest parse to a fraction of that stack
+/// while allowing thousands of levels of any construct.
+const MAX_DEPTH: usize = 20_000;
 
 /// fixity table (§3.2): (precedence, right-assoc)
 fn fixity(op: &str) -> Option<(u8, bool)> {
@@ -66,7 +75,24 @@ impl Parser {
             pos: 0,
             outer_names,
             section_op: None,
+            depth: 0,
         })
+    }
+
+    /// Run `f` one level deeper in the recursive descent. Every cycle of
+    /// mutually recursive parse functions passes through a call made here,
+    /// which is what bounds the parser's stack use.
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError::new("nested too deeply", self.line()));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
 
     fn peek(&self) -> &Tok {
@@ -182,6 +208,10 @@ impl Parser {
     // types
     // ------------------------------------------------------------------
     fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
+        self.nested(Self::parse_type_inner)
+    }
+
+    fn parse_type_inner(&mut self) -> Result<TypeExpr, ParseError> {
         self.skip_newlines_in_type();
         let lhs = self.parse_atype()?;
         self.skip_newlines_in_type();
@@ -303,6 +333,10 @@ impl Parser {
     /// expression stops at a Newline whose following token is in a column
     /// <= min_col (it belongs to an outer construct).
     pub fn parse_expr(&mut self, min_col: usize) -> Result<Expr, ParseError> {
+        self.nested(|p| p.parse_expr_inner(min_col))
+    }
+
+    fn parse_expr_inner(&mut self, min_col: usize) -> Result<Expr, ParseError> {
         self.skip_layout_newlines(min_col);
         match self.peek().clone() {
             Tok::Backslash => {
@@ -501,7 +535,7 @@ impl Parser {
             self.skip_layout_newlines(min_col);
             if matches!(self.peek(), Tok::Or) {
                 self.bump();
-                let rhs = self.parse_or(min_col)?;
+                let rhs = self.nested(|p| p.parse_or(min_col))?;
                 lhs = Expr::Or(Rc::new(lhs), Rc::new(rhs));
             } else {
                 break;
@@ -533,7 +567,7 @@ impl Parser {
                 return Ok(lhs);
             }
             let next_min = if right { prec } else { prec + 1 };
-            let rhs = self.parse_opexpr(next_min, min_col)?;
+            let rhs = self.nested(|p| p.parse_opexpr(next_min, min_col))?;
             // non-assoc check: if lhs is the same operator, reject chaining
             if is_nonassoc(op) {
                 // a non-associative operator cannot be chained; explicit
@@ -694,6 +728,10 @@ impl Parser {
     }
 
     fn parse_atom(&mut self, min_col: usize) -> Result<Expr, ParseError> {
+        self.nested(|p| p.parse_atom_inner(min_col))
+    }
+
+    fn parse_atom_inner(&mut self, min_col: usize) -> Result<Expr, ParseError> {
         match self.peek().clone() {
             Tok::Ident(n) => {
                 self.bump();
