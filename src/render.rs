@@ -1443,12 +1443,16 @@ impl Display {
         }
     }
 
-    fn time(&self) -> Option<i64> {
-        match self {
+    /// The node's time for the row order (Step 1). A node with no stored
+    /// counterpart (minted in this program) has time ∞: it sorts after every
+    /// stored one, not first as a `None` would.
+    fn time(&self) -> i64 {
+        let t = match self {
             Display::Commit { info, .. } => info.meta.as_ref().map(|m| m.time),
             Display::Run { time, .. } => *time,
             Display::Collapsed { info, .. } => info.meta.as_ref().map(|m| m.time),
-        }
+        };
+        t.unwrap_or(i64::MAX)
     }
 
     fn children(&self) -> &[Display] {
@@ -1624,6 +1628,10 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
     let mut rails: Vec<Option<Rail>> = vec![None; lanes_n];
     let mut out: Vec<Placement> = Vec::new();
     let mut flattened: BTreeSet<usize> = BTreeSet::new();
+    // each node's row: "last child" and "after t" are in row order, which is
+    // not sibling order once an edit appends a child (`new`, `rebase`)
+    let row_of: BTreeMap<usize, usize> =
+        rows.iter().enumerate().map(|(i, n)| (n.uid(), i)).collect();
     for (idx, n) in rows.iter().enumerate() {
         let in_trunk = n.in_trunk(trunk);
         let parent = rows[..idx]
@@ -1632,10 +1640,7 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
             .find(|p| p.children().iter().any(|c| c.uid() == n.uid()));
         let parent_lane = parent.and_then(|p| out[rows[..idx].iter().position(|x| x.uid() == p.uid()).unwrap()].lane);
         let is_last_child = parent
-            .map(|p| {
-                let cs = p.children();
-                cs[cs.len() - 1].uid() == n.uid()
-            })
+            .map(|p| p.children().iter().all(|c| row_of[&c.uid()] <= idx))
             .unwrap_or(false);
         let was_flat = flattened.contains(&n.uid());
         let mut lane: Option<usize> = None;
@@ -1687,8 +1692,13 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
         let mut reservations: Vec<(usize, usize)> = Vec::new();
         if !now_flat && in_trunk {
             let cs = n.children();
-            if let Some(tpos) = cs.iter().position(|c| c.in_trunk(trunk)) {
-                for c in &cs[tpos + 1..] {
+            if let Some(t) = cs.iter().find(|c| c.in_trunk(trunk)) {
+                let mut after: Vec<&Display> = cs
+                    .iter()
+                    .filter(|c| row_of[&c.uid()] > row_of[&t.uid()])
+                    .collect();
+                after.sort_by_key(|c| row_of[&c.uid()]);
+                for c in after {
                     if flattened.contains(&c.uid()) {
                         continue;
                     }

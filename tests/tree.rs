@@ -845,7 +845,179 @@ fn tree_worked_example() {
     }
 }
 
+// ----------------------------------------------------------------------
+// row order and lanes (specs/tree.md Steps 1–3): rows go by time, minted
+// commits last, and "last child" / "after t" mean in row order, which an
+// edit that appends a child (`new`, `rebase`) makes differ from sibling order
+// ----------------------------------------------------------------------
 
+/// A commit whose only file is its own, so no row is drawn empty (`◌`).
+fn own_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
+    commit(id, msg, labels, vec![(id, msg)])
+}
+
+/// The rows of the tree of `repo` (focused on the root) as (rails area,
+/// the rest as words), the legend left out.
+fn row_shapes(repo: Value, metas: Vec<(String, MetaInfo)>) -> Vec<(String, String)> {
+    let (mut i, cfg) = make_interp(backend_with(metas));
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        "treeWith ({ detail = 0, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
+        repo,
+    );
+    text.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| {
+            // gutter 2, then 2 · lanes characters of rails
+            let rails: String = l.chars().skip(2).take(8).collect();
+            let rest: String = l.chars().skip(10).collect();
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            (rails.trim_end().to_string(), words.join(" "))
+        })
+        .collect()
+}
+
+fn shapes(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter().map(|(r, w)| (r.to_string(), w.to_string())).collect()
+}
+
+#[test]
+fn minted_commits_come_after_stored_ones() {
+    // a minted commit (a dry run's `new`) has no stored time and sorted as
+    // the oldest, so it took its parent's lane first and ended it, and its
+    // stored sibling forked with `├` from under it, drawn as its child. It
+    // has time ∞ (Step 1): after every stored row, inheriting the lane.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = own_commit("kaaaaaaa", "one", &[]);
+    let b = own_commit("kbbbbbbb", "two", &[]);
+    let c = own_commit("kccccccc", "three", &[]);
+    let m = own_commit("kmmmmmmm", "minted", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "A", t - 30),
+            meta("kbbbbbbb", "A", t - 20),
+            meta("kccccccc", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("○", "@kaaa one"),
+        ("├─○", "@kbbb two"),
+        ("│ ○", "@kccc three"),
+        ("○", "@kmmm minted"),
+    ]);
+    // whichever sibling order the edit left (`new` appends)
+    for minted_first in [false, true] {
+        let b_t = subtree(b.clone(), vec![subtree(c.clone(), vec![])]);
+        let m_t = subtree(m.clone(), vec![]);
+        let kids = if minted_first { vec![m_t, b_t] } else { vec![b_t, m_t] };
+        let repo = repo_of(root.clone(), vec![subtree(a.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "minted first: {}", minted_first);
+    }
+}
+
+#[test]
+fn lane_inheritance_follows_row_order_not_sibling_order() {
+    // `rebase` appends the moved commit to its new parent's children but it
+    // keeps its time, so the last child in the list need not be the last
+    // row. Rule 4 read the list: the older child inherited the lane and
+    // emptied it, and the newer one forked from the empty lane under it.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = own_commit("kaaaaaaa", "one", &[]);
+    let b = own_commit("kbbbbbbb", "two", &[]);
+    let c = own_commit("kccccccc", "three", &[]);
+    let d = own_commit("kddddddd", "four", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "A", t - 40),
+            meta("kbbbbbbb", "A", t - 30),
+            meta("kccccccc", "A", t - 20),
+            meta("kddddddd", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("○", "@kaaa one"),
+        ("├─○", "@kbbb two"),
+        ("│ ○", "@kccc three"),
+        ("○", "@kddd four"),
+    ]);
+    for newest_first in [false, true] {
+        let b_t = subtree(b.clone(), vec![subtree(c.clone(), vec![])]);
+        let d_t = subtree(d.clone(), vec![]);
+        let kids = if newest_first { vec![d_t, b_t] } else { vec![b_t, d_t] };
+        let repo = repo_of(root.clone(), vec![subtree(a.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn trunk_head_forks_end_on_the_last_row() {
+    // the trunk head's last child in row order ends lane 0 with `╰`; read
+    // off the list, the older child ended it and the newer forked `├` below
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("khhhhhhh", "A", t - 30),
+            meta("kxxxxxxx", "A", t - 20),
+            meta("kyyyyyyy", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("◆", "@khhh head main"),
+        ("├─○", "@kxxx older"),
+        ("╰─○", "@kyyy newer"),
+    ]);
+    for newest_first in [false, true] {
+        let (x_t, y_t) = (subtree(x.clone(), vec![]), subtree(y.clone(), vec![]));
+        let kids = if newest_first { vec![y_t, x_t] } else { vec![x_t, y_t] };
+        let repo = repo_of(root.clone(), vec![subtree(h.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn trunk_reservations_are_taken_in_row_order() {
+    // a trunk commit reserves lanes for its side children after the trunk
+    // child "in row order" (Step 3), leftmost first; it took them in sibling
+    // order, so the newer side child got the nearer lane
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let p = own_commit("kppppppp", "base", &[]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kppppppp", "A", t - 40),
+            meta("khhhhhhh", "A", t - 30),
+            meta("kxxxxxxx", "A", t - 20),
+            meta("kyyyyyyy", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("◆─┬─╮", "@kppp base"),
+        ("◆ │ │", "@khhh head main"),
+        ("  ○ │", "@kxxx older"),
+        ("    ○", "@kyyy newer"),
+    ]);
+    for newest_first in [false, true] {
+        let (x_t, y_t) = (subtree(x.clone(), vec![]), subtree(y.clone(), vec![]));
+        let h_t = subtree(h.clone(), vec![]);
+        let kids = if newest_first { vec![h_t, y_t, x_t] } else { vec![h_t, x_t, y_t] };
+        let repo = repo_of(root.clone(), vec![subtree(p.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
 
 
 // ----------------------------------------------------------------------

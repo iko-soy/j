@@ -743,6 +743,24 @@ fn dry_run_tree_glyphs_come_from_the_edited_history() {
 }
 
 #[test]
+fn tree_draws_a_minted_commit_after_its_stored_sibling() {
+    // a dry run's new commit has no stored time; it sorted as the oldest, so
+    // it took its parent's lane and ended it, and the stored sibling forked
+    // from under it, drawn as its child. Minted commits come last
+    // (specs/tree.md Step 1), and the stored sibling forks from the parent.
+    let r = setup();
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["describe \"stored\" . new"]).ok();
+    let out = r.j(&["tree . new . prev"]).ok().stdout;
+    let rows: Vec<&str> = out.lines().collect();
+    let stored = rows.iter().position(|l| l.ends_with("  stored")).unwrap();
+    let minted = rows.iter().position(|l| l.starts_with('▶')).unwrap();
+    assert!(stored < minted, "minted commit drawn first:\n{}", out);
+    assert!(rows[stored].contains('├'), "{}", out);
+    assert!(!rows[minted].contains('├'), "{}", out);
+}
+
+#[test]
 fn tree_draws_the_size_bar_of_the_focus_parent() {
     // the focus's parent diffs against its own parent, whose file list was
     // only loaded when that grandparent was the root: every other parent of
