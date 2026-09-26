@@ -360,14 +360,6 @@ impl ContractExpr {
         }
     }
 
-    /// True if the next parameter is definitely a function type.
-    pub fn next_param_is_function(&self, shapes: &Shapes) -> bool {
-        match self.next_param() {
-            Some(t) => matches!(shapes.unfold(&t), TypeExpr::Fun(_, _)),
-            None => false,
-        }
-    }
-
     /// The 0-based position of the next argument among those the signature
     /// lists, when known. Messages number arguments by the signature (§4.13:
     /// "describe expected Text as argument 1"), not by what the function

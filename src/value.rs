@@ -382,9 +382,8 @@ pub enum FunVal {
     },
     /// `f or g` lifted pointwise over functions (§4.6)
     OrFun(Value, Value),
-    /// unevaluated composition: unfolds only when applied to a non-function
-    /// (§4.1 note — `abandon . contract everything` is a value before it is
-    /// applied, and must not run at load)
+    /// a composition `f . g` applied as `f (g x)` (§4.9); `(.)` itself
+    /// builds a builtin node instead (builtins::compose_values)
     ComposeLazy(Value, Value),
     /// a label literal %name: applies as `labelled "name"`
     Labelled(String, Value),

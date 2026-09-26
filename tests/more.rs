@@ -119,6 +119,39 @@ fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
 }
 
 #[test]
+fn function_argument_to_a_signed_definition_is_a_contract_crash() {
+    // §4.13: every argument is checked against its parameter. A signed
+    // definition given a function where its signature wants a Repo or a
+    // Text composed with it instead, so `new new` was the edit "new twice"
+    // (and `j new new` persisted two commits) and `or` had nothing to catch.
+    let (mut i, cfg) = make_interp();
+    let m = crash_msg(&mut i, &cfg, "new new");
+    assert!(
+        m.contains("new expected Repo (record) as argument 1, got function"),
+        "{}",
+        m
+    );
+    let m = crash_msg(&mut i, &cfg, "describe (\\r -> \"m\")");
+    assert!(m.contains("describe expected Text as argument 1, got function"), "{}", m);
+    assert_value(&mut i, &cfg, "describe (\\r -> \"m\") or 42", Value::int(42));
+    let m = crash_msg(&mut i, &cfg, "squash new");
+    assert!(m.contains("squash expected Repo (record) as argument 1, got function"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "(tree . squash) new");
+    assert!(m.contains("expected Repo (record) as argument 1, got function"), "{}", m);
+}
+
+#[test]
+fn composition_applied_to_a_function_applies() {
+    // §4.9: (f . g) x = f (g x), whatever x is. A function argument composed
+    // pointwise instead, and so did every part whose next parameter was a
+    // type variable: `(show . id) not` crashed inside `not`.
+    let (mut i, cfg) = make_interp();
+    assert_value(&mut i, &cfg, "(show . id) not", Value::text("not"));
+    assert_value(&mut i, &cfg, "(const 1 . id) not", Value::int(1));
+    assert_value(&mut i, &cfg, "((\\x -> show x) . id) not", Value::text("not"));
+}
+
+#[test]
 fn composition_argument_belongs_to_the_right_operand() {
     // §4.9: in (f . g) x the argument is g's. When g's contract was unknown
     // (a selector, an unsigned composition, an `or`), x was checked against

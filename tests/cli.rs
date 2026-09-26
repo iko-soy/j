@@ -412,6 +412,24 @@ fn crash_leaves_repo_untouched() {
 }
 
 #[test]
+fn edit_applied_to_an_edit_is_a_contract_crash() {
+    // `new new` gives `new` a function where its signature wants a Repo: a
+    // contract crash (§4.13), so nothing is persisted (§1.2). It used to
+    // compose instead, and persisted two new commits.
+    let r = setup();
+    let before = r.j(&["length . commits . top"]).ok().stdout;
+    let out = r.j(&["new new"]);
+    assert_eq!(out.code, 1, "stdout: {}", out.stdout);
+    assert!(
+        out.stderr.contains("contract: new expected Repo (record) as argument 1, got function"),
+        "{}",
+        out.stderr
+    );
+    let after = r.j(&["length . commits . top"]).ok().stdout;
+    assert_eq!(before, after);
+}
+
+#[test]
 fn split_and_contract_paths() {
     let r = setup();
     r.write("code.rs", "fn main() {}\n");

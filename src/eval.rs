@@ -842,17 +842,12 @@ impl Interp {
                         Some((n, c)) => (n.clone(), Some(c.clone())),
                         None => (name.clone(), None),
                     };
-                    // compose nodes handle function arguments pointwise in
-                    // compose_apply; do not contract-check them here
-                    let skip_check = name == "(.)" && matches!(arg, Value::Fun(_));
                     if let Some(c) = &cexpr {
-                        if !skip_check {
-                            // numbered by the signature, not by the arguments
-                            // baked into a partial application (§4.13)
-                            let at = c.position().unwrap_or(args.len());
-                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
-                                return Run::Crash(cr);
-                            }
+                        // numbered by the signature, not by the arguments
+                        // baked into a partial application (§4.13)
+                        let at = c.position().unwrap_or(args.len());
+                        if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
+                            return Run::Crash(cr);
                         }
                     }
                     all.push(arg);
@@ -962,40 +957,9 @@ impl Interp {
                         Some((n, c)) => (Some(n.clone()), Some(c.clone())),
                         None => (name.clone(), None),
                     };
-                    // A signed definition's application to a function value is
-                    // tried as a plain application first; if that crashes (as
-                    // `abandon (contract everything)` does at load time, since
-                    // the definition is a Repo-level function), it is function
-                    // composition instead (§4.1 note: the composition is a
-                    // value before it is applied to the repository).
-                    if *applied == 0 && matches!(arg, Value::Fun(_)) && pending.is_some() {
-                        // probe: contract-check the argument; if it fails, the
-                        // application is composition instead (§4.1 note)
-                        let probe_ok = match &cexpr {
-                            Some(c) => {
-                                let r = c.check_arg(&self.shapes, "", &arg).is_ok();
-                                r
-                            }
-                            None => true,
-                        };
-                        if !probe_ok {
-                            let f = Value::Fun(Rc::new(FunVal::Closure {
-                                name: name.clone(),
-                                params: params.clone(),
-                                applied: *applied,
-                                applied_args: applied_args.clone(),
-                                deferred: false,
-                                body: body.clone(),
-                                env: env.clone(),
-                                src: src.clone(),
-                                pending: pending.clone(),
-                            }));
-                            return match crate::builtins::compose_values(self, f, arg) {
-                                Ok(composed) => Run::Step(State::Ret(composed, k)),
-                                Err(cr) => Run::Crash(cr),
-                            };
-                        }
-                    }
+                    // a function argument is checked like any other: where
+                    // the signature wants a Repo, `new new` is a contract
+                    // crash, not a composition (§4.13, §4.9)
                     if let Some(c) = &cexpr {
                         let fname = cname.clone().unwrap_or_default();
                         let at = c.position().unwrap_or(applied_args.len());
@@ -1093,22 +1057,10 @@ impl Interp {
                     }
                 }
                 FunVal::ComposeLazy(f, g) => {
-                    let f = f.clone();
-                    let g = g.clone();
-                    if matches!(arg, Value::Fun(_)) {
-                        // pointwise: (f . g) h = f (g h) — but g h is not
-                        // evaluated yet either; compose lazily
-                        let inner = Value::Fun(Rc::new(FunVal::ComposeLazy(g, arg)));
-                        Run::Step(State::Ret(
-                            Value::Fun(Rc::new(FunVal::ComposeLazy(f, inner))),
-                            k,
-                        ))
-                    } else {
-                        // apply g, then f to the result; a crash in either
-                        // keeps its message and unwinds to any enclosing `or`
-                        // (§4.7)
-                        Run::Step(State::Apply(g, arg, Cont::Fun(f, Rc::new(k))))
-                    }
+                    // (f . g) x = f (g x) (§4.9), whatever x is: apply g,
+                    // then f to the result; a crash in either keeps its
+                    // message and unwinds to any enclosing `or` (§4.7)
+                    Run::Step(State::Apply(g.clone(), arg, Cont::Fun(f.clone(), Rc::new(k))))
                 }
                 FunVal::OrFun(a, b) => {
                     // (f or g) x = f x or g x

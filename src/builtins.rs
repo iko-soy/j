@@ -120,29 +120,12 @@ fn compose_apply(i: &mut Interp, args: &[Value]) -> BResult {
     let f = args[0].clone();
     let g = args[1].clone();
     let x = args[2].clone();
-    // A composed function applied to a function does not run (the operand
-    // contracts are about Repo-level values); it composes pointwise so that
-    // definitions like `abandon . contract everything` and `tree . squash`
-    // are functions waiting for the repository (§4.1 note, §1.2 step 7).
-    if matches!(x, Value::Fun(_)) {
-        let next = apply_or_compose(i, g, x)?;
-        return apply_or_compose(i, f, next);
-    }
+    // (f . g) x = f (g x) (§4.9), whatever x is: a function argument is
+    // applied like any other, and g's contract checks it (§4.13). `squash =
+    // abandon . contract everything` waits for the repository because it is
+    // this node, not because anything composes on a function argument.
     let gx = i.apply(g, x)?;
     i.apply(f, gx)
-}
-
-/// Apply a signed function to an argument, composing instead when the
-/// argument is a function but the contract's next parameter is not.
-pub fn apply_or_compose(i: &mut Interp, f: Value, x: Value) -> BResult {
-    if matches!(x, Value::Fun(_)) {
-        if let Some((_, cexpr)) = pending_of(&f) {
-            if !cexpr.next_param_is_function(&i.shapes) {
-                return compose_values(i, f, x);
-            }
-        }
-    }
-    i.apply(f, x)
 }
 
 /// f . g as a value, with contract propagation
