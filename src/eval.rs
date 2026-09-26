@@ -167,8 +167,13 @@ pub(crate) enum TryOk {
     DeferredBody { arg: Value, cont: Rc<Cont> },
     /// the inner leg of a lazy composition: apply the outer function
     ComposeInner { f: Value, cont: Rc<Cont> },
-    /// the lhs of a lifted `or` applied to an argument
-    OrFunLhs { cont: Rc<Cont> },
+    /// the lhs of a lifted `or` applied to an argument: like `OrLhs`, with
+    /// the rhs function still to be applied to the same argument
+    OrFunLhs {
+        rhs: Value,
+        arg: Value,
+        cont: Rc<Cont>,
+    },
 }
 
 pub(crate) enum Run {
@@ -662,7 +667,20 @@ impl Interp {
                         Run::Step(State::Apply(v, arg, (*cont).clone()))
                     }
                     Some(TryOk::ComposeInner { f, cont }) => Run::Step(State::Apply(f, v, (*cont).clone())),
-                    Some(TryOk::OrFunLhs { cont, .. }) => Run::Step(State::Ret(v, (*cont).clone())),
+                    Some(TryOk::OrFunLhs { rhs, arg, cont }) => {
+                        // `f x or g x` (§4.6): when `f x` is itself a
+                        // function, apply `g` too and lift again, so the
+                        // fallback keeps guarding the later arguments
+                        if matches!(v, Value::Fun(_)) {
+                            Run::Step(State::Apply(
+                                rhs,
+                                arg,
+                                Cont::OrBoth(v, Rc::new(Cont::Shared(cont))),
+                            ))
+                        } else {
+                            Run::Step(State::Ret(v, (*cont).clone()))
+                        }
+                    }
                     None => Run::Crash(Crash::new("internal: Try with no success handler")),
                 }
             }
@@ -1083,7 +1101,11 @@ impl Interp {
                         a,
                         arg.clone(),
                         Cont::Try {
-                            on_ok: Some(TryOk::OrFunLhs { cont: k.clone() }),
+                            on_ok: Some(TryOk::OrFunLhs {
+                                rhs: b.clone(),
+                                arg: arg.clone(),
+                                cont: k.clone(),
+                            }),
                             snapshot: *self.fresh.borrow(),
                             on_crash: Box::new(State::Apply(b, arg, Cont::Shared(k))),
                         },

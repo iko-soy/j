@@ -84,6 +84,32 @@ fn or_function_lifting() {
         "((\\x -> head x or 0) or (\\_ -> 9)) []",
         Value::int(0)
     );
+    // ... including lifting again when `f x` is a function, so the fallback
+    // still guards the later arguments of a curried lhs
+    check!(
+        i,
+        cfg,
+        "((\\a b -> head b) or (\\a b -> 5)) 1 []",
+        Value::int(5)
+    );
+    check!(
+        i,
+        cfg,
+        "((\\a b c -> head c) or (\\a b c -> 7)) 1 2 []",
+        Value::int(7)
+    );
+    check!(
+        i,
+        cfg,
+        "((\\a b -> a) or (\\a b -> 5)) 1 []",
+        Value::int(1)
+    );
+    // `f x` a function and `g x` not: `f x` alone, no longer guarded
+    let m = crash(&mut i, &cfg, "((\\a b -> head b) or (\\a -> 5)) 1 []");
+    assert!(m.contains("head: empty list"), "{}", m);
+    // `g x` is evaluated unguarded, as the rhs of a written `or` is
+    let m = crash(&mut i, &cfg, "((\\a b -> b) or (\\a -> crash \"rhs\")) 1 2");
+    assert!(m.contains("rhs"), "{}", m);
     // lhs function, rhs not a function: lhs returned
     let v = ok(&mut i, &cfg, "head or 3");
     assert!(matches!(v, Value::Fun(_)), "expected a function");

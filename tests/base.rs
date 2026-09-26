@@ -211,6 +211,12 @@ fn goto_variants() {
     assert_eq!(focus_msg(&v), "first");
     let m = crash(&mut i, &cfg, "goto (labelled \"nope\")", repo.clone());
     assert!(m.contains("expected one revision, got 0"), "{}", m);
+    // a lifted `or` over the curried goto still guards the repo argument
+    // (§4.6): goto applied to the revset is a function, so the lift goes on
+    let v = ok(&mut i, &cfg, "(goto or (\\_ -> id)) %nope", repo.clone());
+    assert_eq!(focus_id(&v), focus_id(&repo));
+    let v = ok(&mut i, &cfg, "(goto or (\\_ -> id)) %feat", repo.clone());
+    assert_eq!(focus_msg(&v), "first");
     let m = crash(&mut i, &cfg, "into @kqqqqqqq", repo.clone());
     assert!(m.contains("not a child"), "{}", m);
     // child by predicate: move to the parent, then to the matching child
