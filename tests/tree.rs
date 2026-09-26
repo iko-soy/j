@@ -956,6 +956,18 @@ fn lanes_opts(lanes: usize, icons: bool) -> String {
     )
 }
 
+/// `line` up to display column `col`.
+fn upto_col(line: &str, col: usize) -> String {
+    let mut out = String::new();
+    for c in line.chars() {
+        if j::render::width(&out) + j::render::width(&c.to_string()) > col {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The display column of the id on every commit row of the worked example.
 fn id_cols(text: &str) -> Vec<usize> {
     WORKED_ROWS
@@ -985,6 +997,44 @@ fn a_run_count_runs_on_into_the_id_column() {
         }
     });
     deep.unwrap().join().unwrap();
+}
+
+#[test]
+fn an_icons_glyph_fills_both_columns_of_its_lane() {
+    // a glyph two columns wide was still followed by its lane's second
+    // character, so every lane right of it, and the id, sat one column
+    // further right on its row than on the rows around it
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let src = format!("treeWith ({})", lanes_opts(3, true));
+    let text = tree_text(&mut i, &cfg, &src, repo);
+    // the gutter, the rails (lane 1 at column 4, lane 2 at 6) and the space
+    // after them: the id starts at column 9 on every row
+    let heads: Vec<String> = text.lines().take(9).map(|l| upto_col(l, 9)).collect();
+    let want = [
+        "  ╎ 14",
+        "  🪨╮    ",
+        "  🪨│    ",
+        "  │ 🍃   ",
+        "▶ ├─🔥   ",
+        "  │ │    ",
+        "  ╰─┼─🫙 ",
+        "    ├─🍃 ",
+        "    🍃   ",
+    ];
+    assert_eq!(heads, want, "\n{}", text);
+    assert_eq!(id_cols(&text), vec![9; WORKED_ROWS.len()], "\n{}", text);
+    // with every lane count, flattened rows (lanes = 2) included, the id is
+    // where it is without icons
+    for lanes in 2..=4 {
+        let src = |icons| format!("treeWith ({})", lanes_opts(lanes, icons));
+        let (repo, be) = worked_example();
+        let (mut i, cfg) = make_interp(be);
+        let plain = tree_text(&mut i, &cfg, &src(false), repo.clone());
+        let icons = tree_text(&mut i, &cfg, &src(true), repo);
+        assert_eq!(id_cols(&icons), id_cols(&plain), "lanes {}\n{}\n{}", lanes, plain, icons);
+        assert_eq!(id_cols(&icons), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "lanes {}\n{}", lanes, icons);
+    }
 }
 
 // ----------------------------------------------------------------------

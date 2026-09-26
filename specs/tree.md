@@ -214,6 +214,8 @@ Precedence: `⌂`, then `⊗`, then `◌`, then `◆`, then the position glyphs.
 `⊗` and `◌` are properties of the history being drawn — a commit's files, and
 its parent's in that history — not of the stored commit with the same id, so
 a dry run (§1.2) draws them as the edit would leave them.
+An `icons = true` glyph is two columns wide, so it fills both characters of
+its lane: character `2ℓ+1` of its row is not drawn.
 Rails use `│ ├ ╰ ─ ┼ ╮ ┬ ╎ »`.
 
 #### Elision (`elide = true`)

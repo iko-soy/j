@@ -2355,7 +2355,8 @@ fn detail_rail_row(
 
 /// Colour the rails. Rail connectors are lane-coloured (lane 0 = immutable
 /// blue, others dim); the node glyph at `glyph` (its lane position and ANSI
-/// code) is meaning-coloured.
+/// code) is meaning-coloured. A glyph two columns wide (`icons`) fills both
+/// characters of its lane, so the one after it is not drawn (§Glyphs).
 fn color_rails(
     chars: &[char],
     lane0: &[bool],
@@ -2363,7 +2364,12 @@ fn color_rails(
     glyph: Option<(usize, &str)>,
 ) -> String {
     let mut s = String::new();
+    let mut covered = false;
     for (i, c) in chars.iter().enumerate() {
+        if std::mem::take(&mut covered) {
+            continue;
+        }
+        covered = UnicodeWidthChar::width(*c) == Some(2);
         let t = c.to_string();
         if *c == ' ' {
             s.push(*c);
