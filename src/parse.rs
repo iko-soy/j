@@ -770,6 +770,18 @@ impl Parser {
                     }
                     // right section: (op e) = \x -> x op e
                     let e = self.parse_expr(min_col)?;
+                    // `(op e op)` is no production (§3.4); unchecked, the
+                    // trailing operator would be dropped here and left set
+                    // for the next `(e)` to take as a left section
+                    if let Some(o2) = self.section_op.take() {
+                        return Err(ParseError::new(
+                            format!(
+                                "a section cannot have operators on both sides (`{}` and `{}`)",
+                                o, o2
+                            ),
+                            self.line(),
+                        ));
+                    }
                     self.expect(&Tok::RParen)?;
                     let var = fresh_var();
                     let body = Expr::BinOp(

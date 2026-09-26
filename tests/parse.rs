@@ -97,6 +97,23 @@ fn sections() {
 }
 
 #[test]
+fn section_with_operators_on_both_sides_rejected() {
+    // `(op e op)` matches no production (§3.4). The trailing operator must
+    // be an error, not dropped, and must not survive to turn the next
+    // parenthesised expression into a left section
+    assert!(perr("(- 1 +)").contains("section"));
+    assert!(perr("((- 1 +)) 10").contains("section"));
+    assert!(perr("(id (- 1 +)) 10").contains("section"));
+    assert!(perr("[(- 1 +) (2 * 3)]").contains("section"));
+    match parse_config("bad = (- 1 +)\nsix = (2 * 3)\n", outer()) {
+        Ok(items) => panic!("accepted {:?}", items),
+        Err(e) => assert!(e.msg.contains("section"), "{}", e.msg),
+    }
+    // well-formed sections next to each other are unaffected
+    assert_eq!(r(&p("[(1 -) (+ 2) (3)]")).matches("->").count(), 2);
+}
+
+#[test]
 fn lists_and_records() {
     assert_eq!(r(&p("[1 2 3]")), "[1 2 3]");
     assert_eq!(r(&p("[]")), "[]");
