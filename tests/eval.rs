@@ -335,6 +335,81 @@ fn alias_of_an_undeclared_type_is_not_a_usable_shape() {
     assert!(m.contains("usable shape"), "{}", m);
 }
 
+/// Signed definitions whose lambda takes fewer parameters than the signature,
+/// so the body is deferred until the contract is exhausted (§5.2).
+const DEFERRED: &str = r#"
+failIf : Int -> Edit
+failIf = \n -> if n > 0 then id else crash "negative"
+
+choose : Int -> Int -> Int
+choose = \n -> if n > 0 then (\x -> x) else crash "negative"
+
+bad : Int -> Int -> Int
+bad = \a -> \b -> "oops"
+
+bad3 : Int -> Int -> Int -> Int
+bad3 = \a -> \b c -> "oops"
+
+add3 : Int -> Int -> Int -> Int
+add3 = \a -> \b c -> a + b + c
+"#;
+
+const REPO: &str = r#"{ root = { files = [], message = "kept", labels = [], id = @ }, children = [], context = [] }"#;
+
+#[test]
+fn deferred_body_crash_is_catchable_and_keeps_its_message() {
+    // §4.6, §4.7: a crash in a deferred body is a crash like any other. It
+    // was replaced by "<name>: body crashed when applied" and raised past
+    // every enclosing `or`, so `failIf 0 or id` aborted the whole command.
+    let (mut i, cfg) = make_interp_with(DEFERRED);
+    check!(i, cfg, "choose 0 5 or 7", Value::int(7));
+    check!(i, cfg, "(choose 0 or (\\x -> x + 1)) 5", Value::int(6));
+    check!(i, cfg, "choose 1 5", Value::int(5));
+    let m = crash(&mut i, &cfg, "choose 0 5");
+    assert_eq!(m, "crash: negative");
+    let src = format!("((failIf 0 or id) ({})).root.message", REPO);
+    check!(i, cfg, &src, Value::text("kept"));
+    let src = format!("(\\r -> failIf 0 r or r) ({})", REPO);
+    let v = ok(&mut i, &cfg, &src);
+    assert!(matches!(v, Value::Record(_)));
+    let m = crash(&mut i, &cfg, &format!("failIf 0 ({})", REPO));
+    assert_eq!(m, "crash: negative");
+}
+
+#[test]
+fn deferred_body_is_contract_checked() {
+    // §4.13: every argument of a signed definition is checked as it is
+    // supplied, and the result once the application is complete. Those that
+    // arrived after the body was deferred went unchecked, and so did the
+    // result: `bad 1 "x"` was "oops".
+    let (mut i, cfg) = make_interp_with(DEFERRED);
+    let m = crash(&mut i, &cfg, "bad 1 \"x\"");
+    assert!(m.contains("contract: bad expected Int as argument 2, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "bad 1 2");
+    assert!(m.contains("contract: bad: result expected Int, got Text"), "{}", m);
+    // and a violation is catchable like any other crash
+    check!(i, cfg, "bad 1 2 or 9", Value::int(9));
+    check!(i, cfg, "(bad 1 or (\\_ -> 9)) 2", Value::int(9));
+    let m = crash(&mut i, &cfg, "failIf 1 3");
+    assert!(m.contains("contract: failIf expected Repo"), "{}", m);
+    // with two parameters left once the body is deferred, each of them and
+    // the result are checked too
+    let m = crash(&mut i, &cfg, "bad3 1 \"x\" 3");
+    assert!(m.contains("contract: bad3 expected Int as argument 2, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "bad3 1 2 \"y\"");
+    assert!(m.contains("contract: bad3 expected Int as argument 3, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "bad3 1 2 3");
+    assert!(m.contains("contract: bad3: result expected Int, got Text"), "{}", m);
+    check!(i, cfg, "add3 1 2 3", Value::int(6));
+    check!(i, cfg, "let f = add3 1 2 in f 3 + f 4", Value::int(13));
+    // the partial application stays a named value (§5.2)
+    check!(i, cfg, "show (add3 1 2)", Value::text("add3 1 2"));
+    // the reference config's own deferred definitions blame themselves
+    let m = crash(&mut i, &cfg, "describe \"x\" 3");
+    assert!(m.contains("contract: describe expected Repo"), "{}", m);
+    assert!(m.contains("argument 2"), "{}", m);
+}
+
 #[test]
 fn new_id_mints_distinct_ids() {
     let (mut i, cfg) = make_interp();

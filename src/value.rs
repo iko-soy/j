@@ -364,10 +364,14 @@ pub enum FunVal {
         name: Option<String>, // top-level definition name, if any
         params: Vec<Pattern>,
         applied: usize,
-        /// the arguments supplied so far, for rendering (§5.2)
+        /// the arguments supplied so far, for rendering (§5.2); in a deferred
+        /// closure, those past the first `applied` still wait to be applied
+        /// to the body's value
         applied_args: Vec<Value>,
-        /// the body has not been evaluated yet (the definition's contract is
-        /// not exhausted): the next application evaluates it, then applies
+        /// every parameter is bound but the body has not been evaluated yet,
+        /// as the definition's contract is not exhausted: further arguments
+        /// are collected until it is, then the body is evaluated and its
+        /// value applied to them
         deferred: bool,
         body: Rc<Expr>,
         env: Env,

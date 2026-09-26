@@ -505,9 +505,12 @@ definition with a signature — is checked against it: each argument as it is
 supplied, against the corresponding parameter type, and the result once the
 application is complete (yields a non-function), against the result type.
 Lambdas without a signature and the command-line expression are unchecked
-except through the functions they call. A signature on a definition that is
-not a function (`user`, `conflicts`) is checked once, against the value, when
-the definition is evaluated at load.
+except through the functions they call. A signature covers all the arguments
+it lists, however the definition's lambda is curried: `describe : Text -> Edit`
+is `\m -> mapRoot …`, and the `Repo` that `describe m` is then applied to is
+checked as its second argument, and the result against `Repo`. A signature on
+a definition that is not a function (`user`, `conflicts`) is checked once,
+against the value, when the definition is evaluated at load.
 
 The check is one level deep and never inspects inside a list or a record's
 field values:

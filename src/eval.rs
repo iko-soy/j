@@ -102,8 +102,6 @@ pub(crate) enum Cont {
     OrBoth(Value, Rc<Cont>),
     /// a shared continuation (used when both `or` outcomes continue the same way)
     Shared(Rc<Cont>),
-    /// unconditionally crash with a fixed message (deferred-body failure)
-    CrashWith(String),
     /// run the continuation's computation, catching crashes: on success pass
     /// the value to `on_ok`, on crash switch to `on_crash` (§4.6)
     Try {
@@ -111,8 +109,10 @@ pub(crate) enum Cont {
         snapshot: u64,
         on_crash: Box<State>,
     },
-    /// applying a Labelled: apply inner `labelled` result to the real arg
-    LabelledArg(Value, Rc<Cont>),
+    /// apply the returned function to this argument: the `labelled "name"`
+    /// of a Labelled to the real arg, or a deferred body to the arguments
+    /// that arrived after it was deferred
+    ApplyTo(Value, Rc<Cont>),
     UpdateBase(Vec<(String, Rc<Expr>)>, Env, Rc<Cont>),
     UpdateFields {
         base: Value,
@@ -163,10 +163,6 @@ pub(crate) enum TryOk {
         env: Env,
         cont: Rc<Cont>,
     },
-    /// the deferred body of a signed definition: apply it to the pending arg
-    DeferredBody { arg: Value, cont: Rc<Cont> },
-    /// the inner leg of a lazy composition: apply the outer function
-    ComposeInner { f: Value, cont: Rc<Cont> },
     /// the lhs of a lifted `or` applied to an argument: like `OrLhs`, with
     /// the rhs function still to be applied to the same argument
     OrFunLhs {
@@ -185,7 +181,7 @@ pub(crate) enum Run {
 /// the parent continuation Rc of `k`, for iterative drop and unwinding
 fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
     match k {
-        Cont::Halt | Cont::CrashWith(_) | Cont::Try { .. } => None,
+        Cont::Halt | Cont::Try { .. } => None,
         Cont::Arg(_, _, k) => Some(k),
         Cont::Fun(_, k) => Some(k),
         Cont::If(_, _, _, k) => Some(k),
@@ -195,7 +191,7 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::ExpectBool(_, k) => Some(k),
         Cont::OrBoth(_, k) => Some(k),
         Cont::Shared(k) => Some(k),
-        Cont::LabelledArg(_, k) => Some(k),
+        Cont::ApplyTo(_, k) => Some(k),
         Cont::UpdateBase(_, _, k) => Some(k),
         Cont::UpdateFields { cont, .. } => Some(cont),
         Cont::RecordFields { cont, .. } => Some(cont),
@@ -663,10 +659,6 @@ impl Interp {
                             Run::Step(State::Ret(v, Cont::Shared(cont)))
                         }
                     }
-                    Some(TryOk::DeferredBody { arg, cont, .. }) => {
-                        Run::Step(State::Apply(v, arg, (*cont).clone()))
-                    }
-                    Some(TryOk::ComposeInner { f, cont }) => Run::Step(State::Apply(f, v, (*cont).clone())),
                     Some(TryOk::OrFunLhs { rhs, arg, cont }) => {
                         // `f x or g x` (§4.6): when `f x` is itself a
                         // function, apply `g` too and lift again, so the
@@ -684,8 +676,7 @@ impl Interp {
                     None => Run::Crash(Crash::new("internal: Try with no success handler")),
                 }
             }
-            Cont::LabelledArg(real, k) => Run::Step(State::Apply(v, real, (*k).clone())),
-            Cont::CrashWith(msg) => Run::Crash(Crash::new(msg)),
+            Cont::ApplyTo(real, k) => Run::Step(State::Apply(v, real, (*k).clone())),
             Cont::UpdateBase(fields, env, k) => {
                 if !matches!(v, Value::Record(_)) {
                     return Run::Crash(Crash::new(format!(
@@ -907,27 +898,57 @@ impl Interp {
                     pending,
                 } => {
                     if *deferred {
-                        // the body was deferred at the last application:
-                        // evaluate it now (catching crashes), then apply
-                        let msg = format!(
-                            "{}: body crashed when applied",
-                            name.clone().unwrap_or_default()
-                        );
-                        return Run::Step(State::Eval(
-                            body.clone(),
-                            env.clone(),
-                            Cont::Try {
-                                on_ok: Some(TryOk::DeferredBody {
-                                    arg,
-                                    cont: Rc::new(k),
-                                }),
-                                snapshot: *self.fresh.borrow(),
-                                on_crash: Box::new(State::Ret(
-                                    Value::Bool(false),
-                                    Cont::CrashWith(msg),
-                                )),
+                        // Every parameter of the lambda is bound and its body
+                        // waits for the rest of the signature (§5.2). This
+                        // argument is checked like any other (§4.13). While
+                        // the contract has parameters left it is only
+                        // collected; once it is exhausted the body runs, its
+                        // value is applied to the collected arguments in
+                        // order, and the result is checked. Nothing here
+                        // catches: a crash keeps its own message and unwinds
+                        // to any enclosing `or` (§4.6, §4.7).
+                        let (cname, cexpr) = match pending {
+                            Some((n, c)) => (n.clone(), Some(c.clone())),
+                            None => (name.clone().unwrap_or_default(), None),
+                        };
+                        if let Some(c) = &cexpr {
+                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, applied_args.len(), &arg) {
+                                return Run::Crash(cr);
+                            }
+                        }
+                        let advanced = cexpr
+                            .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
+                        if let Some(c) = advanced.as_ref().filter(|c| !c.is_exhausted()) {
+                            let mut new_args = applied_args.clone();
+                            new_args.push(arg);
+                            let v = Value::Fun(Rc::new(FunVal::Closure {
+                                name: name.clone(),
+                                params: params.clone(),
+                                applied: *applied,
+                                applied_args: new_args,
+                                deferred: true,
+                                body: body.clone(),
+                                env: env.clone(),
+                                src: src.clone(),
+                                pending: Some((cname, c.clone())),
+                            }));
+                            return Run::Step(State::Ret(v, k));
+                        }
+                        let mut k = match advanced {
+                            Some(c) => Cont::CheckExpr {
+                                name: cname,
+                                cexpr: c,
+                                cont: Rc::new(k),
                             },
-                        ));
+                            None => k,
+                        };
+                        k = Cont::ApplyTo(arg, Rc::new(k));
+                        // the arguments past the lambda's own parameters
+                        let collected = applied_args.get(*applied..).unwrap_or(&[]);
+                        for a in collected.iter().rev() {
+                            k = Cont::ApplyTo(a.clone(), Rc::new(k));
+                        }
+                        return Run::Step(State::Eval(body.clone(), env.clone(), k));
                     }
                     let (cname, cexpr) = match pending {
                         Some((n, c)) => (Some(n.clone()), Some(c.clone())),
@@ -1074,22 +1095,10 @@ impl Interp {
                             k,
                         ))
                     } else {
-                        // apply g, catching crashes, then apply f to the result
-                        Run::Step(State::Apply(
-                            g,
-                            arg,
-                            Cont::Try {
-                                on_ok: Some(TryOk::ComposeInner {
-                                    f,
-                                    cont: Rc::new(k),
-                                }),
-                                snapshot: *self.fresh.borrow(),
-                                on_crash: Box::new(State::Ret(
-                                    Value::Bool(false),
-                                    Cont::CrashWith("composition crashed".to_string()),
-                                )),
-                            },
-                        ))
+                        // apply g, then f to the result; a crash in either
+                        // keeps its message and unwinds to any enclosing `or`
+                        // (§4.7)
+                        Run::Step(State::Apply(g, arg, Cont::Fun(f, Rc::new(k))))
                     }
                 }
                 FunVal::OrFun(a, b) => {
@@ -1117,7 +1126,7 @@ impl Interp {
                     Run::Step(State::Apply(
                         labelled.clone(),
                         text,
-                        Cont::LabelledArg(arg, Rc::new(k)),
+                        Cont::ApplyTo(arg, Rc::new(k)),
                     ))
                 }
             },
