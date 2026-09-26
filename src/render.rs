@@ -575,7 +575,7 @@ fn display_block(
                     ("children", v.field("children")?),
                     ("context", Value::list(vec![])),
                 ]);
-                let text = tree_render(interp, &opts, &repo, pal, false)?;
+                let text = tree_render(interp, &opts, &repo, pal, false, tty_width())?;
                 out.push_str(&indent_multiline(&text, indent));
                 return Ok(());
             }
@@ -990,7 +990,28 @@ fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
     })
 }
 
+/// The terminal's width when stdout is one — what rows are cut to and the
+/// legend is placed by (specs/tree.md Step 4, §Legend) — else `None`.
+fn tty_width() -> Option<usize> {
+    if crate::show::stdout_is_tty() {
+        crate::show::terminal_width()
+    } else {
+        None
+    }
+}
+
 pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Value, Crash> {
+    tree_with_width(interp, opts, repo, tty_width())
+}
+
+/// `treeWith` as if stdout were a terminal `term_w` columns wide (`None`: not
+/// a terminal). Public so the tests can drive truncation without a pty.
+pub fn tree_with_width(
+    interp: &mut Interp,
+    opts: &Value,
+    repo: &Value,
+    term_w: Option<usize>,
+) -> Result<Value, Crash> {
     let defaults = default_tree_options(interp)?;
     // a missing option falls back to its default, so an older config that
     // predates a newer option keeps working; a present option is type-checked
@@ -1037,7 +1058,7 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
         date,
         files,
     };
-    let text = tree_render(interp, &o, repo, &pal, true)?;
+    let text = tree_render(interp, &o, repo, &pal, true, term_w)?;
     Ok(Value::text(text))
 }
 
@@ -1269,6 +1290,7 @@ fn tree_render(
     repo: &Value,
     pal: &Palette,
     with_focus: bool,
+    term_w: Option<usize>,
 ) -> Result<String, Crash> {
     // immutable set
     let immutable = crate::repo::compute_immutable(interp, repo).unwrap_or_default();
@@ -1352,7 +1374,7 @@ fn tree_render(
         crate::eval::unique_prefix_in(&ids, id).len()
     };
     // Step 4 — draw
-    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len)
+    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len, term_w)
 }
 
 fn id_of_frame_parent(frame: &Value) -> Result<String, Crash> {
@@ -1835,22 +1857,20 @@ fn build_row_text(
         }
         _ => (String::new(), String::new(), String::new()),
     };
-    // extra columns (§Step 4): date, files changed, full author name
+    // extra columns (§Step 4): date, files changed, full author name — one
+    // entry per enabled column, blank without metadata (a minted commit), so
+    // entry k is the same column on every row
     let mut meta_extra: Vec<String> = Vec::new();
     if let Some(info) = c {
         if info.id != ROOT_ID {
             if opts.date {
-                if let Some(m) = info.meta.as_ref() {
-                    meta_extra.push(render_date(m.time));
-                }
+                meta_extra.push(info.meta.as_ref().map(|m| render_date(m.time)).unwrap_or_default());
             }
             if opts.files {
                 meta_extra.push(format!("{} files", info.nfiles));
             }
             if opts.author {
-                if let Some(m) = info.meta.as_ref() {
-                    meta_extra.push(m.author.clone());
-                }
+                meta_extra.push(info.meta.as_ref().map(|m| m.author.clone()).unwrap_or_default());
             }
         }
     }
@@ -1876,6 +1896,7 @@ fn draw_rows(
     lanes_n: usize,
     with_focus: bool,
     prefix_len: &dyn Fn(&str) -> usize,
+    term_w: Option<usize>,
 ) -> Result<String, Crash> {
     let rail_chars = 2 * lanes_n;
     // id column width: 4-char min prefix plus the `@` literal prefix, and any
@@ -1899,8 +1920,6 @@ fn draw_rows(
             id_w = id_w.max(prefix_len(&c.id) + 1); // +1 for the `@`
         }
     }
-    let text_off = 2 + rail_chars + 1;
-    let msg_off = text_off + id_w + 2;
     let label_col = rows
         .iter()
         .any(|n| n.commit().map(|c| !c.labels.is_empty()).unwrap_or(false));
@@ -1918,26 +1937,12 @@ fn draw_rows(
             n, rows, opts, pal, with_focus, prefix_len, run_extra, id_w,
         ));
     }
-    // right edges for the label and margin columns
-    let mut msg_end_max = 0usize;
-    let mut lab_end_max = 0usize;
-    for (idx, n) in rows.iter().enumerate() {
-        let t = &texts[idx];
-        if n.commit().is_none() {
-            continue;
-        }
-        let mut pos = msg_off;
-        if !t.bar.is_empty() {
-            pos += 1; // the bar takes one extra column before the message
-        }
-        pos += width(&t.msg);
-        if !t.labels.is_empty() {
-            pos += 2 + width(&t.labels);
-        }
-        msg_end_max = msg_end_max.max(pos - if t.labels.is_empty() { 0 } else { 2 + width(&t.labels) });
-        lab_end_max = lab_end_max.max(pos);
-    }
-    let mut lines: Vec<String> = Vec::new();
+    // Columns 4–8 start at the same offset on every row (§Step 4). The size
+    // bar's column is there when any row draws a bar — ` ▅`, two columns —
+    // and blank on the rows that draw none, so a bar never shifts a message.
+    let bar_col = texts.iter().any(|t| !t.bar.is_empty());
+    // each row up to its message: gutter, rails, id and bar
+    let mut heads: Vec<String> = Vec::new();
     for (idx, n) in rows.iter().enumerate() {
         let pl = &placements[idx];
         let t = &texts[idx];
@@ -1952,50 +1957,87 @@ fn draw_rows(
         line.push_str(&color_rails(&chars, &lane0, pal, glyph));
         line.push(' ');
         line.push_str(&t.id);
-        if !t.bar.is_empty() {
+        if bar_col {
             line.push(' ');
-            line.push_str(&t.bar);
+            line.push_str(if t.bar.is_empty() { " " } else { &t.bar });
         }
         line.push_str("  ");
+        heads.push(line);
+    }
+    // the columns are placed by display width as drawn (an `icons` glyph is
+    // two columns wide), from the message column on
+    let msg_col = rows
+        .iter()
+        .zip(&heads)
+        .filter(|(n, _)| n.commit().is_some())
+        .map(|(_, h)| width(h))
+        .max()
+        .unwrap_or(0);
+    let lab_w = texts.iter().map(|t| width(&t.labels)).max().unwrap_or(0);
+    // the data columns, each as wide as its widest entry, so that the margin
+    // after them starts at one offset too
+    let mut extra_w: Vec<usize> = Vec::new();
+    for t in &texts {
+        for (k, e) in t.meta_extra.iter().enumerate() {
+            if k == extra_w.len() {
+                extra_w.push(0);
+            }
+            extra_w[k] = extra_w[k].max(width(e));
+        }
+    }
+    let metas: Vec<String> = texts
+        .iter()
+        .map(|t| meta_block(t, &extra_w, opts, pal))
+        .collect();
+    // message truncation to the terminal width (§Step 4): the widest part
+    // right of the message column (labels, data, margin) sets the room left
+    // for every message, and only messages are cut to it, so the label and
+    // margin columns hold
+    if let Some(w) = term_w {
+        let right = texts
+            .iter()
+            .zip(&metas)
+            .map(|(t, m)| {
+                if !m.is_empty() {
+                    (if label_col { 2 + lab_w } else { 0 }) + 2 + width(m)
+                } else if !t.labels.is_empty() {
+                    2 + width(&t.labels)
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let room = w.saturating_sub(msg_col + right);
+        for t in texts.iter_mut() {
+            t.msg = cut_to_width(&t.msg, room);
+        }
+    }
+    let msg_w = texts.iter().map(|t| width(&t.msg)).max().unwrap_or(0);
+    let lab_off = msg_col + msg_w + 2;
+    let meta_off = if label_col { lab_off + lab_w + 2 } else { lab_off };
+    let mut lines: Vec<String> = Vec::new();
+    for (idx, n) in rows.iter().enumerate() {
+        let t = &texts[idx];
+        let mut line = std::mem::take(&mut heads[idx]);
+        if n.commit().is_some() {
+            pad_to(&mut line, msg_col);
+        }
         line.push_str(&t.msg);
         if label_col && !t.labels.is_empty() {
-            let want = 2 + msg_end_max.saturating_sub(width(&t.msg));
-            line.push_str(&" ".repeat(want));
-            line.push_str(&pal.green(&pad_right(&t.labels, width(&t.labels))));
+            pad_to(&mut line, lab_off);
+            line.push_str(&pal.green(&t.labels));
         }
-        // metadata block: extra columns (date / files / author) then the margin
-        // (age + initials), right-aligned together past the message+labels edge
-        let has_margin = opts.margin && !t.age.is_empty();
-        if !t.meta_extra.is_empty() || has_margin {
-            let cur = if label_col && !t.labels.is_empty() {
-                msg_end_max + 2 + width(&t.labels)
-            } else {
-                width(&t.msg)
-            };
-            let want = 2 + lab_end_max.saturating_sub(cur);
-            line.push_str(&" ".repeat(want));
-            let mut meta: Vec<String> = Vec::new();
-            for e in &t.meta_extra {
-                meta.push(pal.grey(4, e));
-            }
-            if has_margin {
-                meta.push(pal.grey(4, &t.age));
-                meta.push(pal.author(&t.initials_author, &t.initials));
-            }
-            line.push_str(&meta.join("  "));
+        if !metas[idx].is_empty() {
+            pad_to(&mut line, meta_off);
+            line.push_str(&metas[idx]);
         }
-        let _ = pl;
         // the whole focus row is highlighted with a background band across the
         // full terminal width (§Colour; colour only — the ▶ gutter still marks
         // the focus when colour is off)
         let is_focus_row = n.commit().map(|c| c.is_focus).unwrap_or(false);
         if is_focus_row && pal.on {
-            let target_w = if crate::show::stdout_is_tty() {
-                crate::show::terminal_width()
-            } else {
-                None
-            };
-            let padded = match target_w {
+            let padded = match term_w {
                 Some(w) if width(&line) < w => {
                     format!("{}{}", line, " ".repeat(w - width(&line)))
                 }
@@ -2036,12 +2078,6 @@ fn draw_rows(
             lines.push(dline);
         }
     }
-    // message truncation to the terminal width (§Step 4)
-    if crate::show::stdout_is_tty() {
-        if let Some(w) = crate::show::terminal_width() {
-            truncate_lines(&mut lines, w, msg_off, label_col, opts.margin);
-        }
-    }
     // no trailing whitespace on any row
     for l in lines.iter_mut() {
         while l.ends_with(' ') {
@@ -2050,7 +2086,7 @@ fn draw_rows(
     }
     // Legend (§Legend): explain the symbols that actually appear, faintly, on
     // the right of the tree if it fits the terminal width, else at the bottom.
-    append_legend(&mut lines, rows, opts, pal);
+    append_legend(&mut lines, rows, opts, pal, term_w);
     let mut out = lines.join("\n");
     out.push('\n');
     Ok(out)
@@ -2156,7 +2192,13 @@ fn legend_lines(used: &UsedSymbols) -> Vec<String> {
 /// faint, to the right of a tree row starting one row from the top, past the
 /// widest tree line. If that would exceed the terminal width (or there is no
 /// terminal), put the legend at the bottom instead.
-fn append_legend(lines: &mut Vec<String>, rows: &[&Display], opts: &TreeOptions, pal: &Palette) {
+fn append_legend(
+    lines: &mut Vec<String>,
+    rows: &[&Display],
+    opts: &TreeOptions,
+    pal: &Palette,
+    tty_width: Option<usize>,
+) {
     let used = collect_used(rows, opts, opts.icons);
     let entries = legend_lines(&used);
     if entries.is_empty() {
@@ -2166,11 +2208,6 @@ fn append_legend(lines: &mut Vec<String>, rows: &[&Display], opts: &TreeOptions,
     let legend_w = entries.iter().map(|e| width(e)).max().unwrap_or(0);
     let gap = 4;
     let right_total = tree_w + gap + legend_w;
-    let tty_width = if crate::show::stdout_is_tty() {
-        crate::show::terminal_width()
-    } else {
-        None
-    };
     let fits_right = tty_width.map_or(false, |w| right_total <= w);
     if fits_right {
         // pad every tree line to tree_w, then append the legend entries dim
@@ -2364,112 +2401,70 @@ fn color_rails(
     s
 }
 
-/// Cut the message so labels and the margin keep their columns (§Step 4).
-/// Only applied on a tty, so it is exercised directly by the tests.
-pub fn truncate_lines(
-    lines: &mut [String],
-    term_w: usize,
-    msg_off: usize,
-    label_col: bool,
-    margin: bool,
-) {
-    for line in lines.iter_mut() {
-        if width(line) <= term_w {
+/// `s` cut to display width `w`, ending with `…` when anything is cut (and
+/// there is a column for it): the message on a terminal (§Step 4). Colour
+/// escapes are kept whole and not counted, and those past the cut still
+/// follow it, so every style `s` opens is closed.
+fn cut_to_width(s: &str, w: usize) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    let mut kept = String::new();
+    // escapes not yet followed by a kept character
+    let mut pending = String::new();
+    let mut used = 0usize;
+    let mut in_esc = false;
+    let mut full = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_esc = true;
+        }
+        if in_esc {
+            in_esc = c != 'm';
+            pending.push(c);
             continue;
         }
-        // find the message span: it starts at msg_off and ends where the
-        // label/margin padding (2+ spaces) begins
-        let plain = strip_ansi(line);
-        if width(&plain) <= term_w {
+        if full {
             continue;
         }
-        // walk characters, tracking display column. Walk the *plain* string:
-        // skipping only the ESC character would leave the rest of each escape
-        // sequence (`[1;36m`) counted as display width.
-        let mut col = 0usize;
-        let mut cut_at: Option<usize> = None;
-        let mut tail_start: Option<usize> = None;
-        let mut prev_two_spaces = 0usize;
-        for (bi, ch) in plain.char_indices() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if col >= msg_off {
-                if ch == ' ' {
-                    prev_two_spaces += 1;
-                } else {
-                    prev_two_spaces = 0;
-                }
-                if prev_two_spaces == 2 && tail_start.is_none() {
-                    tail_start = Some(bi);
-                }
-            }
-            if col + w >= term_w && cut_at.is_none() {
-                cut_at = Some(bi);
-            }
-            col += w;
-        }
-        if !label_col && !margin {
+        // one column is left for the `…`
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw >= w {
+            full = true;
             continue;
         }
-        if let (Some(_cut), Some(_tail)) = (cut_at, tail_start) {
-            // rebuild from the plain string: this path only matters on a tty,
-            // so keep it simple and operate on plain text
-            let p = &plain;
-            let pw = width(p);
-            if pw <= term_w {
-                continue;
-            }
-            // find message end (last run of 2+ spaces that starts the fixed tail)
-            let bytes = p.as_bytes();
-            let mut tail_bi = p.len();
-            let mut i = 0usize;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b' ' && bytes[i + 1] == b' ' {
-                    // candidate: is everything after this point the fixed tail?
-                    tail_bi = i;
-                }
-                i += 1;
-            }
-            let tail = &p[tail_bi..];
-            let tail_w = width(tail);
-            let head_budget = term_w.saturating_sub(tail_w + 1);
-            // the whole plain line; the loop below stops it at head_budget.
-            // (This used to slice by `char_indices().count()`, a *char* count
-            // used as a *byte* index — a panic on any line whose multi-byte
-            // characters put that index inside a character.)
-            let head = p.as_str();
-            let mut head_w = 0usize;
-            let mut head_end = 0usize;
-            for (bi, ch) in head.char_indices() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if head_w + cw > head_budget {
-                    break;
-                }
-                head_w += cw;
-                head_end = bi + ch.len_utf8();
-            }
-            let head = head[..head_end].trim_end();
-            *line = format!("{}…{}", head, tail);
-        }
+        kept.push_str(&pending);
+        pending.clear();
+        kept.push(c);
+        used += cw;
+    }
+    let ellipsis = if w == 0 { "" } else { "…" };
+    format!("{}{}{}", kept.trim_end_matches(' '), ellipsis, pending)
+}
+
+/// Pad `line` with spaces to display column `col`.
+fn pad_to(line: &mut String, col: usize) {
+    let w = width(line);
+    if w < col {
+        line.push_str(&" ".repeat(col - w));
     }
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::new();
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            if c == 'm' {
-                esc = false;
-            }
-            continue;
-        }
-        if c == '\x1b' {
-            esc = true;
-            continue;
-        }
-        out.push(c);
+/// A row's metadata block (§Step 4): the data columns (date / files /
+/// author), each padded to its column's width in `extra_w`, then the margin
+/// (age and initials). Empty when the row shows none of them.
+fn meta_block(t: &RowText, extra_w: &[usize], opts: &TreeOptions, pal: &Palette) -> String {
+    let mut meta: Vec<String> = Vec::new();
+    for (e, w) in t.meta_extra.iter().zip(extra_w) {
+        let mut s = if e.is_empty() { String::new() } else { pal.grey(4, e) };
+        s.push_str(&" ".repeat(w - width(e)));
+        meta.push(s);
     }
-    out
+    if opts.margin && !t.age.is_empty() {
+        meta.push(pal.grey(4, &t.age));
+        meta.push(pal.author(&t.initials_author, &t.initials));
+    }
+    meta.join("  ").trim_end().to_string()
 }
 
 fn glyph_for(info: &CommitInfo, icons: bool) -> &'static str {

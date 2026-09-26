@@ -152,7 +152,8 @@ Columns, left to right, at fixed offsets:
    display tree, minimum 4 — so the rendered id is itself a valid id literal
    (§3.1). Blank on a run row.
 5. **Size bar** (`detail ≥ 1`, focus and its parent and children only; all
-   commits at `detail = 2`): `▁ ▂ ▃ ▅ ▇`, as before.
+   commits at `detail = 2`): `▁ ▂ ▃ ▅ ▇`, as before. A row without a bar
+   keeps the column blank; it is left out only when no row has a bar.
 6. **Message**: first line; nothing if empty; followed by `⋯ n` on a
    collapsed node.
 7. **Labels**: right-aligned column, present only if any rendered commit has

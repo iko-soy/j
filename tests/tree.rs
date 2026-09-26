@@ -846,6 +846,97 @@ fn tree_worked_example() {
 }
 
 // ----------------------------------------------------------------------
+// text columns (§Step 4): "Columns 4–8 start at the same offset on every
+// row", which the token comparison above cannot see
+// ----------------------------------------------------------------------
+
+/// The worked example's commit rows: id, message, age.
+const WORKED_ROWS: [(&str, &str, &str); 7] = [
+    ("@aaaa", "add parser", "3w"),
+    ("@kpqx", "release 1.2", "2w"),
+    ("@mnrv", "fix lexer", "1w"),
+    ("@wqzt", "wip", "2d"),
+    ("@ptlm", "docs", "1d"),
+    ("@qrst", "spike", "5h"),
+    ("@yxsk", "", "1h"),
+];
+
+/// The worked example's options at `detail`, with the data columns if `data`.
+fn worked_opts(detail: u8, data: bool) -> String {
+    format!(
+        "{{ detail = {}, margin = true, elide = true, icons = false, color = \"never\", lanes = 3, author = {d}, date = {d}, files = {d} }}",
+        detail,
+        d = data
+    )
+}
+
+/// The display column at which `needle` starts in `line`.
+fn col_of(line: &str, needle: &str) -> usize {
+    let at = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("no {:?} in {:?}", needle, line));
+    j::render::width(&line[..at])
+}
+
+/// The row of `text` that carries the id `id`.
+fn row_of<'a>(text: &'a str, id: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.contains(id))
+        .unwrap_or_else(|| panic!("no row {}\n{}", id, text))
+}
+
+#[test]
+fn tree_columns_line_up_on_every_row() {
+    // the message moved two columns right on rows with a size bar (and a
+    // row without one kept no blank slot), and the label and margin columns
+    // were placed from absolute edges used as widths, ~msg_off columns too
+    // far right, and per row from the row's own label width
+    for detail in 0..=2 {
+        for data in [false, true] {
+            let (repo, be) = worked_example();
+            let (mut i, cfg) = make_interp(be);
+            let src = format!("treeWith ({})", worked_opts(detail, data));
+            let text = tree_text(&mut i, &cfg, &src, repo);
+            let ctx = format!("detail {} data {}\n{}", detail, data, text);
+            // message: the same column on every row, bar or not
+            let msg_col = col_of(row_of(&text, "@kpqx"), "release 1.2");
+            for (id, msg, _) in WORKED_ROWS.iter().filter(|r| !r.1.is_empty()) {
+                assert_eq!(col_of(row_of(&text, id), msg), msg_col, "{} message\n{}", id, ctx);
+            }
+            // labels: two columns past the widest message
+            let lab_col = msg_col + j::render::width("release 1.2") + 2;
+            assert_eq!(col_of(row_of(&text, "@kpqx"), "main"), lab_col, "main\n{}", ctx);
+            assert_eq!(col_of(row_of(&text, "@wqzt"), "feature"), lab_col, "feature\n{}", ctx);
+            // the data columns, then the margin: two past the widest label,
+            // each at the same column on every row (authors differ in width)
+            let block_col = lab_col + j::render::width("feature") + 2;
+            let age_col = col_of(row_of(&text, "@aaaa"), "3w");
+            for (id, _, age) in WORKED_ROWS.iter() {
+                let row = row_of(&text, id);
+                assert_eq!(col_of(row, age), age_col, "{} age\n{}", id, ctx);
+                if data {
+                    assert_eq!(col_of(row, "20"), block_col, "{} date\n{}", id, ctx);
+                }
+            }
+            if !data {
+                assert_eq!(age_col, block_col, "margin\n{}", ctx);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_row_without_a_bar_keeps_the_bar_slot() {
+    // specs/tree.md's worked example draws the empty `ptlm` as `@ptlm    docs`
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let src = format!("treeWith ({})", worked_opts(2, false));
+    let text = tree_text(&mut i, &cfg, &src, repo);
+    assert!(row_of(&text, "@ptlm").contains("@ptlm    docs"), "{}", text);
+    assert!(row_of(&text, "@wqzt").contains("@wqzt ▃  wip"), "{}", text);
+}
+
+// ----------------------------------------------------------------------
 // row order and lanes (specs/tree.md Steps 1–3): rows go by time, minted
 // commits last, and "last child" / "after t" mean in row order, which an
 // edit that appends a child (`new`, `rebase`) makes differ from sibling order
@@ -1021,67 +1112,178 @@ fn trunk_reservations_are_taken_in_row_order() {
 
 
 // ----------------------------------------------------------------------
-// terminal-width truncation (§Step 4). Only runs on a tty in the binary,
-// so it is driven directly here.
+// terminal-width truncation (§Step 4). Only a tty has a width in the
+// binary, so it is driven here through `tree_with_width`.
 // ----------------------------------------------------------------------
 
-fn truncate_one(line: &str, term_w: usize) -> String {
-    let mut lines = vec![line.to_string()];
-    // msg_off 18 matches the rendered layout: rails, glyph and id column
-    j::render::truncate_lines(&mut lines, term_w, 18, true, true);
-    lines.pop().unwrap()
+/// The tree rows `treeWith opts` draws on a terminal `w` columns wide, the
+/// legend (set at the bottom once a row fills the width) left out.
+fn rows_on_terminal(i: &mut Interp, cfg: &config::Config, opts: &str, repo: &Value, w: usize) -> Vec<String> {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(opts, outer).unwrap();
+    let env = i.global_env();
+    let o = i.eval(&Rc::new(e), &env).unwrap();
+    let text = j::render::tree_with_width(i, &o, repo, Some(w)).unwrap();
+    let text = text.as_text().unwrap();
+    text.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// A focused commit with `msg` and the label `lbl` on a root.
+fn one_row_repo(msg: &str) -> Value {
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", msg, &["lbl"], vec![("f", "x")]);
+    repo_of(root, vec![subtree(a, vec![])], Some(0))
+}
+
+const ONE_ROW_OPTS: &str =
+    "{ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false }";
+
+#[test]
+fn truncation_cuts_only_the_message() {
+    // the cut kept only what followed the *last* two-space run, the author
+    // initials: labels were cut (`mast…`) and the age dropped, and a message
+    // that fitted still got `…`
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let w = 40;
+    let rows = rows_on_terminal(&mut i, &cfg, &worked_opts(2, false), &repo, w);
+    let ctx = rows.join("\n");
+    let msg_col = col_of(row_of(&ctx, "@wqzt"), "wip");
+    let lab_col = col_of(row_of(&ctx, "@kpqx"), "main");
+    assert_eq!(col_of(row_of(&ctx, "@wqzt"), "feature"), lab_col, "labels moved\n{}", ctx);
+    // 18 columns before the message and 17 after it (`feature  2d  mo`)
+    // leave it 5
+    let fits = 5;
+    for (id, msg, age) in WORKED_ROWS.iter() {
+        let row = row_of(&ctx, id);
+        assert!(j::render::width(row) <= w, "{} is {} cols\n{}", id, j::render::width(row), ctx);
+        // labels and the margin are whole and in their columns
+        assert!(row.ends_with(&format!("{}  {}", age, if *id == "@ptlm" { "ak" } else { "mo" })),
+            "{} margin\n{}", id, ctx);
+        assert_eq!(col_of(row, age), col_of(row_of(&ctx, "@aaaa"), "3w"), "{} margin\n{}", id, ctx);
+        // the message column (`⋯ n` included): whole when it fits, else a
+        // prefix of it and `…`
+        let full = if *id == "@ptlm" { "docs  ⋯ 3" } else { msg };
+        let shown = between_cols(row, msg_col, lab_col);
+        let shown = shown.trim_end();
+        match shown.strip_suffix('…') {
+            Some(head) => assert!(
+                j::render::width(full) > fits && !head.is_empty() && full.starts_with(head),
+                "{} cut to {:?}\n{}", id, shown, ctx
+            ),
+            None => assert!(
+                j::render::width(full) <= fits && shown == full,
+                "{} shows {:?}\n{}", id, shown, ctx
+            ),
+        }
+    }
+}
+
+/// The characters of `line` from display column `from` up to `to`.
+fn between_cols(line: &str, from: usize, to: usize) -> String {
+    let mut col = 0;
+    let mut out = String::new();
+    for c in line.chars() {
+        if col >= from && col < to {
+            out.push(c);
+        }
+        col += j::render::width(&c.to_string());
+    }
+    out
+}
+
+#[test]
+fn truncation_cuts_rows_without_labels_or_margin() {
+    // with no label column and no margin nothing was ever cut
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", &"a long message ".repeat(6), &[], vec![("f", "x")]);
+    let repo = repo_of(root, vec![subtree(a, vec![])], Some(0));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 30).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.starts_with("▶ ◉") && row.ends_with('…'), "{:?}", row);
+    assert_eq!(j::render::width(row), 30, "{:?}", row);
+}
+
+#[test]
+fn truncation_keeps_the_tail_and_fits() {
+    let repo = one_row_repo(&"message ".repeat(20));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 60).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.ends_with("…  lbl"), "tail lost: {:?}", row);
+    assert!(j::render::width(row) <= 60, "{} cols: {:?}", j::render::width(row), row);
+}
+
+#[test]
+fn truncation_keeps_colours_closed() {
+    // the cut runs on the coloured message (bold on the focus row): the
+    // escape sequences are kept, not counted as width or cut in half
+    unsafe { std::env::remove_var("NO_COLOR") };
+    let repo = one_row_repo(&"message ".repeat(20));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let opts = ONE_ROW_OPTS.replace("\"never\"", "\"always\"");
+    let rows = rows_on_terminal(&mut i, &cfg, &opts, &repo, 60).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.contains("…\x1b[0m"), "{:?}", row);
+    // the focus band pads the row to the terminal's width, and no further
+    assert_eq!(j::render::width(row), 60, "{:?}", row);
+}
+
+#[test]
+fn truncation_leaves_short_lines_alone() {
+    let repo = one_row_repo("short");
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 100).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.contains("  short  lbl") && !row.contains('…'), "{:?}", row);
 }
 
 #[test]
 fn truncation_handles_multibyte_messages() {
     // the head was sliced with a *char* count used as a *byte* index, which
     // panics whenever that index lands inside a multi-byte character
-    let tail = "  label";
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
     for n in 1..80 {
+        let repo = one_row_repo(&"ω".repeat(n));
         for w in [20usize, 30, 40, 50, 60, 80] {
-            let msg: String = "ω".repeat(n);
-            let line = format!("  ●        @abcd  {}{}", msg, tail);
-            let got = truncate_one(&line, w);
+            let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, w).join("\n");
+            let row = row_of(&rows, "@kaaa");
+            // only the message is cut: the gutter, rails, id, bar and label
+            // take 25 columns whatever the width
             assert!(
-                j::render::width(&got) <= w.max(j::render::width(tail) + 2),
+                j::render::width(row) <= w.max(25),
                 "n={} w={} -> {:?} ({} cols)",
                 n,
                 w,
-                got,
-                j::render::width(&got)
+                row,
+                j::render::width(row)
             );
+            // (on a wide terminal the legend follows it)
+            assert!(row.contains("  lbl"), "n={} w={} -> {:?}", n, w, row);
         }
     }
 }
 
 #[test]
-fn truncation_keeps_the_tail_and_fits() {
-    let line = format!("  ●        @abcd  {}  bookmark", "message ".repeat(20));
-    let got = truncate_one(&line, 60);
-    assert!(got.contains('…'), "no ellipsis: {:?}", got);
-    assert!(got.ends_with("bookmark"), "tail lost: {:?}", got);
-    assert!(j::render::width(&got) <= 60, "{} cols: {:?}", j::render::width(&got), got);
-}
-
-#[test]
-fn truncation_leaves_short_lines_alone() {
-    let line = "  ●        @abcd  short  label";
-    assert_eq!(truncate_one(line, 100), line);
-}
-
-#[test]
 fn truncation_survives_mixed_scripts() {
     // wide (CJK), combining and ASCII in one message
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
     for msg in [
         "日本語のテキストがとても長い場合の折り返し処理",
         "réfactorisation très importante — étape finale ✓",
         "αβγδε ωωωωω ✓✓✓ ascii tail here",
         "a̐éö̲ combining marks",
     ] {
+        let repo = one_row_repo(msg);
         for w in [10usize, 25, 45, 70] {
-            let line = format!("  ●        @abcd  {}  lbl", msg);
-            let got = truncate_one(&line, w);
-            assert!(!got.is_empty(), "msg={:?} w={}", msg, w);
+            let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, w).join("\n");
+            let row = row_of(&rows, "@kaaa");
+            assert!(j::render::width(row) <= w.max(25), "msg={:?} w={} -> {:?}", msg, w, row);
+            assert!(row.contains("  lbl"), "msg={:?} w={} -> {:?}", msg, w, row);
         }
     }
 }
