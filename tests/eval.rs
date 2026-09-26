@@ -432,6 +432,12 @@ mapInner = \xs -> map inner xs
 
 first : [Int] -> Int
 first = head
+
+mapped : [Int] -> [Int]
+mapped = map (\x -> x + head [])
+
+counted : [Int] -> Int
+counted = map id
 "#;
 
 /// The message of the crash `src` raises and the definition it is in.
@@ -480,6 +486,9 @@ fn crash_names_the_innermost_definition_executing() {
         ("first []", Some("first")),
         ("first \"x\"", Some("first")),
         ("squash 3", Some("squash")),
+        // and so do the functions it applies, and its result's check
+        ("mapped [1]", Some("mapped")),
+        ("counted [1]", Some("counted")),
         // a builtin is no definition: outside every definition, none
         ("head []", None),
         ("crash \"top\"", None),
@@ -606,6 +615,95 @@ fn very_deep_or_recursion() {
         "let go = \\n -> (if n <= 0 then crash \"bottom\" else go (n - 1)) or n in go 50000",
     );
     assert!(value_eq(&v.unwrap(), &Value::int(0)).unwrap());
+}
+
+#[test]
+fn very_deep_recursion_through_builtins_that_apply_functions() {
+    // §4.1: map, filter, foldl and a composition applied the functions they
+    // were given in a nested run on the native stack, so a recursion through
+    // one of them overflowed the stack and aborted the process at depths
+    // that plain recursion (very_deep_recursion) reaches on this thread
+    let (mut i, cfg) = make_interp();
+    for src in [
+        "let f = \\n -> if n == 0 then 0 else head (map f [(n - 1)]) in f 30000",
+        "let f = \\n -> if n == 0 then 0 else length (filter (\\x -> f (n - 1) == 0) [1]) - 1 in f 30000",
+        "let f = \\n -> if n == 0 then 0 else foldl (\\a x -> f (n - 1)) 0 [1] in f 30000",
+        "let f = \\n -> if n == 0 then 0 else ((\\x -> x) . f) (n - 1) in f 30000",
+        "let f = \\n -> if n == 0 then 0 else (head . map f) [(n - 1)] in f 30000",
+    ] {
+        check!(i, cfg, src, Value::int(0));
+    }
+}
+
+/// Run `f` on a thread with a stack of `mb` megabytes.
+fn on_stack(mb: usize, f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(mb * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn deep_linear_history_takes_no_native_stack_per_commit() {
+    // `commits` recurses through `map` once per level of history, and
+    // `labelled`, `trunk` and `immutable` walk the history with it. The
+    // binary evaluates `immutable` on every run (§7.2), so a long linear
+    // history made every command overflow the stack and abort (§4.1). The
+    // chain is built in the language, its deepest commit labelled `main`,
+    // and seen from the top; the stack is a small fraction of the binary's,
+    // so native stack spent per commit shows at a depth a test can afford.
+    on_stack(16, || {
+        let (mut i, cfg) = make_interp();
+        let n = 3000;
+        let src = format!(
+            "let leaf = {{ root = {{ files = [], message = \"\", labels = [\"main\"], id = @ }}, children = [] }}; \
+             chain = foldl (\\t k -> {{ root = {{ files = [], message = \"\", labels = [], id = @ }}, children = [t] }}) leaf (range 1 {n}); \
+             repo = {{ root = chain.root, children = chain.children, context = [] }} \
+             in [(length (commits repo)) (length (trunk repo)) (length (immutable repo))]"
+        );
+        check!(
+            i,
+            cfg,
+            &src,
+            Value::list(vec![Value::int(n), Value::int(1), Value::int(n)])
+        );
+    });
+}
+
+#[test]
+fn builtins_that_apply_functions_keep_their_semantics() {
+    let (mut i, cfg) = make_interp();
+    let ints = |xs: &[i64]| Value::list(xs.iter().map(|&x| Value::int(x)).collect());
+    // elements are visited left to right, so the first crash is the first
+    // element's (§4: evaluation is left to right)
+    for (src, msg) in [
+        ("map (\\x -> crash (show x)) [1 2]", "1"),
+        ("filter (\\x -> crash (show x)) [1 2]", "1"),
+        ("foldl (\\a x -> crash (show x)) 0 [1 2]", "1"),
+        ("filter (\\x -> x) [true 1]", "filter: predicate returned a Int"),
+        ("(not . head) []", "head: empty list"),
+    ] {
+        let m = crash(&mut i, &cfg, src);
+        assert!(m.ends_with(msg), "{} => {}", src, m);
+    }
+    // a crash in a function they apply unwinds to the nearest `or`, outside
+    // them or inside the function
+    check!(i, cfg, "map (\\x -> if x == 2 then crash \"two\" else x) [1 2 3] or [0]", ints(&[0]));
+    check!(i, cfg, "map (\\x -> (if x == 2 then crash \"two\" else x) or 0) [1 2 3]", ints(&[1, 0, 3]));
+    check!(i, cfg, "filter (\\x -> x > 1 or false) [1 2 3]", ints(&[2, 3]));
+    check!(i, cfg, "foldl (\\a x -> (a + head []) or x) 0 [1 2 3]", Value::int(3));
+    check!(i, cfg, "((\\x -> x + 1) . (\\x -> head [] or x)) 1", Value::int(2));
+    // nested, empty, and partially applied
+    check!(i, cfg, "map (map ((+) 1)) [[1] [] [2 3]]", Value::list(vec![ints(&[2]), ints(&[]), ints(&[3, 4])]));
+    check!(i, cfg, "map id []", ints(&[]));
+    check!(i, cfg, "filter (\\x -> true) []", ints(&[]));
+    check!(i, cfg, "foldl (\\a x -> crash \"no\") 5 []", Value::int(5));
+    check!(i, cfg, "foldl (\\a x -> a * 10 + x) 0 [1 2 3]", Value::int(123));
+    check!(i, cfg, "(map (\\x -> x * 2) . filter (\\x -> x > 1)) [1 2 3]", ints(&[4, 6]));
+    // the body of the function is evaluated on each application (§4.10)
+    check!(i, cfg, "let ids = map (\\x -> @) [1 2 3] in nth 0 ids /= nth 2 ids", Value::Bool(true));
 }
 
 #[test]

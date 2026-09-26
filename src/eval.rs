@@ -4,7 +4,7 @@
 use crate::ast::{Expr, Pattern};
 use crate::domain::Backend;
 use crate::shape::{check as contract_check, Contract, Shapes};
-use crate::value::{Crash, Env, FunVal, Value};
+use crate::value::{Crash, Env, FunVal, ListVal, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -149,6 +149,51 @@ pub(crate) enum Cont {
         supplied: usize,
         cont: Rc<Cont>,
     },
+    // The builtins that apply functions they are given run as steps of this
+    // machine, not in a nested run, so a recursion through them takes no
+    // native stack (§4.1; Interp::step_applying). Each frame below receives
+    // one value, so `acc` is pushed to once per element and shared, not
+    // copied, when the trampoline clones the continuation.
+    /// `map f xs`, receiving `f` of the element at `idx`
+    MapNext {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        acc: Rc<RefCell<Vec<Value>>>,
+        cont: Rc<Cont>,
+    },
+    /// `filter p xs`, receiving `p` of the element at `idx`
+    FilterNext {
+        p: Value,
+        xs: ListVal,
+        idx: usize,
+        acc: Rc<RefCell<Vec<Value>>>,
+        cont: Rc<Cont>,
+    },
+    /// `foldl f z xs`, receiving `f` applied to the accumulator, to be
+    /// applied to the element at `idx`
+    FoldlArg {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        cont: Rc<Cont>,
+    },
+    /// `foldl f z xs`, receiving the accumulator after the element at `idx`
+    FoldlAcc {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        cont: Rc<Cont>,
+    },
+    /// the result of such a builtin, checked against its contract once the
+    /// functions it applies have run (§4.13); `def` is the signed definition
+    /// the builtin is the value of, which a crash under this frame is in (§1.4)
+    BuiltinResult {
+        cname: String,
+        check: Option<Rc<crate::shape::ContractExpr>>,
+        def: Option<String>,
+        cont: Rc<Cont>,
+    },
 }
 
 pub type EResult = Result<Value, Crash>;
@@ -198,6 +243,11 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::ListElems { cont, .. } => Some(cont),
         Cont::CheckExpr { cont, .. } => Some(cont),
         Cont::CheckResult { cont, .. } => Some(cont),
+        Cont::MapNext { cont, .. } => Some(cont),
+        Cont::FilterNext { cont, .. } => Some(cont),
+        Cont::FoldlArg { cont, .. } => Some(cont),
+        Cont::FoldlAcc { cont, .. } => Some(cont),
+        Cont::BuiltinResult { cont, .. } => Some(cont),
     }
 }
 
@@ -208,15 +258,46 @@ pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
 
 /// The innermost definition whose application `k` continues (§1.4): a signed
 /// definition's body runs under a `CheckExpr` of its result, which stays on
-/// the chain until the body has returned. Only used on a crash no `Try`
-/// caught, so there is no `Try` on the chain to stop the walk early.
+/// the chain until the body has returned, and one whose value is a builtin
+/// that applies functions runs them under a `BuiltinResult` naming it. Only
+/// used on a crash no `Try` caught, so there is no `Try` on the chain to stop
+/// the walk early.
 fn innermost_def(k: &Cont) -> Option<String> {
     let mut k = k;
     loop {
-        if let Cont::CheckExpr { name, .. } = k {
-            return Some(name.clone());
+        match k {
+            Cont::CheckExpr { name, .. }
+            | Cont::BuiltinResult {
+                def: Some(name), ..
+            } => return Some(name.clone()),
+            _ => {}
         }
         k = parent_rc(k)?;
+    }
+}
+
+/// the builtins that apply the functions they are given; they run as steps
+/// of the machine (Interp::step_applying)
+fn applies_functions(builtin: &str) -> bool {
+    matches!(builtin, "map" | "filter" | "foldl" | "(.)")
+}
+
+/// a builtin's function argument
+fn function_arg(v: &Value) -> Result<Value, Crash> {
+    match v {
+        Value::Fun(_) => Ok(v.clone()),
+        v => Err(Crash::new(format!(
+            "expected a function, got a {}",
+            v.kind_name()
+        ))),
+    }
+}
+
+/// a builtin's list argument, sharing its elements
+fn list_arg(v: &Value) -> Result<ListVal, Crash> {
+    match v {
+        Value::List(xs) => Ok(xs.clone()),
+        v => Err(Crash::new(format!("expected a list, got a {}", v.kind_name()))),
     }
 }
 
@@ -351,10 +432,86 @@ impl Interp {
     /// a composition's made from its operands', names no definition, and the
     /// crash is in whichever definition applied it (§1.4).
     fn blame_builtin(&self, c: Crash, builtin: &str, cname: &str) -> Crash {
+        match self.builtin_def(builtin, cname) {
+            Some(def) => in_def(c, &def),
+            None => c,
+        }
+    }
+
+    /// the definition a crash while applying `builtin` under the contract
+    /// named `cname` is in, as blame_builtin decides
+    fn builtin_def(&self, builtin: &str, cname: &str) -> Option<String> {
         if cname != builtin && self.contracts.contains_key(cname) {
-            in_def(c, cname)
+            Some(cname.to_string())
         } else {
-            c
+            None
+        }
+    }
+
+    /// `map`, `filter`, `foldl` or a composition node given all its
+    /// arguments, continuing in `k`. They apply the functions they are given,
+    /// so they run as steps of this machine: applying them in a nested run
+    /// put every level of a recursion through one of them on the native
+    /// stack, which overflowed and aborted where plain recursion runs (§4.1).
+    /// Evaluation stays left to right, element by element (§4).
+    fn step_applying(&mut self, builtin: &str, args: &[Value], k: Cont) -> Result<Run, Crash> {
+        match builtin {
+            // (f . g) x = f (g x) (§4.9), whatever x is: a function argument
+            // is applied like any other, and g's contract checks it (§4.13).
+            // `squash = abandon . contract everything` waits for the
+            // repository because it is this node, not because anything
+            // composes on a function argument.
+            "(.)" => Ok(Run::Step(State::Apply(
+                args[1].clone(),
+                args[2].clone(),
+                Cont::Fun(args[0].clone(), Rc::new(k)),
+            ))),
+            "map" | "filter" => {
+                let f = function_arg(&args[0])?;
+                let xs = list_arg(&args[1])?;
+                if xs.is_empty() {
+                    return Ok(Run::Step(State::Ret(Value::list(vec![]), k)));
+                }
+                let x = xs[0].clone();
+                let acc = Rc::new(RefCell::new(Vec::new()));
+                let cont = Rc::new(k);
+                let next = if builtin == "map" {
+                    Cont::MapNext {
+                        f: f.clone(),
+                        xs,
+                        idx: 0,
+                        acc,
+                        cont,
+                    }
+                } else {
+                    Cont::FilterNext {
+                        p: f.clone(),
+                        xs,
+                        idx: 0,
+                        acc,
+                        cont,
+                    }
+                };
+                Ok(Run::Step(State::Apply(f, x, next)))
+            }
+            "foldl" => {
+                let f = function_arg(&args[0])?;
+                let xs = list_arg(&args[2])?;
+                if xs.is_empty() {
+                    return Ok(Run::Step(State::Ret(args[1].clone(), k)));
+                }
+                let next = Cont::FoldlArg {
+                    f: f.clone(),
+                    xs,
+                    idx: 0,
+                    cont: Rc::new(k),
+                };
+                Ok(Run::Step(State::Apply(f, args[1].clone(), next)))
+            }
+            _ => Err(Crash::new(format!(
+                "internal: `{}` does not apply functions",
+                builtin
+            ))),
         }
     }
 
@@ -865,6 +1022,95 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::MapNext {
+                f,
+                xs,
+                idx,
+                acc,
+                cont,
+            } => {
+                acc.borrow_mut().push(v);
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let x = xs[idx].clone();
+                    let next = Cont::MapNext {
+                        f: f.clone(),
+                        xs,
+                        idx,
+                        acc,
+                        cont,
+                    };
+                    Run::Step(State::Apply(f, x, next))
+                } else {
+                    Run::Step(State::Ret(Value::list(acc.take()), (*cont).clone()))
+                }
+            }
+            Cont::FilterNext {
+                p,
+                xs,
+                idx,
+                acc,
+                cont,
+            } => {
+                match v {
+                    Value::Bool(true) => acc.borrow_mut().push(xs[idx].clone()),
+                    Value::Bool(false) => (),
+                    v => {
+                        return Run::Crash(Crash::new(format!(
+                            "filter: predicate returned a {}",
+                            v.kind_name()
+                        )))
+                    }
+                }
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let x = xs[idx].clone();
+                    let next = Cont::FilterNext {
+                        p: p.clone(),
+                        xs,
+                        idx,
+                        acc,
+                        cont,
+                    };
+                    Run::Step(State::Apply(p, x, next))
+                } else {
+                    Run::Step(State::Ret(Value::list(acc.take()), (*cont).clone()))
+                }
+            }
+            Cont::FoldlArg { f, xs, idx, cont } => {
+                let x = xs[idx].clone();
+                Run::Step(State::Apply(v, x, Cont::FoldlAcc { f, xs, idx, cont }))
+            }
+            Cont::FoldlAcc { f, xs, idx, cont } => {
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let next = Cont::FoldlArg {
+                        f: f.clone(),
+                        xs,
+                        idx,
+                        cont,
+                    };
+                    Run::Step(State::Apply(f, v, next))
+                } else {
+                    Run::Step(State::Ret(v, (*cont).clone()))
+                }
+            }
+            Cont::BuiltinResult {
+                cname,
+                check,
+                def,
+                cont,
+            } => {
+                if let Some(c) = &check {
+                    if let Err(cr) = c.check_result(&self.shapes, &cname, &v) {
+                        return Run::Crash(match &def {
+                            Some(d) => in_def(cr, d),
+                            None => cr,
+                        });
+                    }
+                }
+                Run::Step(State::Ret(v, (*cont).clone()))
+            }
         }
     }
 
@@ -896,23 +1142,39 @@ impl Interp {
                     let advanced = cexpr
                         .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
                     if all.len() == *arity {
+                        // a composition's contract derived from its operands
+                        // leaves results to theirs, checked as the
+                        // composition runs; a signature attached to it is
+                        // checked like any other
+                        let check = advanced.filter(|c| {
+                            name != "(.)"
+                                || matches!(**c, crate::shape::ContractExpr::Known { .. })
+                        });
+                        if applies_functions(name) {
+                            // the result is checked once the functions have
+                            // run, and a crash while they run is blamed as
+                            // one in the builtin itself
+                            let def = self.builtin_def(name, &cname);
+                            let k = if check.is_some() || def.is_some() {
+                                Cont::BuiltinResult {
+                                    cname: cname.clone(),
+                                    check,
+                                    def,
+                                    cont: Rc::new(k),
+                                }
+                            } else {
+                                k
+                            };
+                            return match self.step_applying(name, &all, k) {
+                                Ok(run) => run,
+                                Err(c) => Run::Crash(self.blame_builtin(c, name, &cname)),
+                            };
+                        }
                         match bf(self, &all) {
                             Ok(r) => {
-                                // a composition's contract derived from its
-                                // operands leaves results to theirs, checked
-                                // as the composition runs; a signature
-                                // attached to it is checked like any other
-                                if let Some(c) = &advanced {
-                                    if name != "(.)"
-                                        || matches!(**c, crate::shape::ContractExpr::Known { .. })
-                                    {
-                                        if let Err(cr) =
-                                            c.check_result(&self.shapes, &cname, &r)
-                                        {
-                                            return Run::Crash(
-                                                self.blame_builtin(cr, name, &cname),
-                                            );
-                                        }
+                                if let Some(c) = &check {
+                                    if let Err(cr) = c.check_result(&self.shapes, &cname, &r) {
+                                        return Run::Crash(self.blame_builtin(cr, name, &cname));
                                     }
                                 }
                                 Run::Step(State::Ret(r, k))
