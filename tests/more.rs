@@ -119,6 +119,27 @@ fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
 }
 
 #[test]
+fn composition_argument_belongs_to_the_right_operand() {
+    // §4.9: in (f . g) x the argument is g's. When g's contract was unknown
+    // (a selector, an unsigned composition, an `or`), x was checked against
+    // f's parameter instead.
+    let (mut i, cfg) = make_interp_with("foo : Int -> a\nfoo = \\x y -> [y]\n");
+    assert_value(&mut i, &cfg, "(length . .xs) ({ xs = [1 2] })", Value::int(2));
+    assert_value(&mut i, &cfg, "(not . .b) ({ b = true })", Value::bool(false));
+    assert_value(&mut i, &cfg, "(length . (\\r -> [r]) . (\\r -> r)) 5", Value::int(1));
+    assert_value(&mut i, &cfg, "(length . ((\\x -> [x]) or id) . id) 5", Value::int(1));
+    // g's own contract is used up, so x goes unchecked into it, not into f
+    assert_value(&mut i, &cfg, "(length . foo 1) \"abc\"", Value::int(1));
+    // a known g still checks its argument, numbered as g's
+    let m = crash_msg(&mut i, &cfg, "(length . head) 5");
+    assert!(
+        m.contains("(length . head) expected [a] (a list) as argument 1, got Int"),
+        "{}",
+        m
+    );
+}
+
+#[test]
 fn signatures_hold_whatever_the_definition_is_built_from() {
     // §4.13: a signature is checked at every application of the definition,
     // whether its value is a lambda, a composition, an `or`, or a label.

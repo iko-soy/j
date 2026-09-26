@@ -275,10 +275,10 @@ impl ContractExpr {
         match self {
             ContractExpr::Unknown => None,
             ContractExpr::Known { contract, at } => contract.params.get(*at).cloned(),
-            ContractExpr::Compose(f, g) => g
-                .next_param()
-                .or_else(|| f.next_param())
-                .or_else(|| f.result_after()),
+            // (f . g) x = f (g x) (§4.9): the argument is g's, even when
+            // g's contract is unknown or used up, and f's own contract
+            // checks what g returns when it is applied to it
+            ContractExpr::Compose(_, g) => g.next_param(),
             ContractExpr::ApplyFirst(e) => {
                 let advanced = ContractExpr::apply_first(e.clone());
                 advanced.next_param()
