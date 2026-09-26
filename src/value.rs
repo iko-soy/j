@@ -68,14 +68,22 @@ pub struct ThunkVal {
 
 enum ThunkState {
     Pending(Box<dyn FnOnce() -> Result<Value, Crash>>),
+    /// the computation has been taken out of `Pending` and is running
+    Forcing,
     Ready(Value),
+    /// the computation crashed (a store read failed). Every later force
+    /// crashes the same way (§7.2): a crash caught by `or`, or swallowed by
+    /// rendering, must not leave some other value behind.
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for ThunkVal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &*self.state.borrow() {
             ThunkState::Pending(_) => write!(f, "Thunk(pending)"),
+            ThunkState::Forcing => write!(f, "Thunk(forcing)"),
             ThunkState::Ready(v) => write!(f, "Thunk({:?})", v),
+            ThunkState::Failed(c) => write!(f, "Thunk(failed: {})", c.msg),
         }
     }
 }
@@ -87,24 +95,27 @@ impl ThunkVal {
         }
     }
 
-    /// the value, computing it on first call and memoizing
+    /// the value, computing it on first call and memoizing the outcome, a
+    /// crash included
     pub fn force(&self) -> Result<Value, Crash> {
-        if let ThunkState::Ready(v) = &*self.state.borrow() {
-            return Ok(v.clone());
-        }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, ThunkState::Ready(Value::Bool(false))) {
-                ThunkState::Pending(t) => t,
-                ThunkState::Ready(v) => {
-                    *st = ThunkState::Ready(v.clone());
-                    return Ok(v);
-                }
+        match &*self.state.borrow() {
+            ThunkState::Ready(v) => return Ok(v.clone()),
+            ThunkState::Failed(c) => return Err(c.clone()),
+            ThunkState::Forcing => {
+                return Err(Crash::new("internal: a lazy value was forced re-entrantly"))
             }
+            ThunkState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), ThunkState::Forcing) {
+            ThunkState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let v = thunk()?;
-        *self.state.borrow_mut() = ThunkState::Ready(v.clone());
-        Ok(v)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(v) => ThunkState::Ready(v.clone()),
+            Err(c) => ThunkState::Failed(c.clone()),
+        };
+        out
     }
 }
 
@@ -149,7 +160,12 @@ pub struct LazyBlob {
 
 enum LazyState {
     Pending(Box<dyn FnOnce() -> Result<Rc<Vec<u8>>, Crash>>),
+    /// the read has been taken out of `Pending` and is running
+    Forcing,
     Ready(Rc<Vec<u8>>),
+    /// the read failed: every later force fails the same way, so the blob
+    /// never reads as empty (§7.2), whoever caught or swallowed the crash
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for LazyBlob {
@@ -176,25 +192,28 @@ impl LazyBlob {
         }
     }
 
-    /// the bytes, reading from the store on first call and memoizing
+    /// the bytes, reading from the store on first call and memoizing the
+    /// outcome, a failed read included
     pub fn force(&self) -> Result<Rc<Vec<u8>>, Crash> {
         // fast path: already forced
-        if let LazyState::Ready(b) = &*self.state.borrow() {
-            return Ok(b.clone());
-        }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, LazyState::Ready(Rc::new(Vec::new()))) {
-                LazyState::Pending(t) => t,
-                LazyState::Ready(b) => {
-                    *st = LazyState::Ready(b.clone());
-                    return Ok(b);
-                }
+        match &*self.state.borrow() {
+            LazyState::Ready(b) => return Ok(b.clone()),
+            LazyState::Failed(c) => return Err(c.clone()),
+            LazyState::Forcing => {
+                return Err(Crash::new("internal: a lazy blob was read re-entrantly"))
             }
+            LazyState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), LazyState::Forcing) {
+            LazyState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let bytes = thunk()?;
-        *self.state.borrow_mut() = LazyState::Ready(bytes.clone());
-        Ok(bytes)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(b) => LazyState::Ready(b.clone()),
+            Err(c) => LazyState::Failed(c.clone()),
+        };
+        out
     }
 }
 

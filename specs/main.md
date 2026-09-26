@@ -767,7 +767,10 @@ a value as follows.
 
 The record is the *semantics*. An implementation may back `files`, `children`,
 and `context` with lazily materialised structures, provided every observation
-an expression can make agrees with the eager value.
+an expression can make agrees with the eager value. If materialising one of
+them, or a file's content, fails (an object missing from the store), every
+later use of it fails the same way: a crash caught by `or` (§4.7) never leaves
+some other value in its place.
 
 ### 7.3 Files, blobs, and `replay`
 
