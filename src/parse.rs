@@ -3,7 +3,7 @@
 use crate::ast::{Expr, Item, Pattern, TypeExpr};
 use crate::lex::{lex, LexError, SpTok, Tok};
 use num_bigint::BigInt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -35,6 +35,16 @@ pub struct Parser {
     pos: usize,
     /// Names in scope (top-level + builtins) for the no-shadowing rule.
     outer_names: Rc<BTreeSet<String>>,
+    /// Names bound by the lambdas and `let` blocks around the current
+    /// position, for the same rule (§4.2). Since shadowing is refused, no
+    /// name is in here twice, and a construct removes the names it added
+    /// when its scope ends.
+    locals: HashSet<String>,
+    /// How many local binders have been parsed, and for each name the
+    /// ordinal and line of the latest one: the `let` check that `locals`
+    /// cannot make (see `parse_let`).
+    binders: usize,
+    last_binder: HashMap<String, (usize, usize)>,
     /// set when an operator expression ends with a trailing operator before
     /// `)`, i.e. a left section
     section_op: Option<&'static str>,
@@ -74,6 +84,9 @@ impl Parser {
             toks: lex(src)?,
             pos: 0,
             outer_names,
+            locals: HashSet::new(),
+            binders: 0,
+            last_binder: HashMap::new(),
             section_op: None,
             depth: 0,
         })
@@ -323,7 +336,11 @@ impl Parser {
                 loop {
                     match self.peek().clone() {
                         Tok::Ident(n) => {
+                            // in scope from here on, so a later parameter
+                            // may not reuse it either
                             self.check_shadow(&n)?;
+                            self.locals.insert(n.clone());
+                            self.note_binder(&n, self.line());
                             params.push(Pattern::Var(n));
                             self.bump();
                         }
@@ -350,6 +367,11 @@ impl Parser {
                     return Err(ParseError::new("lambda needs at least one parameter", self.line()));
                 }
                 let body = self.parse_expr(min_col)?;
+                for p in &params {
+                    if let Pattern::Var(n) = p {
+                        self.locals.remove(n);
+                    }
+                }
                 let src = self.source_slice(&src_start);
                 Ok(Expr::Lambda(params, Rc::new(body), src))
             }
@@ -407,7 +429,8 @@ impl Parser {
             ));
         }
         let mut bindings: Vec<(String, Rc<Expr>)> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<(String, usize)> = Vec::new();
+        let first_binder = self.binders;
         loop {
             // binding: ident '=' expr, expr limited to block_col
             let name = match self.peek().clone() {
@@ -419,17 +442,20 @@ impl Parser {
                     ))
                 }
             };
-            self.check_shadow(&name)?;
-            if names.iter().any(|n| *n == name) {
+            if names.iter().any(|(n, _)| *n == name) {
                 return Err(ParseError::new(
                     format!("`{}` is bound twice in this let", name),
                     self.line(),
                 ));
             }
+            self.check_shadow(&name)?;
+            // in scope from here on: in its own expression, the later ones
+            // and the body (§4.1)
+            self.locals.insert(name.clone());
+            names.push((name.clone(), self.line()));
             self.bump();
             self.expect(&Tok::Equals)?;
             let e = self.parse_expr(block_col)?;
-            names.push(name.clone());
             bindings.push((name, Rc::new(e)));
             // separator: `;` or newline at exactly block_col, then `in` ends
             match self.peek().clone() {
@@ -501,18 +527,40 @@ impl Parser {
                 }
             }
         }
+        // A binding is in scope in the expressions before it too (§4.1), but
+        // it was not yet in `locals` while they were parsed: a binder in one
+        // of them that reuses its name is caught here instead.
+        for (n, _) in &names {
+            if let Some(&(k, line)) = self.last_binder.get(n) {
+                if k >= first_binder {
+                    return Err(shadowed(n, line));
+                }
+            }
+        }
+        for (n, line) in &names {
+            self.note_binder(n, *line);
+        }
         let body = self.parse_expr(min_col)?;
+        for (n, _) in &names {
+            self.locals.remove(n);
+        }
         Ok(Expr::Let(bindings, Rc::new(body)))
     }
 
+    /// §4.2: a binder may not reuse a top-level or builtin name, nor one
+    /// bound by an enclosing lambda or `let`.
     fn check_shadow(&self, name: &str) -> Result<(), ParseError> {
-        if self.outer_names.contains(name) {
-            return Err(ParseError::new(
-                format!("`{}` is already bound and may not be shadowed", name),
-                self.line(),
-            ));
+        if self.outer_names.contains(name) || self.locals.contains(name) {
+            return Err(shadowed(name, self.line()));
         }
         Ok(())
+    }
+
+    /// Record a local binder for the check at the end of each enclosing
+    /// `let` block's bindings.
+    fn note_binder(&mut self, name: &str, line: usize) {
+        self.last_binder.insert(name.to_string(), (self.binders, line));
+        self.binders += 1;
     }
 
     fn parse_or(&mut self, min_col: usize) -> Result<Expr, ParseError> {
@@ -865,6 +913,10 @@ impl Parser {
         }
         Ok(e)
     }
+}
+
+fn shadowed(name: &str, line: usize) -> ParseError {
+    ParseError::new(format!("`{}` is already bound and may not be shadowed", name), line)
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -264,6 +264,21 @@ fn builtin_redefinition_rejected() {
 }
 
 #[test]
+fn local_shadowing_is_a_configuration_error() {
+    // §4.2: rebinding a name of an enclosing lambda or let in config.j
+    for (def, name) in [
+        ("sh = \\x -> \\x -> x", "x"),
+        ("sh = \\x x -> x", "x"),
+        ("sh = let a = 1 in let a = 2 in a", "a"),
+        ("sh = \\repo -> let repo = 1 in repo", "repo"),
+    ] {
+        let e = cfg_err(&format!("{}\n{}\n", MINIMAL, def));
+        assert!(e.starts_with("line 7:"), "{}: {}", def, e);
+        assert!(e.contains(&format!("`{}` is already bound", name)), "{}: {}", def, e);
+    }
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);

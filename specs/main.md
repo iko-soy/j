@@ -330,8 +330,12 @@ function.
 There is no shadowing. A `let` binding or lambda parameter may not use a name
 already bound in an enclosing scope, including top-level definitions and
 declared builtins; in `config.j` that is a configuration error (exit 3), on
-the command line a parse error. Defining a top-level name twice, or defining a
-name that is also a declared builtin, is a configuration error.
+the command line a parse error. A lambda's earlier parameters enclose its later
+ones, and all bindings of a `let` block enclose each of its expressions, since
+they are mutually recursive (§4.1), so `\x x -> x` and
+`let a = \b -> b; b = 2 in a 1` are errors too. Defining a top-level name
+twice, or defining a name that is also a declared builtin, is a configuration
+error.
 
 ### 4.3 Records
 

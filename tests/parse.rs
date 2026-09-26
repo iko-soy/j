@@ -164,6 +164,59 @@ fn shadowing_rejected() {
 }
 
 #[test]
+fn local_shadowing_rejected() {
+    // §4.2: a name bound by an enclosing lambda or let may not be bound
+    // again inside it, not only a top-level or builtin name
+    for src in [
+        "\\x -> \\x -> x",
+        "\\x x -> x",
+        "\\x _ x -> x",
+        "let a = 1 in let a = 2 in a",
+        "let x = 1 in \\x -> x",
+        "\\x -> let x = 1 in x",
+        "let x = 1 in let f = \\x -> x in f 2", // docs/language.md
+        "\\y -> (\\z -> \\y -> z)",
+        // a binding is in scope in its own expression and in every other
+        // binding of its block, later ones included (§4.1)
+        "let f = \\f -> f in f",
+        "let a = \\b -> b; b = 2 in a 1",
+        "let a = (let c = \\b -> b in c); b = 2 in a",
+        "let a = 1\n    b = \\a -> a\nin b",
+    ] {
+        let m = perr(src);
+        assert!(m.contains("already bound") && m.contains("shadow"), "{:?}: {}", src, m);
+    }
+    // the error names the inner binder and its line
+    match parse_config("f = \\x ->\n  let y = 1\n      x = 2\n  in y\n", outer()) {
+        Ok(_) => panic!("`x` rebound inside `\\x` must fail"),
+        Err(e) => {
+            assert!(e.msg.contains("`x`"), "{}", e.msg);
+            assert_eq!(e.line, 3);
+        }
+    }
+    match parse_config("f =\n  let a = \\b ->\n        b\n      b = 2\n  in a\n", outer()) {
+        Ok(_) => panic!("`\\b` inside the block that binds `b` must fail"),
+        Err(e) => {
+            assert!(e.msg.contains("`b`"), "{}", e.msg);
+            assert_eq!(e.line, 2);
+        }
+    }
+}
+
+#[test]
+fn disjoint_scopes_may_reuse_a_name() {
+    // only an enclosing binder counts: siblings and scopes that have ended
+    // do not
+    p("(\\x -> x) (\\x -> x)");
+    p("\\_ _ -> 1");
+    p("let a = \\x -> x; b = \\x -> x in a");
+    p("(let t = 1 in t) + (let t = 2 in t)");
+    p("let f = (let x = 1 in \\y -> x + y); g = \\x -> f x in g 100");
+    p("map (+ 1) (map (1 +) [1])");
+    cfg("f = \\x -> x\ng = \\x -> let y = x in y\nh = let y = 1 in y\n");
+}
+
+#[test]
 fn unexpected_tokens() {
     perr("1 2 +");
     perr("+ 1");
@@ -387,9 +440,10 @@ fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
             format!("{}1{}", "{ a = ".repeat(n), " }".repeat(n)),
             format!("x{}", " { a = x".repeat(n)),
             format!("{}1{}", "(+ ".repeat(n), ")".repeat(n)),
-            format!("{}1", "\\x -> ".repeat(n)),
+            // distinct names, since shadowing is an error of its own (§4.2)
+            format!("{}1", (0..n).map(|k| format!("\\x{} -> ", k)).collect::<String>()),
             format!("{}1", "if true then 1 else ".repeat(n)),
-            format!("{}1", "let a = 1 in ".repeat(n)),
+            format!("{}1", (0..n).map(|k| format!("let a{} = 1 in ", k)).collect::<String>()),
             format!("{}[]", "1 :: ".repeat(n)),
             format!("{}true", "true or ".repeat(n)),
         ] {

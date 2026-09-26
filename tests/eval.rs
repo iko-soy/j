@@ -126,12 +126,21 @@ fn let_is_recursive() {
 #[test]
 fn lexical_scoping() {
     let (mut i, cfg) = make_interp();
-    // closures capture their environment
+    // closures capture their environment: `f` sees the `x` it was defined
+    // under, not the `x` bound where it is called (§4.2 forbids shadowing, so
+    // the two `x`s are in disjoint scopes)
     check!(
         i,
         cfg,
-        "let x = 1 in let f = \\y -> x + y in let x = 100 in f 1",
-        Value::int(2)
+        "let f = (let x = 1 in \\y -> x + y); g = \\x -> f x in g 100",
+        Value::int(101)
+    );
+    // and keep it after the scope that bound it has returned
+    check!(
+        i,
+        cfg,
+        "let add = \\x -> \\y -> x + y in let inc = add 1 in inc 41",
+        Value::int(42)
     );
 }
 
