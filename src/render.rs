@@ -1114,7 +1114,8 @@ fn build_info(
             let pf = parent.files;
             let empty = match backend_empty {
                 Some(e) => e,
-                None => crate::value::value_eq(files.as_ref().expect("files loaded"), pf)?,
+                // in any order: a snapshot stands for a tree (§7.3)
+                None => crate::repo::snapshot_eq(files.as_ref().expect("files loaded"), pf)?,
             };
             if want_diff {
                 // both maps are built at most once per commit and reused by

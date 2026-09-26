@@ -602,7 +602,8 @@ impl JjBackend {
         new: &Value,
         text: &str,
     ) -> Result<(), Crash> {
-        if crate::value::value_eq(loaded, new)? {
+        // §1.2 step 8: unchanged, up to the order of snapshot entries (§7.3)
+        if crate::repo::same_repo(loaded, new)? {
             return Ok(());
         }
         *interp.old_repo.borrow_mut() = Some(loaded.clone());
@@ -670,10 +671,7 @@ impl JjBackend {
             }
             let stored_files = block_on(tree_to_files(&store, &root_jj.tree(), &cache, &entries))
                 .map_err(|e| Crash::new(e.msg))?;
-            if !crate::value::value_eq(
-                &Value::list(stored_files),
-                &Value::list(root_v.field("files")?.as_list()?.to_vec()),
-            )? {
+            if !crate::repo::snapshot_eq(&Value::list(stored_files), &root_v.field("files")?)? {
                 return Err(Crash::new("persistence: the root commit cannot be changed"));
             }
         }
@@ -720,10 +718,9 @@ impl JjBackend {
                     let files_changed = {
                         let stored_files =
                             block_on(tree_to_files(&store, &stored_commit.tree(), &cache, &entries))?;
-                        !crate::value::value_eq(
-                            &Value::list(stored_files),
-                            &Value::list(files_v.as_list()?.to_vec()),
-                        )?
+                        // a tree has no order: entries listed differently
+                        // are not a change to rewrite (§7.3)
+                        !crate::repo::snapshot_eq(&Value::list(stored_files), &files_v)?
                     };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {

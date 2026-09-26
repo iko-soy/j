@@ -519,6 +519,51 @@ fn dirty_immutable_focus_leaves_its_descendants_alone() {
 }
 
 #[test]
+fn reordering_an_immutable_snapshot_is_not_a_change() {
+    // a `contract m` that moves nothing into master still lists master's
+    // entries in another order (`select` puts the ones m matches first).
+    // Comparing snapshots as lists refused that as "immutable (files
+    // changed)", in the `validate` dry run too, although no content moved;
+    // a snapshot stands for a tree, which has no order (§7.3, §7.5 step 3)
+    let env = setup();
+    let dest = uniq("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::create_dir(dest.join("h")).unwrap();
+    std::fs::write(dest.join("h/x"), "x\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    env.j(&dest, &["push (label \"master\" here)"]).ok();
+    let pushed = git(&dest, &["rev-parse", "refs/remotes/origin/master"]).trim().to_string();
+    let trunk_hash = || {
+        env.j(&dest, &["\\r -> (meta (head (trunk r))).hash"]).ok().stdout.trim().to_string()
+    };
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    let edits = ["tree . validate . contract (under ./h)", "contract (under ./h)"];
+    // the working-copy commit is master itself, so the focus is the new child
+    // it was loaded with (§7.2); that child is not recorded either (§1.2)
+    let n = ops();
+    for e in edits {
+        env.j(&dest, &[e]).ok();
+        assert_eq!(ops(), n, "{} was recorded", e);
+    }
+    assert_eq!(trunk_hash(), pushed);
+    // from a mutable child of master: recording that child makes one
+    env.j(&dest, &["describe \"child\""]).ok();
+    let n = ops();
+    let focus_hash = env.j(&dest, &["\\r -> (meta r.root.id).hash"]).ok().stdout;
+    for e in edits {
+        env.j(&dest, &[e]).ok();
+        assert_eq!(ops(), n, "{} was recorded", e);
+    }
+    assert_eq!(trunk_hash(), pushed);
+    assert_eq!(env.j(&dest, &["\\r -> (meta r.root.id).hash"]).ok().stdout, focus_hash);
+    // moving real content into master is still refused
+    std::fs::write(dest.join("h/x"), "changed\n").unwrap();
+    let out = env.j(&dest, &["contract (under ./h)"]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert!(out.stderr.contains("immutable (files changed)"), "{}", out.stderr);
+}
+
+#[test]
 fn clone_default_dir_name() {
     let env = setup();
     // clone URL without DIR: last path component minus .git

@@ -739,6 +739,61 @@ fn abandon_discards_uncommitted_edits_from_disk() {
 }
 
 #[test]
+fn reordering_a_snapshot_is_not_a_change() {
+    // `select` lists the entries a fileset matches first, so a `contract m`
+    // that moves nothing still hands persistence a parent whose entries are
+    // in another order. Comparing snapshots as lists called that a change:
+    // every such run rewrote the parent and each commit above it (new hashes
+    // and committer times, the same trees) and recorded an operation. A
+    // snapshot stands for a tree, which has no order (§7.3, §7.5 step 4).
+    let r = setup();
+    r.write("a.txt", "a\n");
+    std::fs::create_dir(r.dir.join("h")).unwrap();
+    r.write("h/x", "x\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("h/x", "x2\n");
+    r.j(&["describe \"child\""]).ok();
+    // the first contract moves h/x into base; after it, one moves nothing
+    r.j(&["contract (under ./h)"]).ok();
+    let hashes = || {
+        r.j(&["\\r -> map (\\i -> (meta i).hash) (ancestors r)"])
+            .ok()
+            .stdout
+    };
+    let before = hashes();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let rotate = "mapRoot (\\c -> c { files = tail c.files ++ [(head c.files)] })";
+    for edit in [
+        "contract (under ./h)".to_string(),
+        "tree . validate . contract (under ./h)".to_string(),
+        // the same kind of reorder written by hand, on the focus and its parent
+        rotate.to_string(),
+        format!("at parents ({})", rotate),
+    ] {
+        r.j(&[&edit]).ok();
+        let now = r.j(&["ops"]).ok().stdout.lines().count();
+        assert_eq!(now, ops, "{} was recorded", edit);
+        assert_eq!(hashes(), before, "{} rewrote a commit", edit);
+    }
+    // an edit in the working directory is recorded, and the parent, which
+    // comes back only reordered, is kept as stored
+    let parent_hash = || r.j(&["\\r -> (meta (up r).root.id).hash"]).ok().stdout;
+    let parent = parent_hash();
+    r.write("a.txt", "edited\n");
+    r.j(&["contract (under ./h)"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(parent_hash(), parent, "the parent was rewritten");
+    // a real change to the parent is recorded
+    r.write("h/x", "x3\n");
+    r.j(&["contract (under ./h)"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_ne!(parent_hash(), parent);
+    let base = "\\r -> text (contentAt ./h/x (up r).root.files)";
+    assert_eq!(r.j(&[base]).ok().stdout, "x3\n");
+}
+
+#[test]
 fn replacing_a_file_with_a_directory_survives_persistence() {
     // checking out from the stale recorded tree turned a file <-> directory
     // swap into working-copy state that contradicts the tree: debug builds

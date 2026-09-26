@@ -358,6 +358,43 @@ fn detail_line_changed_paths() {
     assert!(text.contains("− del"), "{}", text);
 }
 
+#[test]
+fn empty_ignores_the_order_of_entries() {
+    // a snapshot stands for a tree, which has no order (§7.3): a commit
+    // holding its parent's entries in another order — what `split m` leaves
+    // when m moves nothing — changes nothing and is drawn empty
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", "parent", &[], vec![("a.txt", "1"), ("h/x", "2")]);
+    let b = commit("kbbbbbbb", "reordered", &[], vec![("h/x", "2"), ("a.txt", "1")]);
+    let c = commit("kccccccc", "changed", &[], vec![("h/x", "3"), ("a.txt", "1")]);
+    let repo = repo_of(
+        root,
+        vec![subtree(a, vec![subtree(b, vec![subtree(c, vec![])])])],
+        None,
+    );
+    let (mut i, cfg) = make_interp(backend_with(vec![
+        meta(ROOT_ID, "R", 1),
+        meta("kaaaaaaa", "A", now() - 30),
+        meta("kbbbbbbb", "B", now() - 20),
+        meta("kccccccc", "C", now() - 10),
+    ]));
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
+        repo,
+    );
+    let row = |msg: &str| {
+        text.lines()
+            .find(|l| l.contains(msg))
+            .unwrap_or_else(|| panic!("no row for {}:\n{}", msg, text))
+            .to_string()
+    };
+    assert!(row("reordered").contains('◌'), "{}", text);
+    assert!(!row("changed").contains('◌'), "{}", text);
+    assert!(!row("parent").contains('◌'), "{}", text);
+}
+
 // ----------------------------------------------------------------------
 // the spec's worked example (§7.11)
 // ----------------------------------------------------------------------

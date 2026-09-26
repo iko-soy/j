@@ -761,7 +761,10 @@ an expression can make agrees with the eager value.
   the list of path components; components must be valid UTF-8, and a
   repository with a path that is not exits 2. `content` is a `Blob` carrying the file's
   content and type (regular, executable, symlink) and, for conflicted paths,
-  jj's conflict value for that path.
+  jj's conflict value for that path. The entries' order carries no meaning,
+  as a tree has none: persistence (§1.2 step 8, §7.5), the laws of §8 and
+  the tree's empty mark compare snapshots path by path, though `==` compares
+  them as lists (§4.5).
 - A path that is deleted and resolved has no entry. A path that is in a
   deletion conflict has an entry whose blob is unresolved. Each side of a
   conflict is either absent or content with its own file type, so a side
@@ -1114,7 +1117,7 @@ Messages are never coloured except dim (cousins) and dim italic (empty).
 
 These hold for the reference `config.j` and should be property-tested against
 an in-memory implementation of the builtins (§10). `=` means the results are
-equal, or both crash.
+equal, with snapshots compared path by path (§7.3), or both crash.
 
 ```
 by r.root.id r                      = r

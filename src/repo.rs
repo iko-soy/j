@@ -235,6 +235,123 @@ fn parent_map_rec(loc: &Value, out: &mut Vec<(String, String)>) -> Result<(), Cr
 }
 
 // ----------------------------------------------------------------------
+// equality up to the order of snapshot entries (§7.3)
+// ----------------------------------------------------------------------
+
+/// Whether two snapshots hold the same entries, in whatever order. A
+/// snapshot stands for a tree, which has no order (§7.3): `select` lists the
+/// entries a fileset matches first, so a `contract m` that moves nothing
+/// still reorders the parent's files, and comparing them as lists called
+/// that a change. Entries compare with `value_eq`, so lazy blobs still
+/// compare by content id without being read.
+pub fn snapshot_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
+    let (a, b) = (a.forced()?, b.forced()?);
+    // not lists: no snapshots, left to validation to name (§7.5 step 1)
+    let (Value::List(xs), Value::List(ys)) = (&a, &b) else {
+        return value_eq(&a, &b);
+    };
+    if xs.len() != ys.len() {
+        return Ok(false);
+    }
+    // the usual case, both in path order: one pass, nothing allocated
+    let mut k = 0;
+    while k < xs.len() && value_eq(&xs[k], &ys[k])? {
+        k += 1;
+    }
+    if k == xs.len() {
+        return Ok(true);
+    }
+    // a tree has one listing in path order, the one it is loaded in and
+    // `replay` returns, so two such listings that differ are different trees
+    if in_path_order(xs) && in_path_order(ys) {
+        return Ok(false);
+    }
+    // the rest by path; an entry with no readable path, or a path listed
+    // twice, is not a tree, and compares unequal as it would as a list
+    let mut rest: BTreeMap<Vec<String>, &Value> = BTreeMap::new();
+    for x in &xs[k..] {
+        let Some(p) = entry_path(x) else {
+            return Ok(false);
+        };
+        if rest.insert(p, x).is_some() {
+            return Ok(false);
+        }
+    }
+    for y in &ys[k..] {
+        match entry_path(y).and_then(|p| rest.remove(&p)) {
+            Some(x) if value_eq(x, y)? => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn entry_path(entry: &Value) -> Option<Vec<String>> {
+    let path = entry.field("path").ok()?;
+    let comps = path.as_list().ok()?;
+    comps.iter().map(|c| c.as_text().ok().map(str::to_string)).collect()
+}
+
+/// Every entry's path strictly after the one before, component by component
+/// (`a/b` < `a.txt`); false if a path is unreadable.
+fn in_path_order(entries: &[Value]) -> bool {
+    let before = |a: &Value, b: &Value| -> Option<bool> {
+        let (pa, pb) = (a.field("path").ok()?, b.field("path").ok()?);
+        let (ca, cb) = (pa.as_list().ok()?, pb.as_list().ok()?);
+        for (x, y) in ca.iter().zip(cb.iter()) {
+            match x.as_text().ok()?.cmp(y.as_text().ok()?) {
+                std::cmp::Ordering::Equal => {}
+                o => return Some(o.is_lt()),
+            }
+        }
+        Some(ca.len() < cb.len())
+    };
+    entries.windows(2).all(|w| before(&w[0], &w[1]) == Some(true))
+}
+
+/// Whether `b` is the repository `a` (§1.2 step 8): equal as values, except
+/// that each commit's `files` compare as snapshots (`snapshot_eq`), so a
+/// result that only reorders entries persists nothing. A record `b` shares
+/// with `a` is equal without being walked.
+pub fn same_repo(a: &Value, b: &Value) -> Result<bool, Crash> {
+    match (a, b) {
+        (Value::Record(x), Value::Record(y)) => {
+            if std::rc::Rc::ptr_eq(x, y) {
+                return Ok(true);
+            }
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
+                // only a Commit has a `files` field in a Repo value
+                let same = k1 == k2
+                    && if k1 == "files" {
+                        snapshot_eq(v1, v2)?
+                    } else {
+                        same_repo(v1, v2)?
+                    };
+                if !same {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Value::List(xs), Value::List(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (u, v) in xs.iter().zip(ys.iter()) {
+                if !same_repo(u, v)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => value_eq(a, b),
+    }
+}
+
+// ----------------------------------------------------------------------
 // validation (§7.5 steps 1–3 and 6), shared by `validate` and persistence
 // ----------------------------------------------------------------------
 
@@ -443,7 +560,7 @@ fn validate_immutable(old: &Value, new: &Value, immutable: &BTreeSet<String>) ->
                 id
             )));
         }
-        if !value_eq(&c.field("files")?, &nc.field("files")?)? {
+        if !snapshot_eq(&c.field("files")?, &nc.field("files")?)? {
             return Err(Crash::new(format!(
                 "persistence: commit {} is immutable (files changed)",
                 id

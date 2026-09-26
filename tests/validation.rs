@@ -317,6 +317,84 @@ fn immutable_message_change_rejected() {
 }
 
 #[test]
+fn immutable_files_in_another_order_are_unchanged() {
+    // a snapshot stands for a tree, which has no order (§7.3): `contract m`
+    // lists the entries m matches first, so moving nothing into an immutable
+    // parent reordered its files, and the list comparison refused that as
+    // "immutable (files changed)" — in `validate` and in persistence alike
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let with_a = |files: Vec<Value>| {
+        let frame = |parent: Value| {
+            Value::record(&[
+                ("left", Value::list(vec![])),
+                ("parent", parent),
+                ("right", Value::list(vec![])),
+            ])
+        };
+        Value::record(&[
+            ("children", Value::list(vec![])),
+            (
+                "context",
+                Value::list(vec![
+                    frame(commit("kaaaaaaa", "a", &[], files)),
+                    frame(root.clone()),
+                ]),
+            ),
+            ("root", commit("kbbbbbbb", "b", &[], vec![])),
+        ])
+    };
+    // a is a merge, so immutable
+    let mut b = backend_with(&["kaaaaaaa", "kbbbbbbb"]);
+    b.parents.insert(
+        "kaaaaaaa".to_string(),
+        vec![ROOT_ID.to_string(), "kyyyyyyy".to_string()],
+    );
+    let mut i = make_interp(b);
+    let old = with_a(vec![entry("a.txt", "1"), entry("h/x", "2")]);
+    *i.old_repo.borrow_mut() = Some(old.clone());
+    let reordered = with_a(vec![entry("h/x", "2"), entry("a.txt", "1")]);
+    assert!(
+        j::repo::validate_repo(&mut i, &reordered).is_ok(),
+        "{:?}",
+        j::repo::validate_repo(&mut i, &reordered).err().map(|c| c.msg)
+    );
+    // a real change in any order is still refused
+    for files in [
+        vec![entry("h/x", "3"), entry("a.txt", "1")],
+        vec![entry("a.txt", "1"), entry("h/x", "3")],
+        vec![entry("h/x", "2")],
+        vec![entry("h/x", "2"), entry("a.txt", "1"), entry("b.txt", "1")],
+        vec![entry("a.txt", "1"), entry("b.txt", "1"), entry("h/x", "2")],
+        vec![entry("h/y", "2"), entry("a.txt", "1")],
+    ] {
+        let e = j::repo::validate_repo(&mut i, &with_a(files)).unwrap_err();
+        assert!(e.msg.contains("immutable (files changed)"), "{}", e.msg);
+    }
+}
+
+#[test]
+fn snapshots_compare_path_by_path() {
+    let eq = |a: Vec<Value>, b: Vec<Value>| {
+        j::repo::snapshot_eq(&Value::list(a), &Value::list(b)).unwrap()
+    };
+    let (a, b, c) = (entry("a", "1"), entry("b/c", "2"), entry("b.txt", "3"));
+    assert!(eq(vec![a.clone(), b.clone(), c.clone()], vec![a.clone(), b.clone(), c.clone()]));
+    assert!(eq(vec![a.clone(), b.clone(), c.clone()], vec![c.clone(), a.clone(), b.clone()]));
+    assert!(eq(vec![c.clone(), b.clone(), a.clone()], vec![b.clone(), c.clone(), a.clone()]));
+    assert!(eq(vec![], vec![]));
+    // the same paths with other content, fewer or more paths, other paths
+    let c2 = entry("b.txt", "4");
+    assert!(!eq(vec![a.clone(), b.clone(), c.clone()], vec![a.clone(), b.clone(), c2.clone()]));
+    assert!(!eq(vec![a.clone(), b.clone(), c.clone()], vec![c2, b.clone(), a.clone()]));
+    assert!(!eq(vec![a.clone(), b.clone()], vec![a.clone(), b.clone(), c.clone()]));
+    assert!(!eq(vec![a.clone(), c.clone()], vec![a.clone(), b.clone()]));
+    assert!(!eq(vec![c.clone(), a.clone()], vec![a.clone(), b.clone()]));
+    // a path listed twice is not a tree, and matches nothing else
+    assert!(!eq(vec![a.clone(), a.clone()], vec![a.clone(), c.clone()]));
+    assert!(!eq(vec![c.clone(), a.clone()], vec![a.clone(), a.clone()]));
+}
+
+#[test]
 fn root_must_stay_on_top() {
     // covered implicitly by navigation invariants; validate shape only here
     let old = two_commit_repo(&[]);
