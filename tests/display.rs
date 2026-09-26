@@ -440,3 +440,18 @@ fn tree_emptiness_uses_the_backend_when_files_are_lazy() {
         assert!(!row.contains('◌'), "wrongly marked empty: {:?}\n{}", row, out);
     }
 }
+
+#[test]
+fn tree_draws_the_focus_parents_bar_when_files_are_lazy() {
+    // the focus's parent diffs against its own parent, whose file list a
+    // backend that answers `is_empty` never loaded: the bar went missing
+    // (specs/tree.md, Step 4 column 5)
+    let (repo, be) = lazy_repo_chain(3);
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "tree", repo);
+    let bars = ['▁', '▂', '▃', '▅', '▇'];
+    for (msg, bar) in [("commit 0", false), ("commit 1", true), ("commit 2", true)] {
+        let row = out.lines().find(|l| l.ends_with(msg)).unwrap();
+        assert_eq!(row.contains(bars), bar, "{:?}\n{}", row, out);
+    }
+}

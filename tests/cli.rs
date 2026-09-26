@@ -698,6 +698,35 @@ fn tree_does_not_mark_commits_empty() {
     }
 }
 
+/// The tree row of the commit whose message is `msg`.
+fn tree_row<'a>(out: &'a str, msg: &str) -> &'a str {
+    out.lines()
+        .find(|l| l.ends_with(&format!("  {}", msg)))
+        .unwrap_or_else(|| panic!("no row for {:?} in:\n{}", msg, out))
+}
+
+#[test]
+fn tree_draws_the_size_bar_of_the_focus_parent() {
+    // the focus's parent diffs against its own parent, whose file list was
+    // only loaded when that grandparent was the root: every other parent of
+    // the focus lost its bar (specs/tree.md, Step 4 column 5)
+    let r = setup();
+    for (n, body) in [("A", "a\n"), ("B", "b\nb\nb\n"), ("C", "c\n")] {
+        r.write(&format!("{}.txt", n), body);
+        r.j(&[&format!("describe \"{}\"", n)]).ok();
+        if n != "C" {
+            r.j(&["new"]).ok();
+        }
+    }
+    let out = r.j(&["tree"]).ok().stdout;
+    let bars = ['▁', '▂', '▃', '▅', '▇'];
+    for n in ["B", "C"] {
+        assert!(tree_row(&out, n).contains(bars), "no size bar on {}:\n{}", n, out);
+    }
+    // the grandparent is neither the focus nor next to it: no bar at detail 1
+    assert!(!tree_row(&out, "A").contains(bars), "{}", out);
+}
+
 #[test]
 fn redo_twice_in_a_row() {
     // the second redo followed the redo marker to the undo it reversed and

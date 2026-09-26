@@ -1033,19 +1033,29 @@ impl CommitInfo {
     }
 }
 
-/// A parent commit's snapshot as seen by its children: the files value, plus
-/// its path-keyed map built at most once and shared by every child's diff.
+/// A parent commit's snapshot as seen by its children: the files value,
+/// loaded on first use — by the parent itself or by whichever child needs to
+/// compare against it, since only the child knows that it does — plus its
+/// path-keyed map built at most once and shared by every child's diff.
 /// Keying a snapshot allocates a `Vec<String>` per entry, so rebuilding it for
 /// each child dominated `treeFull`/`treeData` on a large history.
 struct ParentSnap<'a> {
-    files: &'a Value,
+    commit: &'a Value,
+    files: &'a std::cell::OnceCell<Value>,
     map: &'a std::cell::OnceCell<SnapMap>,
 }
 
 impl ParentSnap<'_> {
+    fn files(&self) -> Result<&Value, Crash> {
+        if self.files.get().is_none() {
+            let _ = self.files.set(self.commit.field("files")?);
+        }
+        Ok(self.files.get().expect("just set"))
+    }
+
     fn map(&self) -> Result<&SnapMap, Crash> {
         if self.map.get().is_none() {
-            let _ = self.map.set(snapshot_map_of(self.files)?);
+            let _ = self.map.set(snapshot_map_of(self.files()?)?);
         }
         Ok(self.map.get().expect("just set"))
     }
@@ -1093,35 +1103,31 @@ fn build_info(
         });
     let want_diff = opts.detail >= 2 || is_focus_pre || child_is_focus || parent_is_focus;
     let backend_empty = interp.backend.is_empty(&id);
+    // this commit's own snapshot and its map, each built on first use — here
+    // or by a child that compares against it — and shared with every child
+    let my_files: std::cell::OnceCell<Value> = std::cell::OnceCell::new();
+    let my_map: std::cell::OnceCell<SnapMap> = std::cell::OnceCell::new();
+    let my_snap = ParentSnap {
+        commit,
+        files: &my_files,
+        map: &my_map,
+    };
     // the files list is only materialized when something needs it: the diff
     // (detail/focus), the files data column, or the emptiness fallback
     let need_files = want_diff || opts.files || backend_empty.is_none();
-    let files = if need_files {
-        Some(commit.field("files")?)
-    } else {
-        None
-    };
-    let nfiles = files.as_ref().map(|f| f.as_list().map(|l| l.len())).transpose()?.unwrap_or(0);
-    // this commit's own snapshot map, built on first use and shared with every
-    // child that diffs against it
-    let my_map: std::cell::OnceCell<SnapMap> = std::cell::OnceCell::new();
-    let my_snap = files.as_ref().map(|f| ParentSnap {
-        files: f,
-        map: &my_map,
-    });
+    let nfiles = if need_files { my_snap.files()?.as_list()?.len() } else { 0 };
     let (empty, size, detail_marks) = match parent_files {
         Some(parent) => {
-            let pf = parent.files;
             let empty = match backend_empty {
                 Some(e) => e,
                 // in any order: a snapshot stands for a tree (§7.3)
-                None => crate::repo::snapshot_eq(files.as_ref().expect("files loaded"), pf)?,
+                None => crate::repo::snapshot_eq(my_snap.files()?, parent.files()?)?,
             };
             if want_diff {
                 // both maps are built at most once per commit and reused by
                 // this commit's children, so a diff costs one keying, not four
                 let from_map = parent.map()?;
-                let to_map = my_snap.as_ref().expect("files loaded").map()?;
+                let to_map = my_snap.map()?;
                 let marks = touched_in_maps(from_map, to_map)?;
                 // size: lines added+removed against the parent
                 let mut lines = 0usize;
@@ -1142,13 +1148,9 @@ fn build_info(
             }
         }
         None => {
-            // No parent snapshot to compare against — either this is the top
-            // of the history, or the parent's file list was never materialized
-            // because nothing needed it. `nfiles` is 0 in that second case
-            // simply because the list was not loaded, so it cannot stand in
-            // for emptiness: ask the backend first, and fall back to the file
-            // count only when the list really was loaded (which is exactly
-            // when the backend could not answer).
+            // the top of the history: no parent to compare against, so ask
+            // the backend, and fall back to the file count only when it could
+            // not answer (the files were loaded for exactly that case)
             let empty = match backend_empty {
                 Some(e) => e && id != ROOT_ID,
                 None => nfiles == 0 && id != ROOT_ID,
@@ -1169,7 +1171,7 @@ fn build_info(
             immutable,
             focus_id,
             anc,
-            my_snap.as_ref(),
+            Some(&my_snap),
             with_focus,
             is_ancestor_of_focus,
             is_focus_pre,
