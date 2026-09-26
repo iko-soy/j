@@ -399,6 +399,41 @@ fn crash_leaves_repo_untouched() {
 }
 
 #[test]
+fn unwritable_path_refused_before_anything_is_recorded() {
+    // these paths were written and the operation published; only the
+    // checkout then refused them, so every later persisting run recorded
+    // another operation and crashed the same way, and undo refused
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"stable\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    for bad in [
+        r#"[".." "evil"]"#,
+        r#"["x" ".."]"#,
+        r#"[".git" "hooks" "post-checkout"]"#,
+        r#"[".jj" "x"]"#,
+    ] {
+        let edit = format!(
+            "mapRoot (\\c -> c {{ files = c.files ++ [{{ path = {}, content = blob \"pwn\" }}] }})",
+            bad
+        );
+        // the dry run reports what persisting would
+        let out = r.j(&[&format!("tree . validate . {}", edit)]);
+        assert_eq!(out.code, 1, "validate accepted {}: {}", bad, out.stdout);
+        assert!(out.stderr.contains("path component"), "{}", out.stderr);
+        let out = r.j(&[&edit]);
+        assert_eq!(out.code, 1, "{}: {}", bad, out.stderr);
+        assert!(out.stderr.contains("path component"), "{}", out.stderr);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops, "{} was recorded", bad);
+        assert_eq!(r.j(&["log"]).ok().stdout, log);
+    }
+    // nothing was created in the working directory, and the repo still works
+    assert!(!r.dir.join("x").exists());
+    r.j(&["describe \"after\""]).ok();
+}
+
+#[test]
 fn root_path_entry_is_a_crash_not_a_panic() {
     // jj's tree builder asserts a path is not the root: exit 101 and a Rust
     // panic, which `or` could not catch

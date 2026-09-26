@@ -160,6 +160,72 @@ fn file_and_directory_at_one_path_rejected() {
 }
 
 #[test]
+fn unwritable_path_components_rejected() {
+    // validate accepted every one of these. Persisting `.`, `..`, `.git` or
+    // `.jj` recorded the operation before the checkout refused it, wedging
+    // the repository; the rest crashed only when the tree was written.
+    let old = two_commit_repo(&[]);
+    for bad in [
+        &["..", "evil"][..],
+        &["x", ".."][..],
+        &["."][..],
+        &[".git", "hooks", "post-checkout"][..],
+        &["a", ".git"][..],
+        &[".jj", "x"][..],
+        &[""][..],
+        &["a/b"][..],
+        &["x\0y"][..],
+    ] {
+        let new = focus_with_files(vec![entry_at(bad, "pwn")]);
+        let e = validate_with(&old, &new).unwrap_err();
+        assert!(e.contains("path component"), "{:?}: {}", bad, e);
+    }
+    // names that merely resemble them are ordinary files; jj's snapshot
+    // tracks `.GIT` on a case-sensitive filesystem, so refusing it would
+    // refuse the working directory itself
+    for ok in [&["..."][..], &[".gitignore"][..], &[".jjconfig", ".git.d"][..], &[".GIT", "x"][..]] {
+        let new = focus_with_files(vec![entry_at(ok, "fine")]);
+        assert!(validate_with(&old, &new).is_ok(), "{:?}", ok);
+    }
+}
+
+#[test]
+fn immutable_commits_keep_stored_path_components() {
+    // an immutable commit is left exactly as stored (§7.5 step 3), so a name
+    // the history already holds must not stop every later persist
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", "a", &[], vec![entry(".jj/x", "vendored")]);
+    let frame = |parent: Value| {
+        Value::record(&[
+            ("left", Value::list(vec![])),
+            ("parent", parent),
+            ("right", Value::list(vec![])),
+        ])
+    };
+    let focus = |files: Vec<Value>| {
+        Value::record(&[
+            ("children", Value::list(vec![])),
+            ("context", Value::list(vec![frame(a.clone()), frame(root.clone())])),
+            ("root", commit("kbbbbbbb", "b", &[], files)),
+        ])
+    };
+    // a is a merge, so immutable
+    let mut b = backend_with(&["kaaaaaaa", "kbbbbbbb"]);
+    b.parents.insert(
+        "kaaaaaaa".to_string(),
+        vec![ROOT_ID.to_string(), "kyyyyyyy".to_string()],
+    );
+    let mut i = make_interp(b);
+    let old = focus(vec![]);
+    *i.old_repo.borrow_mut() = Some(old.clone());
+    assert!(j::repo::validate_repo(&mut i, &old).is_ok());
+    // the mutable focus is still checked
+    let bad = focus(vec![entry(".jj/x", "copied")]);
+    let e = j::repo::validate_repo(&mut i, &bad).unwrap_err();
+    assert!(e.msg.contains("path component"), "{}", e.msg);
+}
+
+#[test]
 fn labels_cannot_change() {
     let old = two_commit_repo(&["feat"]);
     let stripped = {

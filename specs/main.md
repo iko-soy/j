@@ -804,8 +804,10 @@ Within it:
 
 1. **Validate shape.** `new` has the shape of a `Repo`; every `id` occurs
    exactly once; every snapshot has unique paths, none of them the root `./`
-   and none both a file and a directory (§7.3). Violations crash with a
-   message naming the rule.
+   and none both a file and a directory (§7.3); every path component of a
+   commit outside the immutable set (step 3) is a name a checkout can create:
+   not empty, `.`, `..`, `.git` or `.jj`, and without `/` or NUL. Violations
+   crash with a message naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.

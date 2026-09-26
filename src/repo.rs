@@ -261,6 +261,7 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
     if let Some(old) = &old {
         validate_immutable(old, new, &immutable)?;
     }
+    validate_path_names(new, &immutable)?;
     // focus mutable (§7.5 step 6)
     let focus_id = id_of(&new.field("root")?)?;
     if focus_id == ROOT_ID || immutable.contains(&focus_id) {
@@ -336,6 +337,34 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
     let children = loc.field("children")?;
     for c in children.as_list()?.iter() {
         validate_tree(&refocus_child(loc, c)?, seen)?;
+    }
+    Ok(())
+}
+
+/// Path components (§7.5 step 1) of every commit persisting may write or
+/// check out. jj stores any name that is not empty and has no `/`, but its
+/// checkout refuses `.`, `..`, `.git` and `.jj` — after the operation is
+/// recorded — and a git tree cannot hold a NUL. An immutable commit is kept
+/// exactly as stored (step 3), so a name its history already holds is not
+/// refused.
+fn validate_path_names(new: &Value, immutable: &BTreeSet<String>) -> Result<(), Crash> {
+    for c in all_commits(new)? {
+        if immutable.contains(&id_of(&c)?) {
+            continue;
+        }
+        let files = c.field("files")?;
+        for e in files.as_list()? {
+            let path = e.field("path")?;
+            for comp in path.as_list()? {
+                let comp = comp.as_text()?;
+                if matches!(comp, "" | "." | ".." | ".git" | ".jj") || comp.contains(['/', '\0']) {
+                    return Err(Crash::new(format!(
+                        "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
+                        comp
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
