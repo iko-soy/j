@@ -396,6 +396,134 @@ fn empty_ignores_the_order_of_entries() {
 }
 
 // ----------------------------------------------------------------------
+// the size bar and the files column (§7.11 column 5, specs/tree.md Step 4)
+// ----------------------------------------------------------------------
+
+/// Render a chain of commits on the root, each `(message, files)` the child
+/// of the one before, with the files column on, and return each message's
+/// row. The focus is the root, so at detail 1 only its child diffs.
+fn chain_rows(detail: u8, chain: &[(&str, Vec<(String, String)>)]) -> Vec<(String, String)> {
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let mut metas = vec![meta(ROOT_ID, "R", 1)];
+    let mut sub: Option<Value> = None;
+    for (n, (msg, files)) in chain.iter().enumerate().rev() {
+        let id = format!("k{:03}zzzzzzzzzzzz", n);
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let c = commit(&id, msg, &[], files);
+        metas.push(meta(&id, "A", now() - 1000 + n as i64));
+        sub = Some(subtree(c, sub.into_iter().collect()));
+    }
+    let repo = repo_of(root, sub.into_iter().collect(), None);
+    let (mut i, cfg) = make_interp(backend_with(metas));
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        &format!(
+            "treeWith ({{ detail = {}, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = true }})",
+            detail
+        ),
+        repo,
+    );
+    chain
+        .iter()
+        .map(|(msg, _)| {
+            let row = text
+                .lines()
+                .find(|l| l.split_whitespace().any(|t| t == *msg))
+                .unwrap_or_else(|| panic!("no row for {}:\n{}", msg, text));
+            (msg.to_string(), row.to_string())
+        })
+        .collect()
+}
+
+fn numbered(lines: impl Iterator<Item = usize>) -> String {
+    lines.map(|i| format!("line {}\n", i)).collect()
+}
+
+#[test]
+fn size_bar_counts_lines_added_plus_removed() {
+    // the bar is lines added plus removed against the parent, one glyph per
+    // threshold 1, 10, 50, 200, 1000 (§7.11 column 5). It summed the whole
+    // length of both versions of each changed file, so a one-line edit to a
+    // long file drew the largest bar, and its thresholds were shifted by one
+    // glyph, so `▁` never appeared and `▇` stood for both 200 and 1000.
+    let mut chain: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    let mut len = 0;
+    for (msg, grow) in [
+        ("grow0001", 1),
+        ("grow0009", 9),
+        ("grow0010", 10),
+        ("grow0049", 49),
+        ("grow0050", 50),
+        ("grow0199", 199),
+        ("grow0200", 200),
+        ("grow0999", 999),
+        ("grow1000", 1000),
+    ] {
+        len += grow;
+        chain.push((msg, vec![("f".to_string(), numbered(0..len))]));
+    }
+    let edited = numbered(0..len).replace("line 1200\n", "changed\n");
+    chain.push(("edit1", vec![("f".to_string(), edited.clone())]));
+    let dropped = edited.replace("line 1300\n", "");
+    chain.push(("drop1", vec![("f".to_string(), dropped.clone())]));
+    // a path changed without a changed line still counts, so only an empty
+    // commit has no bar
+    let touched = vec![("e".to_string(), String::new()), ("f".to_string(), dropped)];
+    chain.push(("touch", touched.clone()));
+    chain.push(("nothing", touched));
+    let want = [
+        ("grow0001", "▁"),
+        ("grow0009", "▁"),
+        ("grow0010", "▂"),
+        ("grow0049", "▂"),
+        ("grow0050", "▃"),
+        ("grow0199", "▃"),
+        ("grow0200", "▅"),
+        ("grow0999", "▅"),
+        ("grow1000", "▇"),
+        ("edit1", "▁"),
+        ("drop1", "▁"),
+        ("touch", "▁"),
+        ("nothing", ""),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows.iter().zip(want) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+}
+
+#[test]
+fn files_column_counts_changed_files() {
+    // `files` is the number of files changed against the parent (specs/tree.md
+    // Step 4 column 9), not the size of the commit's snapshot: an empty
+    // commit changes none. At detail 1 most rows skip the diff, and the
+    // column must not depend on it.
+    let f = |fs: &[(&str, &str)]| -> Vec<(String, String)> {
+        fs.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect()
+    };
+    let chain = vec![
+        ("addthree", f(&[("a", "1\n"), ("b", "1\n"), ("c", "1\n")])),
+        ("changetwo", f(&[("a", "2\n"), ("b", "1\n")])),
+        ("addone", f(&[("a", "2\n"), ("b", "1\n"), ("d", "1\n")])),
+        ("changenone", f(&[("a", "2\n"), ("b", "1\n"), ("d", "1\n")])),
+    ];
+    let want = [3, 2, 1, 0];
+    for detail in [1, 2] {
+        for ((msg, row), n) in chain_rows(detail, &chain).iter().zip(want) {
+            let toks: Vec<&str> = row.split_whitespace().collect();
+            let at = toks
+                .iter()
+                .position(|t| *t == "files")
+                .unwrap_or_else(|| panic!("no files column for {}: {:?}", msg, row));
+            assert_eq!(toks[at - 1], n.to_string(), "detail {}, {}: {:?}", detail, msg, row);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 // the spec's worked example (§7.11)
 // ----------------------------------------------------------------------
 
@@ -472,45 +600,52 @@ fn worked_example() -> (Value, MemBackend) {
     let mut kids: Vec<Value> = Vec::new();
     let ids: Vec<String> = (0..14).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
 
-    // the base snapshot (the last run commit's files): 30 lines each, so
-    // aaaa's diff is 30+30 = 60 lines (▅)
+    // the base snapshot (the last run commit's files): three files of 40
+    // lines. Each commit's diff against its parent sizes its bar (§7.11
+    // column 5: lines added plus removed, thresholds 1, 10, 50, 200, 1000).
     let base: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "b\n".repeat(30)),
-        ("src/parser.rs".to_string(), "b\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "b\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "b\n".repeat(40)),
+        ("src/parser.rs".to_string(), "b\n".repeat(40)),
+        ("tests/lexer.rs".to_string(), "b\n".repeat(40)),
     ];
     fn snap<'a>(fs: &'a [(String, String)]) -> Vec<(&'a str, &'a str)> {
         fs.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect()
     }
-    // aaaa: base rewritten to 30 new lines (▅)
+    // aaaa: base rewritten to 40 new lines a file, 3 × 80 = 240 lines (▅)
     let aaaa_files: Vec<(String, String)> = base
         .iter()
-        .map(|(p, _)| (p.clone(), "a\n".repeat(30)))
+        .map(|(p, _)| (p.clone(), "a\n".repeat(40)))
         .collect();
     let aaaa = commit("aaaaaaaaaaaaaaaa", "add parser", &[], snap(&aaaa_files));
-    // kpqx: aaaa rewritten to 30 new lines (▅). It has no tests/lexer.rs, so
+    // kpqx: aaaa's sources rewritten to 50 new lines and tests/lexer.rs
+    // deleted, 90 + 90 + 40 = 220 lines (▅). It has no tests/lexer.rs, so
     // wqzt's tests/lexer.rs is an addition (+), as in the worked example.
     let kpqx_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "k\n".repeat(30)),
-        ("src/parser.rs".to_string(), "k\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "k\n".repeat(50)),
+        ("src/parser.rs".to_string(), "k\n".repeat(50)),
     ];
     let kpqx = commit("kpqxaaaaaaaaaaaa", "release 1.2", &["main"], snap(&kpqx_files));
-    // mnrv: aaaa with one 2-line change (▂)
+    // mnrv: aaaa with 12 lines cut from the lexer (▂)
     let mnrv_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "a\n".repeat(29)),
-        ("src/parser.rs".to_string(), "a\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "a\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "a\n".repeat(28)),
+        ("src/parser.rs".to_string(), "a\n".repeat(40)),
+        ("tests/lexer.rs".to_string(), "a\n".repeat(40)),
     ];
     let mnrv = commit("mnrvaaaaaaaaaaaa", "fix lexer", &[], snap(&mnrv_files));
+    // wqzt: against kpqx, the lexer's 50 lines become the conflict's 8, the
+    // parser's 50 become 2, and 2 are added: 58 + 52 + 2 = 112 lines (▃)
     let wqzt = conflict_commit("wqztaaaaaaaaaaaa", "wip", &["feature"]);
-    // qrst: wqzt with the lexer conflict resolved to 2 lines (▁)
+    // qrst: wqzt with the lexer conflict resolved to its two added sides,
+    // which drops the 6 other lines of the conflict (▁)
     let qrst_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "r\n".repeat(2)),
-        ("src/parser.rs".to_string(), "k\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "k\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "a\nc\n".to_string()),
+        ("src/parser.rs".to_string(), "w\nw\n".to_string()),
+        ("tests/lexer.rs".to_string(), "w\nw\n".to_string()),
     ];
     let qrst = commit("qrstaaaaaaaaaaaa", "spike", &[], snap(&qrst_files));
-    // yxsk: wqzt with the conflict resolved plus 9 added one-line files (▃)
+    // yxsk: wqzt with the conflict resolved to a new line, the other two files
+    // rewritten to 30 lines, and 9 one-line files added: 9 + 32 + 32 + 9 = 82
+    // lines (▃)
     let mut yxsk_files: Vec<(String, String)> = vec![
         ("src/lexer.rs".to_string(), "resolved2\n".to_string()),
         ("src/parser.rs".to_string(), "k\n".repeat(30)),
@@ -668,21 +803,18 @@ fn tree_worked_example() {
     ○    @yxsk ▃                             1h  mo
 ";
     // The spec pins down the rails *graph* (which structural characters appear
-    // on each row, in order) and the id/message/label/detail content. The
-    // size-bar glyph, exact column widths, and the gutter on the spec's first
-    // row are implementation/spec-formatting details, so we compare (a) the
-    // ordered sequence of structural characters per row and (b) the word
-    // tokens, ignoring all whitespace.
+    // on each row, in order) and the id/size-bar/message/label/detail content.
+    // Exact column widths and the gutter on the spec's first row are
+    // implementation/spec-formatting details, so we compare (a) the ordered
+    // sequence of structural characters per row and (b) the word tokens,
+    // ignoring all whitespace.
     let struct_chars = |l: &str| -> String {
         l.chars()
             .filter(|c| "⌂◆○◉◌⊗├╰┼─╮┬│╎»".contains(*c))
             .collect()
     };
     let tokens = |l: &str| -> Vec<String> {
-        l.split_whitespace()
-            .map(|t| t.trim_matches(|c| "▁▂▃▅▇".contains(c)).to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
+        l.split_whitespace().map(|t| t.to_string()).collect()
     };
     let got: Vec<&str> = text.lines().collect();
     // The legend follows the tree body after a blank line (§Legend). Split it

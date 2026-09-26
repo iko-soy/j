@@ -765,6 +765,46 @@ fn tree_draws_the_size_bar_of_the_focus_parent() {
 }
 
 #[test]
+fn tree_data_sizes_commits_by_their_changes() {
+    // the size bar counted the whole length of both versions of each changed
+    // file, so a one-line edit to a long file drew `▇`, and the files column
+    // counted the whole snapshot, so an empty commit showed its parent's file
+    // count (§7.11 column 5; specs/tree.md Step 4 column 9)
+    let r = setup();
+    let big: String = (1..=1500).map(|i| format!("{}\n", i)).collect();
+    r.write("big", &big);
+    r.write("small", "hello\n");
+    r.j(&["describe \"big file\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("big", &big.replace("\n750\n", "\nseven fifty\n"));
+    r.j(&["describe \"one line edit\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"empty commit\""]).ok();
+    let row = |out: &str, msg: &str| -> (String, String) {
+        let row = out
+            .lines()
+            .find(|l| l.contains(&format!("  {}  ", msg)))
+            .unwrap_or_else(|| panic!("no row for {:?} in:\n{}", msg, out))
+            .to_string();
+        let bar: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        let toks: Vec<&str> = row.split_whitespace().collect();
+        let at = toks.iter().position(|t| *t == "files").expect("files column");
+        (bar, toks[at - 1].to_string())
+    };
+    let out = r.j(&["treeData"]).ok().stdout;
+    assert_eq!(row(&out, "big file"), ("▇".into(), "2".into()), "{}", out);
+    assert_eq!(row(&out, "one line edit"), ("▁".into(), "1".into()), "{}", out);
+    assert_eq!(row(&out, "empty commit"), ("".into(), "0".into()), "{}", out);
+    // at detail 1 the first commit is not next to the focus and draws no
+    // bar; its files column is counted all the same
+    let detail1 = "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = true })";
+    let out = r.j(&[detail1]).ok().stdout;
+    assert_eq!(row(&out, "big file"), ("".into(), "2".into()), "{}", out);
+    assert_eq!(row(&out, "one line edit"), ("▁".into(), "1".into()), "{}", out);
+    assert_eq!(row(&out, "empty commit"), ("".into(), "0".into()), "{}", out);
+}
+
+#[test]
 fn redo_twice_in_a_row() {
     // the second redo followed the redo marker to the undo it reversed and
     // restored *that* view, instead of looking outward for an undo that had

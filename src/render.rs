@@ -392,6 +392,52 @@ fn touched_in_maps(from: &SnapMap, to: &SnapMap) -> Result<Vec<(Vec<String>, cha
     Ok(out)
 }
 
+/// Lines added plus removed between two versions of one path (§7.11 size
+/// bar), either possibly absent: the length of a line diff, lines split after
+/// each `\n` as `line_count` counts them. A conflict counts as its
+/// materialized text, as it is checked out.
+///
+/// Myers' cost grows with the product of the file's length and the size of
+/// the change, so a plain line diff of a rewritten long file takes seconds.
+/// A line that does not occur on the other side at all cannot be part of any
+/// common subsequence, so, as git's xdiff does, those lines count as changed
+/// up front and only the rest is diffed — the count is the same. What remains
+/// slow (a long file whose lines were reordered) has a deadline, past which
+/// `similar` settles for a longer diff: an overcount of a change that is
+/// already large.
+fn changed_lines(from: Option<&Value>, to: Option<&Value>) -> Result<usize, Crash> {
+    use std::collections::HashSet;
+    let text = |v: Option<&Value>| -> Result<Vec<u8>, Crash> {
+        match v {
+            Some(Value::Blob(b)) => b.bytes(),
+            _ => Ok(Vec::new()),
+        }
+    };
+    let (a, b) = (text(from)?, text(to)?);
+    let a: Vec<&[u8]> = a.split_inclusive(|c| *c == b'\n').collect();
+    let b: Vec<&[u8]> = b.split_inclusive(|c| *c == b'\n').collect();
+    let (in_a, in_b): (HashSet<&[u8]>, HashSet<&[u8]>) =
+        (a.iter().copied().collect(), b.iter().copied().collect());
+    let a_common: Vec<&[u8]> = a.iter().copied().filter(|l| in_b.contains(l)).collect();
+    let b_common: Vec<&[u8]> = b.iter().copied().filter(|l| in_a.contains(l)).collect();
+    let unmatched = (a.len() - a_common.len()) + (b.len() - b_common.len());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let ops = similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &a_common,
+        &b_common,
+        Some(deadline),
+    );
+    let diffed: usize = ops
+        .iter()
+        .map(|op| match op.as_tag_tuple() {
+            (similar::DiffTag::Equal, _, _) => 0,
+            (_, old, new) => old.len() + new.len(),
+        })
+        .sum();
+    Ok(unmatched + diffed)
+}
+
 fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
     let mut m = BTreeMap::new();
     for e in snap.as_list()?.iter() {
@@ -1007,7 +1053,7 @@ struct CommitInfo {
     is_child_of_ancestor: bool,
     meta: Option<crate::domain::MetaInfo>,
     size: Option<usize>, // lines added+removed against parent
-    nfiles: usize,       // number of files in this commit's snapshot
+    nfiles: usize,       // number of files changed against parent (`files` column)
     detail_marks: Vec<(String, char)>,
     children: Vec<CommitInfo>,
 }
@@ -1137,9 +1183,7 @@ fn build_info(
     };
     // the files list is only materialized when something needs it: the diff
     // (detail/focus), the files data column, or the emptiness fallback
-    let need_files = want_diff || opts.files || backend_empty.is_none();
-    let nfiles = if need_files { my_snap.files()?.as_list()?.len() } else { 0 };
-    let (empty, size, detail_marks) = match parent_files {
+    let (empty, size, detail_marks, nfiles) = match parent_files {
         Some(parent) => {
             let empty = match backend_empty {
                 Some(e) => e,
@@ -1152,29 +1196,34 @@ fn build_info(
                 let from_map = parent.map()?;
                 let to_map = my_snap.map()?;
                 let marks = touched_in_maps(from_map, to_map)?;
-                // size: lines added+removed against the parent
+                // size: lines added plus removed against the parent (§7.11
+                // column 5); a path changed without a changed line (an empty
+                // file, a new file type) counts one, so only an empty commit
+                // has no bar
                 let mut lines = 0usize;
                 for (key, _, _) in &marks {
-                    let count = |m: &SnapMap| -> usize {
-                        match m.get(key) {
-                            Some(Value::Blob(b)) => b.line_count().max(1),
-                            _ => 1,
-                        }
-                    };
-                    lines += count(from_map) + count(to_map);
+                    lines += changed_lines(from_map.get(key), to_map.get(key))?.max(1);
                 }
                 let marks2: Vec<(String, char)> =
                     marks.iter().map(|(p, m, _)| (p.join("/"), *m)).collect();
-                (marks.is_empty(), Some(lines), marks2)
+                (marks.is_empty(), Some(lines), marks2, marks.len())
             } else {
-                (empty, None, Vec::new())
+                // the files column is the number of paths changed against the
+                // parent (specs/tree.md Step 4), so it diffs even without a bar
+                let nfiles = if opts.files && !empty {
+                    touched_in_maps(parent.map()?, my_snap.map()?)?.len()
+                } else {
+                    0
+                };
+                (empty, None, Vec::new(), nfiles)
             }
         }
         None => {
             // the top of the history: no parent to compare against, and so no
-            // backend answer either — the files were loaded, and it is empty
-            // iff it has none (the root never counts as empty)
-            (nfiles == 0 && id != ROOT_ID, None, Vec::new())
+            // backend answer either — it is empty iff it has no files (the
+            // root never counts as empty), and every file it has is added
+            let nfiles = my_snap.files()?.as_list()?.len();
+            (nfiles == 0 && id != ROOT_ID, None, Vec::new(), nfiles)
         }
     };
     let meta = interp.backend.meta(&id).ok();
@@ -2471,16 +2520,17 @@ fn size_bar(size: Option<usize>, pal: &Palette) -> String {
     match size {
         None | Some(0) => String::new(),
         Some(n) => {
+            // one glyph per threshold 1, 10, 50, 200, 1000 (§7.11 column 5)
             let (bar, level) = if n >= 1000 {
                 ("▇", 4)
             } else if n >= 200 {
-                ("▇", 3)
+                ("▅", 3)
             } else if n >= 50 {
-                ("▅", 2)
+                ("▃", 2)
             } else if n >= 10 {
-                ("▃", 1)
+                ("▂", 1)
             } else {
-                ("▂", 0)
+                ("▁", 0)
             };
             pal.accent(level, bar)
         }
