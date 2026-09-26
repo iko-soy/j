@@ -800,10 +800,11 @@ fn replay_carries_conflicts_through() {
     ] {
         assert_eq!(r.j(&[law]).ok().stdout.trim(), "true", "{}", law);
     }
-    // rebase parents r = r: nothing to record
-    let ops = r.j(&["ops"]).ok().stdout;
+    // rebase parents r = r: nothing to record. Count the operations: the
+    // listing shows each one's age, which can tick over between the runs
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
     r.j(&["rebase parents"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
     // squashing into the conflicted commit keeps its conflict
     r.j(&["new"]).ok();
     r.write("b.txt", "bee\n");
