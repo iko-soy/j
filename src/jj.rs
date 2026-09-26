@@ -255,9 +255,11 @@ pub struct JjInner {
     /// build_interp with the post-snapshot map
     visible: Mutex<Option<Arc<VisibleRepo>>>,
     lock_guard: Mutex<Option<FileLock>>,
-    /// the snapshot transaction and working-copy lock, held between
-    /// build_interp and persist so the snapshot and the expression's edits
-    /// form one jj operation (§1.2); dropped uncommitted by printing runs
+    /// the snapshot's unpublished rewrite, kept between build_interp and
+    /// persist so the snapshot and the expression's edits form one jj
+    /// operation (§1.2); dropped uncommitted by printing runs. The
+    /// working-copy lock is not held: its saved state is still the tree
+    /// recorded before the snapshot until `persist`'s checkout resets it
     pending: Mutex<Option<PendingSnapshot>>,
 }
 
@@ -548,8 +550,9 @@ impl JjBackend {
         // tree. The next run's incremental snapshot would then find nothing
         // to do and build the Repo from the stale tree — and a persisting run
         // would check that stale tree back out, destroying the edits. The
-        // state is advanced only by `persist`'s checkout, which finishes
-        // against the operation that actually recorded the tree (§7.4/§7.7).
+        // state is advanced only by `persist`'s checkout, which first resets
+        // it to this snapshot and finishes against the operation that
+        // actually recorded the tree (§7.4/§7.7).
         drop(locked_ws);
         let _ = op_id;
         let pending = PendingSnapshot {
@@ -778,16 +781,40 @@ impl JjBackend {
         // §7.4/§7.5 step 7: check out the focus to the working directory
         let focus_commit = block_on(store.get_commit_async(&focus_jj))
             .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
-        block_on(self.checkout(&focus_commit, op_id))?;
+        block_on(self.checkout(&focus_commit, snapshot_wc.as_ref(), op_id))?;
 
         Ok(())
     }
 
-    async fn checkout(&self, commit: &Commit, op_id: OperationId) -> Result<(), Crash> {
+    /// Check `commit` out and record `op_id` as the operation the working
+    /// copy is at. `snapshot` is the folded snapshot commit of a persisting
+    /// run (§7.4), whose tree is what the working directory holds.
+    async fn checkout(
+        &self,
+        commit: &Commit,
+        snapshot: Option<&Commit>,
+        op_id: OperationId,
+    ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
+        // `snapshot_repo` released its lock without saving what it scanned,
+        // so the state just loaded still describes the tree recorded before
+        // the edits, and jj checks out by diffing that tree against the new
+        // one: a path whose recorded content equals the focus's would keep
+        // the user's edit, a file created since would stay, and a file
+        // replaced by a directory (or back) would leave state contradicting
+        // the tree. Reset the state to the snapshot first (it writes no file;
+        // the paths it changes are re-read by the next snapshot), so the
+        // checkout diffs from what is actually on disk (§7.4).
+        if let Some(snapshot) = snapshot {
+            locked_ws
+                .locked_wc()
+                .reset(snapshot)
+                .await
+                .map_err(|e| Crash::new(format!("cannot record the snapshot: {}", e)))?;
+        }
         locked_ws
             .locked_wc()
             .check_out(commit)
@@ -1145,7 +1172,7 @@ impl JjBackend {
             .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
         *self.inner.repo.lock().unwrap() = repo.clone();
         let wc_commit = block_on(self.wc_commit(&repo))?;
-        block_on(self.checkout(&wc_commit, op_id)).map_err(|c| (1, c.msg))?;
+        block_on(self.checkout(&wc_commit, None, op_id)).map_err(|c| (1, c.msg))?;
         Ok(())
     }
 
@@ -1367,7 +1394,7 @@ fn create_initial_wc_commit(
     if let Ok(existing) = block_on(backend.wc_commit(&base)) {
         if existing.parent_ids().first() == Some(&parent) {
             let op_id = base.operation().id().clone();
-            block_on(backend.checkout(&existing, op_id)).map_err(|c| (1, c.msg))?;
+            block_on(backend.checkout(&existing, None, op_id)).map_err(|c| (1, c.msg))?;
             return Ok(());
         }
         if existing.id() != store.root_commit_id() {
@@ -1403,7 +1430,7 @@ fn create_initial_wc_commit(
     let repo = block_on(unpublished.publish())
         .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
     *backend.inner.repo.lock().unwrap() = repo;
-    block_on(backend.checkout(&wc, op_id)).map_err(|c| (1, c.msg))?;
+    block_on(backend.checkout(&wc, None, op_id)).map_err(|c| (1, c.msg))?;
     Ok(())
 }
 

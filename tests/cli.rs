@@ -689,3 +689,85 @@ fn extract_sees_through_lazy_file_lists() {
     let blobs = r.j(&["length . extract Blob"]).ok().stdout;
     assert_eq!(blobs.trim(), "2", "extract Blob: {}", blobs);
 }
+
+#[test]
+fn moving_the_focus_rewrites_uncommitted_edits() {
+    // A persisting run that starts with uncommitted edits folds their
+    // snapshot into its operation and then checks out the new focus. The
+    // checkout diffed from the tree the working copy had last *recorded*,
+    // not from the snapshot, so a path whose recorded content equals the new
+    // focus's was never rewritten: `prev` left the child's edit on disk, and
+    // the next run recorded it into the parent (§7.4, §7.5 step 7).
+    let r = setup();
+    r.write("a.txt", "one\n");
+    r.j(&["describe \"first\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "two\n");
+    r.j(&["prev"]).ok();
+    assert_eq!(r.read("a.txt"), "one\n");
+    r.j(&["describe \"first, again\""]).ok();
+    let files = r.j(&["\\r -> show r.root.files"]).ok().stdout;
+    assert!(files.contains("blob \"one\\n\""), "the parent took the edit: {}", files);
+    // the edit itself lives on in the child it was snapshotted into
+    r.j(&["next"]).ok();
+    assert_eq!(r.read("a.txt"), "two\n");
+}
+
+#[test]
+fn abandon_discards_uncommitted_edits_from_disk() {
+    // the same stale diff: the new focus, an empty child of the abandoned
+    // commit's parent, has exactly the recorded tree, so the checkout did
+    // nothing at all and the discarded
+    // edits, deletions and new files stayed on disk to be recorded into the
+    // new focus by the next run
+    let r = setup();
+    r.write("a.txt", "orig\n");
+    r.write("b.txt", "bee\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "scratch\n");
+    std::fs::remove_file(r.dir.join("b.txt")).unwrap();
+    r.write("c.txt", "junk\n");
+    r.j(&["abandon"]).ok();
+    assert_eq!(r.read("a.txt"), "orig\n");
+    assert_eq!(r.read("b.txt"), "bee\n");
+    assert!(!r.dir.join("c.txt").exists(), "c.txt survived the abandon");
+    // the directory now equals the focus, so recording it is a no-op
+    r.j(&["id"]).ok();
+    let ops = r.j(&["ops"]).ok().stdout;
+    assert!(ops.lines().next().unwrap_or("").contains("abandon"), "{}", ops);
+}
+
+#[test]
+fn replacing_a_file_with_a_directory_survives_persistence() {
+    // checking out from the stale recorded tree turned a file <-> directory
+    // swap into working-copy state that contradicts the tree: debug builds
+    // panicked in jj-lib on this and every later run, release builds dropped
+    // the directory from disk and from the commit on the next snapshot
+    let r = setup();
+    r.write("a", "hi\n");
+    r.j(&["describe \"file\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b.txt", "t\n");
+    r.j(&["describe \"dir\""]).ok();
+    r.j(&["tree"]).ok();
+    r.j(&["id"]).ok();
+    assert_eq!(r.read("a/b.txt"), "t\n");
+    let files = r.j(&["files"]).ok().stdout;
+    assert!(files.contains("b.txt"), "{}", files);
+    // and back: a directory replaced by a file
+    r.j(&["new"]).ok();
+    std::fs::remove_dir_all(r.dir.join("a")).unwrap();
+    r.write("a", "file again\n");
+    r.j(&["describe \"file again\""]).ok();
+    r.j(&["tree"]).ok();
+    r.j(&["id"]).ok();
+    assert_eq!(r.read("a"), "file again\n");
+    // the checkout itself swaps them back when the focus moves
+    r.j(&["prev"]).ok();
+    assert_eq!(r.read("a/b.txt"), "t\n");
+    r.j(&["prev"]).ok();
+    assert_eq!(r.read("a"), "hi\n");
+}
