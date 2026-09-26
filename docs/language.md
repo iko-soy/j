@@ -265,9 +265,10 @@ in even 10
 > binding column.
 
 Because evaluation is strict (call by value), a non-function binding is
-evaluated immediately. `let a = b; b = 5 in a` crashes (`b` isn't bound yet
-when `a` is evaluated); recursion works through *functions*, whose bodies
-aren't evaluated until applied.
+evaluated immediately, though after the bindings it needs, whatever order
+they are written in: `let a = b; b = 5 in a` is 5. Bindings that need each
+other's values, as in `let a = b; b = a in a`, crash; recursion works through
+*functions*, whose bodies aren't evaluated until applied.
 
 ### No shadowing
 

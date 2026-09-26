@@ -124,6 +124,49 @@ fn let_is_recursive() {
 }
 
 #[test]
+fn let_bindings_evaluate_in_dependency_order() {
+    let (mut i, cfg) = make_interp();
+    // §4.1: a binding is evaluated after every binding it refers to outside
+    // a lambda, whatever order the block lists them in
+    check!(i, cfg, "let y = x + 1; x = 1 in y", Value::int(2));
+    check!(i, cfg, "let a = b; b = 5 in a", Value::int(5));
+    check!(i, cfg, "let a = b + 1; b = c + 1; c = 10 in a", Value::int(12));
+    check!(i, cfg, "let z = f 2; f = \\x -> x * 3 in z", Value::int(6));
+    check!(i, cfg, "let\n  total = base * 2\n  base = 21\nin total", Value::int(42));
+    check!(i, cfg, "(\\n -> let y = x + n; x = 1 in y) 5", Value::int(6));
+    // source order made `b` unbound here, a crash `or` caught: 0, not 1
+    check!(i, cfg, "let a = b or 0; b = 1 in a", Value::int(1));
+    // a function applied in a binding finds the bindings its body refers to,
+    // as one applied at load does (§4.1)
+    check!(i, cfg, "let f = \\x -> x * k; z = f 2; k = 3 in z", Value::int(6));
+    check!(
+        i,
+        cfg,
+        "let ev = \\n -> if n == 0 then k else od (n - 1); r = ev 4; od = \\n -> if n == 0 then 0 else ev (n - 1); k = 1 in r",
+        Value::int(1)
+    );
+    // mutually referring bindings keep the order that references outside
+    // lambdas give them: `b` applies `a`, whose body needs `y`, and `y`
+    // refers back to `b`; `b` waits for `z`, so `y` is bound by then
+    check!(i, cfg, "let a = \\_ -> y; b = a z; y = \\_ -> b; z = 1 in z", Value::int(1));
+}
+
+#[test]
+fn let_cycle_is_a_crash() {
+    let (mut i, cfg) = make_interp();
+    for src in ["let a = b; b = a in a", "let a = a in a", "let a = [b]; b = { x = a } in 1"] {
+        let m = crash(&mut i, &cfg, src);
+        assert!(m.contains("cycle"), "{} => {}", src, m);
+    }
+    // an ordinary crash, which `or` catches, and only when the block is
+    // evaluated
+    check!(i, cfg, "(let a = b + 1; b = a in a) or 7", Value::int(7));
+    check!(i, cfg, "if false then (let a = a in a) else 1", Value::int(1));
+    // references inside lambdas never form a cycle
+    check!(i, cfg, "let f = \\n -> if n == 0 then 0 else f (n - 1) in f 3", Value::int(0));
+}
+
+#[test]
 fn lexical_scoping() {
     let (mut i, cfg) = make_interp();
     // closures capture their environment: `f` sees the `x` it was defined

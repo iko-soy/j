@@ -441,8 +441,14 @@ impl Interp {
                 if bs.is_empty() {
                     return Run::Step(State::Eval(body.clone(), env, k));
                 }
-                let names: Vec<String> = bs.iter().map(|(n, _)| n.clone()).collect();
-                let exprs: Vec<Rc<Expr>> = bs.iter().map(|(_, e)| e.clone()).collect();
+                // the bindings are evaluated in dependency order, not source
+                // order, and a cycle among them is a crash (§4.1)
+                let order = match crate::config::let_order(bs) {
+                    Some(order) => order,
+                    None => return Run::Crash(Crash::new("let: a cycle among the bindings")),
+                };
+                let names: Vec<String> = order.iter().map(|&i| bs[i].0.clone()).collect();
+                let exprs: Vec<Rc<Expr>> = order.iter().map(|&i| bs[i].1.clone()).collect();
                 // one recursive frame shared by every binding and the body, so
                 // the block is mutually recursive (§4.1)
                 let (env2, cell) = env.extend_rec();
