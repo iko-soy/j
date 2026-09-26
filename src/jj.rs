@@ -1826,7 +1826,7 @@ fn check_push_records(
 }
 
 /// change-id closure of jj-parents from the seeds (all jj parents, not just
-/// the first), for the push content checks
+/// the first), for the push content checks and the immutable set (§7.5)
 fn ancestors_of_change_ids(vis: &VisibleRepo, seeds: &[String]) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = seeds.to_vec();
@@ -1920,18 +1920,11 @@ impl Backend for JjBackend {
         let Some(vis) = vis else {
             return BTreeSet::new();
         };
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<String> = ids.iter().cloned().collect();
-        while let Some(id) = stack.pop() {
-            if seen.insert(id.clone()) {
-                if let Some(rec) = vis.commits.get(&id) {
-                    if !rec.first_parent.is_empty() {
-                        stack.push(rec.first_parent.clone());
-                    }
-                }
-            }
-        }
-        seen
+        // every jj parent, not just the first: rewriting a commit reached
+        // only through a merge's second parent rewrites the merge too
+        // (§7.5 step 3)
+        let seeds: Vec<String> = ids.iter().cloned().collect();
+        ancestors_of_change_ids(&vis, &seeds)
     }
 
     fn replay(&self, onto: &[Value], from: &[Value], to: &[Value]) -> Result<Vec<Value>, Crash> {

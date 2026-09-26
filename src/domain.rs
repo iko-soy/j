@@ -52,7 +52,8 @@ pub trait Backend {
     fn is_empty(&self, _id: &str) -> Option<bool> {
         None
     }
-    /// All ancestors (inclusive) of the given change ids.
+    /// All ancestors (inclusive) of the given change ids, through every
+    /// parent of a merge, not only the first (§7.5 step 3).
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String>;
 
     /// jj tree merge (§7.3): replay the change from->to onto `onto`.

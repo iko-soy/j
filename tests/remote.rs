@@ -241,6 +241,57 @@ fn init_over_git_keeps_uncommitted_changes() {
 }
 
 #[test]
+fn merge_ancestors_through_every_parent_are_immutable() {
+    // §7.5 step 3: every ancestor of a merge is immutable, including those
+    // reached only through its second parent. Following first parents only,
+    // the side branch was mutable: describing or abandoning one of its
+    // commits exited 0, and jj rebased the read-only merge (§7.2) onto the
+    // result, dropping the side's files from it on abandon.
+    let env = setup();
+    let commit = |dir: &PathBuf, file: &str, msg: &str| {
+        std::fs::write(dir.join(file), format!("{}\n", msg)).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", msg]);
+    };
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    git(&dir, &["checkout", "-qb", "side"]);
+    commit(&dir, "s1.txt", "side one");
+    commit(&dir, "s2.txt", "side two");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit(&dir, "m.txt", "main work");
+    git(&dir, &["-c", "user.email=t@t", "-c", "user.name=T", "merge", "-q", "side", "-m", "merge"]);
+    let merge = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
+    env.j(&dir, &["init"]).ok();
+    let merge_hash = || {
+        let expr = r#"\r -> (meta (head (matching (\c -> startsWith "merge" c.message) all r))).hash"#;
+        env.j(&dir, &[expr]).ok().stdout.trim().to_string()
+    };
+    assert_eq!(merge_hash(), merge);
+
+    let tree = env.j(&dir, &["tree"]).ok().stdout;
+    for msg in ["side one", "side two"] {
+        let line = tree.lines().find(|l| l.contains(msg)).unwrap();
+        assert!(line.contains('◆'), "`{}` is not drawn immutable:\n{}", msg, tree);
+    }
+
+    let side = |msg: &str, edit: &str| {
+        format!(r#"at (matching (\c -> startsWith "{}" c.message) all) ({})"#, msg, edit)
+    };
+    for edit in [side("side one", "describe \"edited\""), side("side two", "abandon")] {
+        // validate is an honest dry run of what persistence refuses
+        let out = env.j(&dir, &[&format!("tree . validate . {}", edit)]);
+        assert_eq!(out.code, 1, "validate accepted `{}`:\n{}", edit, out.stdout);
+        assert!(out.stderr.contains("is immutable"), "{}", out.stderr);
+        let out = env.j(&dir, &[&edit]);
+        assert_eq!(out.code, 1, "persistence accepted `{}`", edit);
+        assert!(out.stderr.contains("is immutable"), "{}", out.stderr);
+        assert_eq!(merge_hash(), merge, "`{}` rewrote the merge", edit);
+    }
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
 fn push_label_and_relabel() {
     let env = setup();
     let dest = uniq("clone");

@@ -823,7 +823,9 @@ Within it:
    and all of its ancestors. Every id in it must be present in `new` with the
    same parent id, files, and message. Violations crash naming the commit.
    (Ancestors of merges are included because rewriting an ancestor rewrites
-   the merge, whose second parent the model cannot represent.)
+   the merge, whose second parent the model cannot represent.) They are the
+   merge's jj ancestors through every parent, not only the first, so a
+   commit reached only through a second parent is immutable too.
 4. **Walk `new` top-down.** For each commit `c` (root first):
    - If `c.id` is the root commit's change id, it must be the top of the tree
      and must be unchanged; otherwise crash.
