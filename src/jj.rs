@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
 use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, Value};
+use futures::TryStreamExt;
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -22,6 +23,7 @@ use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use jj_lib::revset::{ResolvedRevsetExpression, RevsetStreamExt};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::working_copy::SnapshotOptions;
@@ -979,7 +981,7 @@ impl JjBackend {
         let base = self.head_repo()?;
         let (value, vis) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
-        check_push_records(&records, &vis, &base)?;
+        check_push_records(&records, &base)?;
         let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
         Ok(())
     }
@@ -1788,68 +1790,48 @@ fn parse_push_records(
     Ok(out)
 }
 
-/// §7.6: refuse to send commits with unresolved files or empty descriptions,
-/// and refuse to move/delete a bookmark whose current target is immutable
-/// away from a descendant of that target
+/// §7.6: refuse to send commits with unresolved files or empty descriptions
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
-    vis: &VisibleRepo,
     repo: &Arc<ReadonlyRepo>,
 ) -> Result<(), OpenError> {
     let store = repo.store().clone();
-    for (name, target) in records {
-        let mut seeds: Vec<String> = Vec::new();
-        if let Some(commit_id) = target {
-            let commit = block_on(store.get_commit_async(commit_id))
-                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
-            let change_id = commit.change_id().reverse_hex();
-            if vis.commits.contains_key(&change_id) {
-                seeds.push(change_id);
+    let origin = RemoteName::new("origin");
+    // the commits that would be sent: ancestors of the new targets that no
+    // bookmark on the remote already reaches; a delete sends none
+    let heads: Vec<CommitId> = records.iter().filter_map(|(_, t)| t.clone()).collect();
+    if heads.is_empty() {
+        return Ok(());
+    }
+    let on_remote: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(origin)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let sent = ResolvedRevsetExpression::commits(on_remote)
+        .range(&ResolvedRevsetExpression::commits(heads))
+        .evaluate(repo.as_ref())
+        .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
+    let sent: Vec<Commit> = block_on(sent.stream().commits(&store).try_collect())
+        .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
+    for commit in &sent {
+        let change_id = commit.change_id().reverse_hex();
+        for (_path, value) in commit.tree().entries() {
+            let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
+            if !value.is_resolved() {
+                return Err((1, format!("push: commit `@{}` has unresolved files", change_id)));
             }
         }
-        if let Some(current) = repo
-            .view()
-            .get_remote_bookmark(RefName::new(name).to_remote_symbol(RemoteName::new("origin")))
-            .target
-            .as_resolved()
-            .cloned()
-            .unwrap_or(None)
-        {
-            let commit = block_on(store.get_commit_async(&current))
-                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
-            let change_id = commit.change_id().reverse_hex();
-            if vis.commits.contains_key(&change_id) {
-                seeds.push(change_id);
-            }
-        }
-        let ancestors = ancestors_of_change_ids(vis, &seeds);
-        for change_id in &ancestors {
-            let rec = vis.commits.get(change_id).expect("ancestors are stored");
-            for (_path, value) in rec.commit.tree().entries() {
-                let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
-                if !value.is_resolved() {
-                    return Err((
-                        1,
-                        format!(
-                            "push: commit `@{}` has unresolved files",
-                            rec.change_id
-                        ),
-                    ));
-                }
-            }
-            if rec.commit.description().trim().is_empty() && rec.commit.id() != store.root_commit_id() {
-                return Err((
-                    1,
-                    format!("push: commit `@{}` has an empty description", rec.change_id),
-                ));
-            }
+        if commit.description().trim().is_empty() && commit.id() != store.root_commit_id() {
+            return Err((1, format!("push: commit `@{}` has an empty description", change_id)));
         }
     }
     Ok(())
 }
 
 /// change-id closure of jj-parents from the seeds (all jj parents, not just
-/// the first), for the push content checks and the immutable set (§7.5)
+/// the first), for the immutable set (§7.5)
 fn ancestors_of_change_ids(vis: &VisibleRepo, seeds: &[String]) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = seeds.to_vec();

@@ -880,7 +880,9 @@ language: `fetch` and `push` are the only things that change them.
   - a `name` is not a valid git branch name, an `id` is not a visible commit,
     or a delete names a bookmark the remote does not have;
   - any commit that would be sent has an unresolved file or an empty
-    description;
+    description (the commits that would be sent are the records' `id`s and
+    their ancestors that no bookmark on `origin` reaches as of the last
+    `fetch` or `push`; a delete sends none);
   - the bookmark's current target is in the immutable set (§7.5) and the
     record would move it to a commit that does not descend from it, or delete
     it.

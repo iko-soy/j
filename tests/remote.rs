@@ -393,6 +393,40 @@ fn push_of_an_empty_list_pushes_nothing() {
 }
 
 #[test]
+fn push_checks_only_the_commits_it_sends() {
+    // §7.6: the unresolved-file and empty-description refusals are about
+    // commits that would be sent. The check walked every ancestor of the new
+    // and old targets, so one empty message the remote already had refused
+    // every later push on top of it, and deletes, which send nothing
+    let env = setup();
+    let seed = env.dir.join("seed");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
+    git(&seed, &["checkout", "-q", "master"]);
+    std::fs::write(seed.join("a.txt"), "blank\n").unwrap();
+    git(
+        &seed,
+        &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qa", "--allow-empty-message", "-m", ""],
+    );
+    git(&seed, &["push", "-q", "origin", "master"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "work\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    assert!(git(&env.remote, &["log", "--oneline", "feature"]).contains("work"));
+    env.j(&dest, &["push (label \"copy\" (labelled \"feature\"))"]).ok();
+    env.j(&dest, &["push (unlabel \"copy\")"]).ok();
+    assert!(!git(&env.remote, &["branch"]).contains("copy"));
+    // a new commit without a message is still refused
+    env.j(&dest, &["new"]).ok();
+    std::fs::write(dest.join("b.txt"), "more\n").unwrap();
+    let out = env.j(&dest, &["push (label \"feature\" here)"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("empty description"), "{}", out.stderr);
+    assert!(git(&env.remote, &["log", "-1", "--format=%s", "feature"]).contains("work"));
+}
+
+#[test]
 fn partial_push_records_what_the_remote_accepted() {
     // git push is not atomic: when the remote accepts `aaa` and rejects
     // `bbb`, aaa is on the remote. The run exited 1 without recording the
