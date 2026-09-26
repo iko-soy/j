@@ -1,9 +1,9 @@
 //! Parser for the j language (§3.2–3.4), including the two layout rules.
 
-use crate::ast::{Expr, Item, Pattern, TypeExpr};
+use crate::ast::{Expr, Item, Pattern, Source, TypeExpr};
 use crate::lex::{lex, LexError, SpTok, Tok};
 use num_bigint::BigInt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -31,14 +31,35 @@ impl From<LexError> for ParseError {
 }
 
 pub struct Parser {
+    /// the text being parsed, of which each lambda keeps its span (§5.2)
+    src: Rc<str>,
     toks: Vec<SpTok>,
     pos: usize,
     /// Names in scope (top-level + builtins) for the no-shadowing rule.
     outer_names: Rc<BTreeSet<String>>,
+    /// Names bound by the lambdas and `let` blocks around the current
+    /// position, for the same rule (§4.2). Since shadowing is refused, no
+    /// name is in here twice, and a construct removes the names it added
+    /// when its scope ends.
+    locals: HashSet<String>,
+    /// How many local binders have been parsed, and for each name the
+    /// ordinal and line of the latest one: the `let` check that `locals`
+    /// cannot make (see `parse_let`).
+    binders: usize,
+    last_binder: HashMap<String, (usize, usize)>,
     /// set when an operator expression ends with a trailing operator before
     /// `)`, i.e. a left section
     section_op: Option<&'static str>,
+    /// levels of recursive descent currently open, bounded by `MAX_DEPTH`
+    depth: usize,
 }
+
+/// How many levels of recursive descent may be open at once. Each costs
+/// native stack (several KB in a debug build), so input nested past this is
+/// a parse error (§1.4) instead of an overflow of the worker thread's stack
+/// (main.rs); the bound keeps the deepest parse to a fraction of that stack
+/// while allowing thousands of levels of any construct.
+const MAX_DEPTH: usize = 20_000;
 
 /// fixity table (§3.2): (precedence, right-assoc)
 fn fixity(op: &str) -> Option<(u8, bool)> {
@@ -62,11 +83,32 @@ fn is_nonassoc(op: &str) -> bool {
 impl Parser {
     pub fn new(src: &str, outer_names: Rc<BTreeSet<String>>) -> Result<Self, ParseError> {
         Ok(Parser {
+            src: Rc::from(src),
             toks: lex(src)?,
             pos: 0,
             outer_names,
+            locals: HashSet::new(),
+            binders: 0,
+            last_binder: HashMap::new(),
             section_op: None,
+            depth: 0,
         })
+    }
+
+    /// Run `f` one level deeper in the recursive descent. Every cycle of
+    /// mutually recursive parse functions passes through a call made here,
+    /// which is what bounds the parser's stack use.
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError::new("nested too deeply", self.line()));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
 
     fn peek(&self) -> &Tok {
@@ -123,12 +165,15 @@ impl Parser {
         Ok(items)
     }
 
+    /// One item. Under rule 1 (§3.3) a line starting past column 1 continues
+    /// it, so a line break before its `=` or `:` is skipped when the next
+    /// line starts past column 1, like one inside its type or expression.
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         match self.peek().clone() {
             Tok::TypeName(name) => {
                 // typedecl: TYPENAME '=' type
                 self.bump();
-                self.skip_newlines();
+                self.skip_layout_newlines(1);
                 self.expect(&Tok::Equals)?;
                 let ty = self.parse_type()?;
                 Ok(Item::TypeDecl(name, ty))
@@ -136,6 +181,7 @@ impl Parser {
             Tok::Ident(name) => {
                 let line = self.line();
                 self.bump();
+                self.skip_layout_newlines(1);
                 match self.peek().clone() {
                     Tok::Colon => {
                         self.bump();
@@ -167,6 +213,7 @@ impl Parser {
                     }
                 };
                 self.expect(&Tok::RParen)?;
+                self.skip_layout_newlines(1);
                 self.expect(&Tok::Colon)?;
                 let ty = self.parse_type()?;
                 Ok(Item::Signature(op.to_string(), ty, line))
@@ -182,47 +229,22 @@ impl Parser {
     // types
     // ------------------------------------------------------------------
     fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
-        self.skip_newlines_in_type();
+        self.nested(Self::parse_type_inner)
+    }
+
+    /// Types occur only in top-level items, so their layout limit is always
+    /// rule 1's column 1 (§3.3): a line break may fall anywhere in a type,
+    /// before or after `->` alike, when the next line starts past column 1.
+    fn parse_type_inner(&mut self) -> Result<TypeExpr, ParseError> {
+        self.skip_layout_newlines(1);
         let lhs = self.parse_atype()?;
-        self.skip_newlines_in_type();
+        self.skip_layout_newlines(1);
         if matches!(self.peek(), Tok::Arrow) {
             self.bump();
             let rhs = self.parse_type()?;
             Ok(TypeExpr::Fun(Rc::new(lhs), Rc::new(rhs)))
         } else {
             Ok(lhs)
-        }
-    }
-
-    /// In types (signatures) we allow newlines before `->` continuation when
-    /// indented; keep it simple: skip newlines if the next token is `->`.
-    fn skip_newlines_in_type(&mut self) {
-        let save = self.pos;
-        loop {
-            if matches!(self.peek(), Tok::Newline) {
-                self.pos += 1;
-                // only continue skipping if Arrow follows after the newlines
-                let _ = &save;
-                let mut p = self.pos;
-                while matches!(self.toks[p].tok, Tok::Newline) {
-                    p += 1;
-                }
-                if matches!(self.toks[p].tok, Tok::Arrow) {
-                    self.pos = p;
-                    return;
-                } else {
-                    self.pos = save;
-                    // restore to before newlines? we must not consume them if
-                    // not followed by Arrow, since layout needs them.
-                    // Walk back: find first newline we consumed.
-                    while self.pos > 0 && matches!(self.toks[self.pos - 1].tok, Tok::Newline) {
-                        self.pos -= 1;
-                    }
-                    return;
-                }
-            } else {
-                return;
-            }
         }
     }
 
@@ -246,7 +268,7 @@ impl Parser {
                 self.bump();
                 let mut fields = Vec::new();
                 loop {
-                    self.skip_newlines();
+                    self.skip_layout_newlines(1);
                     if matches!(self.peek(), Tok::RBrace) {
                         self.bump();
                         break;
@@ -260,10 +282,11 @@ impl Parser {
                             ))
                         }
                     };
+                    self.skip_layout_newlines(1);
                     self.expect(&Tok::Colon)?;
                     let t = self.parse_type()?;
                     fields.push((name, Rc::new(t)));
-                    self.skip_newlines();
+                    self.skip_layout_newlines(1);
                     match self.peek() {
                         Tok::Comma => {
                             self.bump();
@@ -303,6 +326,10 @@ impl Parser {
     /// expression stops at a Newline whose following token is in a column
     /// <= min_col (it belongs to an outer construct).
     pub fn parse_expr(&mut self, min_col: usize) -> Result<Expr, ParseError> {
+        self.nested(|p| p.parse_expr_inner(min_col))
+    }
+
+    fn parse_expr_inner(&mut self, min_col: usize) -> Result<Expr, ParseError> {
         self.skip_layout_newlines(min_col);
         match self.peek().clone() {
             Tok::Backslash => {
@@ -312,7 +339,11 @@ impl Parser {
                 loop {
                     match self.peek().clone() {
                         Tok::Ident(n) => {
+                            // in scope from here on, so a later parameter
+                            // may not reuse it either
                             self.check_shadow(&n)?;
+                            self.locals.insert(n.clone());
+                            self.note_binder(&n, self.line());
                             params.push(Pattern::Var(n));
                             self.bump();
                         }
@@ -339,6 +370,11 @@ impl Parser {
                     return Err(ParseError::new("lambda needs at least one parameter", self.line()));
                 }
                 let body = self.parse_expr(min_col)?;
+                for p in &params {
+                    if let Pattern::Var(n) = p {
+                        self.locals.remove(n);
+                    }
+                }
                 let src = self.source_slice(&src_start);
                 Ok(Expr::Lambda(params, Rc::new(body), src))
             }
@@ -396,7 +432,8 @@ impl Parser {
             ));
         }
         let mut bindings: Vec<(String, Rc<Expr>)> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<(String, usize)> = Vec::new();
+        let first_binder = self.binders;
         loop {
             // binding: ident '=' expr, expr limited to block_col
             let name = match self.peek().clone() {
@@ -408,17 +445,20 @@ impl Parser {
                     ))
                 }
             };
-            self.check_shadow(&name)?;
-            if names.iter().any(|n| *n == name) {
+            if names.iter().any(|(n, _)| *n == name) {
                 return Err(ParseError::new(
                     format!("`{}` is bound twice in this let", name),
                     self.line(),
                 ));
             }
+            self.check_shadow(&name)?;
+            // in scope from here on: in its own expression, the later ones
+            // and the body (§4.1)
+            self.locals.insert(name.clone());
+            names.push((name.clone(), self.line()));
             self.bump();
             self.expect(&Tok::Equals)?;
             let e = self.parse_expr(block_col)?;
-            names.push(name.clone());
             bindings.push((name, Rc::new(e)));
             // separator: `;` or newline at exactly block_col, then `in` ends
             match self.peek().clone() {
@@ -443,6 +483,16 @@ impl Parser {
                     }
                     let next_col = self.toks[q].col;
                     if matches!(self.toks[q].tok, Tok::In) {
+                        // like any token that begins a line, an `in` at or
+                        // left of the limit belongs to an outer construct
+                        // (§3.3): a new top-level item or an outer let's
+                        // binding line, never this let
+                        if next_col <= min_col {
+                            return Err(ParseError::new(
+                                format!("`in` must be indented past column {}", min_col),
+                                self.toks[q].line,
+                            ));
+                        }
                         self.pos = q;
                         self.bump();
                         break;
@@ -480,18 +530,40 @@ impl Parser {
                 }
             }
         }
+        // A binding is in scope in the expressions before it too (§4.1), but
+        // it was not yet in `locals` while they were parsed: a binder in one
+        // of them that reuses its name is caught here instead.
+        for (n, _) in &names {
+            if let Some(&(k, line)) = self.last_binder.get(n) {
+                if k >= first_binder {
+                    return Err(shadowed(n, line));
+                }
+            }
+        }
+        for (n, line) in &names {
+            self.note_binder(n, *line);
+        }
         let body = self.parse_expr(min_col)?;
+        for (n, _) in &names {
+            self.locals.remove(n);
+        }
         Ok(Expr::Let(bindings, Rc::new(body)))
     }
 
+    /// §4.2: a binder may not reuse a top-level or builtin name, nor one
+    /// bound by an enclosing lambda or `let`.
     fn check_shadow(&self, name: &str) -> Result<(), ParseError> {
-        if self.outer_names.contains(name) {
-            return Err(ParseError::new(
-                format!("`{}` is already bound and may not be shadowed", name),
-                self.line(),
-            ));
+        if self.outer_names.contains(name) || self.locals.contains(name) {
+            return Err(shadowed(name, self.line()));
         }
         Ok(())
+    }
+
+    /// Record a local binder for the check at the end of each enclosing
+    /// `let` block's bindings.
+    fn note_binder(&mut self, name: &str, line: usize) {
+        self.last_binder.insert(name.to_string(), (self.binders, line));
+        self.binders += 1;
     }
 
     fn parse_or(&mut self, min_col: usize) -> Result<Expr, ParseError> {
@@ -501,7 +573,7 @@ impl Parser {
             self.skip_layout_newlines(min_col);
             if matches!(self.peek(), Tok::Or) {
                 self.bump();
-                let rhs = self.parse_or(min_col)?;
+                let rhs = self.nested(|p| p.parse_or(min_col))?;
                 lhs = Expr::Or(Rc::new(lhs), Rc::new(rhs));
             } else {
                 break;
@@ -533,7 +605,7 @@ impl Parser {
                 return Ok(lhs);
             }
             let next_min = if right { prec } else { prec + 1 };
-            let rhs = self.parse_opexpr(next_min, min_col)?;
+            let rhs = self.nested(|p| p.parse_opexpr(next_min, min_col))?;
             // non-assoc check: if lhs is the same operator, reject chaining
             if is_nonassoc(op) {
                 // a non-associative operator cannot be chained; explicit
@@ -694,6 +766,10 @@ impl Parser {
     }
 
     fn parse_atom(&mut self, min_col: usize) -> Result<Expr, ParseError> {
+        self.nested(|p| p.parse_atom_inner(min_col))
+    }
+
+    fn parse_atom_inner(&mut self, min_col: usize) -> Result<Expr, ParseError> {
         match self.peek().clone() {
             Tok::Ident(n) => {
                 self.bump();
@@ -759,6 +835,7 @@ impl Parser {
                 Ok(Expr::Record(fields))
             }
             Tok::LParen => {
+                let open = self.toks[self.pos].clone();
                 self.bump();
                 // (op) | (op expr) | (expr op) | (expr)
                 if let Tok::Op(o) = self.peek().clone() {
@@ -770,6 +847,18 @@ impl Parser {
                     }
                     // right section: (op e) = \x -> x op e
                     let e = self.parse_expr(min_col)?;
+                    // `(op e op)` is no production (§3.4); unchecked, the
+                    // trailing operator would be dropped here and left set
+                    // for the next `(e)` to take as a left section
+                    if let Some(o2) = self.section_op.take() {
+                        return Err(ParseError::new(
+                            format!(
+                                "a section cannot have operators on both sides (`{}` and `{}`)",
+                                o, o2
+                            ),
+                            self.line(),
+                        ));
+                    }
                     self.expect(&Tok::RParen)?;
                     let var = fresh_var();
                     let body = Expr::BinOp(
@@ -780,7 +869,7 @@ impl Parser {
                     return Ok(Expr::Lambda(
                         vec![Pattern::Var(var)],
                         Rc::new(body),
-                        "section".into(),
+                        self.source_slice(&open),
                     ));
                 }
                 let first = self.parse_expr(min_col)?;
@@ -797,7 +886,7 @@ impl Parser {
                     return Ok(Expr::Lambda(
                         vec![Pattern::Var(var)],
                         Rc::new(body),
-                        "section".into(),
+                        self.source_slice(&open),
                     ));
                 }
                 self.expect(&Tok::RParen)?;
@@ -810,9 +899,16 @@ impl Parser {
         }
     }
 
-    fn source_slice(&self, _start: &SpTok) -> String {
-        // source text of a lambda for display; we re-render from the AST.
-        String::new()
+    /// The source of a lambda or section, from its first token `start` to
+    /// the last token consumed, for its rendering (§5.2: exactly as
+    /// written). Line breaks the layout rules skipped looking for more of it
+    /// are not part of it, nor is a comment after its last token.
+    fn source_slice(&self, start: &SpTok) -> Source {
+        let mut last = self.pos - 1;
+        while matches!(self.toks[last].tok, Tok::Newline) {
+            last -= 1;
+        }
+        Source::new(self.src.clone(), start.start, self.toks[last].end)
     }
 
     /// Parse a single command-line expression. Layout rule 1 does not apply.
@@ -828,6 +924,10 @@ impl Parser {
         }
         Ok(e)
     }
+}
+
+fn shadowed(name: &str, line: usize) -> ParseError {
+    ParseError::new(format!("`{}` is already bound and may not be shadowed", name), line)
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};

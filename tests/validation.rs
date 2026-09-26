@@ -449,6 +449,21 @@ fn builtin_redefinition_rejected() {
 }
 
 #[test]
+fn local_shadowing_is_a_configuration_error() {
+    // §4.2: rebinding a name of an enclosing lambda or let in config.j
+    for (def, name) in [
+        ("sh = \\x -> \\x -> x", "x"),
+        ("sh = \\x x -> x", "x"),
+        ("sh = let a = 1 in let a = 2 in a", "a"),
+        ("sh = \\repo -> let repo = 1 in repo", "repo"),
+    ] {
+        let e = cfg_err(&format!("{}\n{}\n", MINIMAL, def));
+        assert!(e.starts_with("line 7:"), "{}: {}", def, e);
+        assert!(e.contains(&format!("`{}` is already bound", name)), "{}: {}", def, e);
+    }
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);
@@ -473,6 +488,74 @@ fn signature_must_precede_definition() {
         MINIMAL
     ));
     assert!(e.contains("immediately"), "{}", e);
+}
+
+#[test]
+fn no_item_between_signature_and_definition() {
+    // §3.4, §6.2.2: a typedecl or another signature is an item too; either
+    // used to detach the signature silently and still attach it as `f`'s
+    // contract
+    for between in ["T = Int\n", "g : Int\ng = 1\n"] {
+        let e = cfg_err(&format!("{}\nf : Int\n{}f = 2\n", MINIMAL, between));
+        assert!(
+            e.contains("the signature for `f` is not immediately followed"),
+            "{:?}: {}",
+            between,
+            e
+        );
+    }
+    // a builtin's signature has no definition to precede
+    config::load_config(&format!(
+        "{}\nlength : [a] -> Int\nT = Int\nnull : [a] -> Bool\nf : Int\nf = 1\n",
+        MINIMAL
+    ))
+    .expect("builtin signatures may be followed by any item");
+}
+
+/// Load and evaluate a config over an empty backend.
+fn eval_cfg(src: &str) -> Result<Interp, String> {
+    let cfg = config::load_config(src).map_err(|e| e.message())?;
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).map_err(|c| c.msg)?;
+    Ok(i)
+}
+
+#[test]
+fn label_literal_depends_on_labelled() {
+    // §4.11: `%main` is `labelled "main"`, so a definition using it outside a
+    // lambda is evaluated after `labelled` (§4.1). A name sorting before
+    // `labelled` used to be evaluated first and fail the whole config with
+    // "`labelled` is not defined".
+    for def in ["base = %main", "choices = [%main %master]", "zbase = %main"] {
+        let i = eval_cfg(&format!("{}\n{}\n", MINIMAL, def))
+            .unwrap_or_else(|e| panic!("{}: {}", def, e));
+        let name = def.split(' ').next().unwrap();
+        assert!(i.globals.lookup(name).is_some(), "{}", def);
+    }
+}
+
+#[test]
+fn load_order_follows_lambda_bodies() {
+    // `opts` applies `mk` at load and `mk`'s body needs `lanes`, a reference
+    // inside a lambda that §4.1 does not count: `opts` used to be evaluated
+    // as soon as `mk` was, before `lanes` (which waits for `names`)
+    let i = eval_cfg(&format!(
+        "{}\nnames = 1\nlanes = [names]\nmk = \\d -> {{ lanes = lanes }}\nopts = mk 1\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    let opts = i.globals.lookup("opts").expect("opts");
+    let want = Value::record(&[("lanes", Value::list(vec![Value::int(1)]))]);
+    assert!(j::value::value_eq(&opts, &want).unwrap());
+    // mutually referring definitions keep the order that references outside
+    // lambdas give them: `b` applies `a`, whose body needs `y`, and `y` refers
+    // back to `b`; `b` waits for `z`, so `y` is bound by then
+    let i = eval_cfg(&format!(
+        "{}\na = \\_ -> y\nb = a z\ny = \\_ -> b\nz = 1\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    assert!(i.globals.lookup("b").is_some());
 }
 
 #[test]

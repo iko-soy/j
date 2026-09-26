@@ -5,8 +5,9 @@ use crate::value::{BlobContent, Crash, FunVal, Value};
 
 pub fn show(interp: &Interp, v: &Value) -> String {
     let s = render(interp, v);
-    // line breaking: one line if it fits in 80 columns
-    if s.chars().count() <= 80 {
+    // line breaking: one line if it fits in 80 columns, counted in display
+    // cells as everywhere else (§5.1), not code points
+    if crate::render::width(&s) <= 80 {
         return s;
     }
     render_wide(interp, v, 0)
@@ -63,12 +64,16 @@ fn render(interp: &Interp, v: &Value) -> String {
 fn render_fun(interp: &Interp, f: &FunVal) -> String {
     match f {
         FunVal::Builtin { name, args, .. } => {
+            // a selector `.name` carries its field as a baked-in first
+            // argument (builtins::make_selector) and renders as the selector
+            // atom itself (§3.4), not as an application to that field
+            if name.starts_with('.') && name.len() > 1 {
+                return name.clone();
+            }
             // operator builtins render parenthesised when bare
             if args.is_empty() {
                 if is_operator_name(name) {
                     format!("({})", name)
-                } else if name.starts_with('.') && name.len() > 1 {
-                    name.clone() // selector .name
                 } else if name == "(.)" {
                     "(.)".into()
                 } else {
@@ -83,7 +88,7 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
                 } else {
                     name.clone()
                 };
-                // args may contain a baked-in value (compose, selectors)
+                // args may contain a baked-in value (compose)
                 match name.as_str() {
                     "(.)" if args.len() == 2 => {
                         format!(
@@ -117,25 +122,27 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
         }
         FunVal::Closure {
             name: None,
-            applied,
+            applied_args,
             params,
             body,
             src,
             ..
         } => {
-            if *applied == 0 {
-                if src.is_empty() || src == "section" {
-                    crate::parse::render_lambda(params, body)
-                } else {
-                    src.clone()
-                }
+            // a lambda or section renders as its source, exactly as written
+            // (§5.2); only an AST built without source is re-rendered
+            let base = if src.as_str().is_empty() {
+                crate::parse::render_lambda(params, body)
             } else {
-                let base = if src.is_empty() || src == "section" {
-                    crate::parse::render_lambda(params, body)
-                } else {
-                    src.clone()
-                };
-                format!("({}) <applied>", base)
+                src.as_str().to_string()
+            };
+            if applied_args.is_empty() {
+                base
+            } else {
+                // partial application: the lambda, parenthesised as it is not
+                // atomic, followed by the arguments supplied so far (§5.2)
+                let args: Vec<String> =
+                    applied_args.iter().map(|a| render_atom(interp, a)).collect();
+                format!("({}) {}", base, args.join(" "))
             }
         }
         FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a), render_atom(interp, b)),
@@ -152,12 +159,27 @@ fn render_atom(interp: &Interp, v: &Value) -> String {
     let atomic = matches!(
         v,
         Value::Int(_) | Value::Text(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) | Value::List(_)
-    );
+    ) || is_section(v);
     let s = render(interp, v);
     if atomic {
         s
     } else {
         format!("({})", s)
+    }
+}
+
+/// A section renders as its source, `(op e)` or `(e op)` (§5.2), which is
+/// already an atom (§3.4) and takes no parentheses of its own. A lambda's
+/// source begins with its `\` instead, and a section, taking one argument,
+/// is never partially applied.
+fn is_section(v: &Value) -> bool {
+    match v {
+        Value::Fun(f) => matches!(
+            f.as_ref(),
+            FunVal::Closure { name: None, applied_args, src, .. }
+                if applied_args.is_empty() && src.as_str().starts_with('(')
+        ),
+        _ => false,
     }
 }
 
@@ -198,6 +220,12 @@ pub fn text_literal(s: &str) -> String {
 
 fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
     match v {
+        // see through a lazy `files` list as `render` does, so that it breaks
+        // like the equal forced list instead of staying on one line
+        Value::Thunk(t) => match t.force() {
+            Ok(v) => render_wide(interp, &v, indent),
+            Err(_) => "<lazy>".to_string(),
+        },
         Value::List(xs) if !xs.is_empty() => {
             let mut out = String::from("[");
             for (i, x) in xs.iter().enumerate() {
@@ -216,7 +244,8 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
                         | Value::Shape(_)
                         | Value::List(_)
                         | Value::Record(_)
-                ) {
+                ) || is_section(x)
+                {
                     out.push_str(&s);
                 } else {
                     out.push_str(&format!("({})", s));
@@ -259,12 +288,19 @@ pub fn unified_diff(a: &str, b: &str) -> String {
             };
             out.push_str(sign);
             let text = change.to_string();
-            // similar yields the line with its terminator when present; the
-            // last line of a file without a trailing newline has none, so add
-            // one to keep the diff line-oriented
+            // similar yields the line with its terminator when present (and
+            // supplies a `\n` for the last line of a text without a trailing
+            // newline); a lone `\r` also ends a line for it, so add a `\n` to
+            // keep the diff line-oriented
             out.push_str(&text);
             if !text.ends_with('\n') {
                 out.push('\n');
+            }
+            // mark a line that had no terminator, as GNU diff and git do:
+            // otherwise dropping the final newline shows as the same line
+            // removed and re-added, alike in both directions
+            if change.missing_newline() {
+                out.push_str("\\ No newline at end of file\n");
             }
         }
     }

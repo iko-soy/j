@@ -74,14 +74,22 @@ pub struct ThunkVal {
 
 enum ThunkState {
     Pending(Box<dyn FnOnce() -> Result<Value, Crash>>),
+    /// the computation has been taken out of `Pending` and is running
+    Forcing,
     Ready(Value),
+    /// the computation crashed (a store read failed). Every later force
+    /// crashes the same way (§7.2): a crash caught by `or`, or swallowed by
+    /// rendering, must not leave some other value behind.
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for ThunkVal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &*self.state.borrow() {
             ThunkState::Pending(_) => write!(f, "Thunk(pending)"),
+            ThunkState::Forcing => write!(f, "Thunk(forcing)"),
             ThunkState::Ready(v) => write!(f, "Thunk({:?})", v),
+            ThunkState::Failed(c) => write!(f, "Thunk(failed: {})", c.msg),
         }
     }
 }
@@ -107,24 +115,27 @@ impl ThunkVal {
         self.origin.as_deref()
     }
 
-    /// the value, computing it on first call and memoizing
+    /// the value, computing it on first call and memoizing the outcome, a
+    /// crash included
     pub fn force(&self) -> Result<Value, Crash> {
-        if let ThunkState::Ready(v) = &*self.state.borrow() {
-            return Ok(v.clone());
-        }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, ThunkState::Ready(Value::Bool(false))) {
-                ThunkState::Pending(t) => t,
-                ThunkState::Ready(v) => {
-                    *st = ThunkState::Ready(v.clone());
-                    return Ok(v);
-                }
+        match &*self.state.borrow() {
+            ThunkState::Ready(v) => return Ok(v.clone()),
+            ThunkState::Failed(c) => return Err(c.clone()),
+            ThunkState::Forcing => {
+                return Err(Crash::new("internal: a lazy value was forced re-entrantly"))
             }
+            ThunkState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), ThunkState::Forcing) {
+            ThunkState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let v = thunk()?;
-        *self.state.borrow_mut() = ThunkState::Ready(v.clone());
-        Ok(v)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(v) => ThunkState::Ready(v.clone()),
+            Err(c) => ThunkState::Failed(c.clone()),
+        };
+        out
     }
 }
 
@@ -187,7 +198,12 @@ pub struct LazyBlob {
 
 enum LazyState {
     Pending(Box<dyn FnOnce() -> Result<Rc<Vec<u8>>, Crash>>),
+    /// the read has been taken out of `Pending` and is running
+    Forcing,
     Ready(Rc<Vec<u8>>),
+    /// the read failed: every later force fails the same way, so the blob
+    /// never reads as empty (§7.2), whoever caught or swallowed the crash
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for LazyBlob {
@@ -214,25 +230,28 @@ impl LazyBlob {
         }
     }
 
-    /// the bytes, reading from the store on first call and memoizing
+    /// the bytes, reading from the store on first call and memoizing the
+    /// outcome, a failed read included
     pub fn force(&self) -> Result<Rc<Vec<u8>>, Crash> {
         // fast path: already forced
-        if let LazyState::Ready(b) = &*self.state.borrow() {
-            return Ok(b.clone());
-        }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, LazyState::Ready(Rc::new(Vec::new()))) {
-                LazyState::Pending(t) => t,
-                LazyState::Ready(b) => {
-                    *st = LazyState::Ready(b.clone());
-                    return Ok(b);
-                }
+        match &*self.state.borrow() {
+            LazyState::Ready(b) => return Ok(b.clone()),
+            LazyState::Failed(c) => return Err(c.clone()),
+            LazyState::Forcing => {
+                return Err(Crash::new("internal: a lazy blob was read re-entrantly"))
             }
+            LazyState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), LazyState::Forcing) {
+            LazyState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let bytes = thunk()?;
-        *self.state.borrow_mut() = LazyState::Ready(bytes.clone());
-        Ok(bytes)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(b) => LazyState::Ready(b.clone()),
+            Err(c) => LazyState::Failed(c.clone()),
+        };
+        out
     }
 }
 
@@ -357,9 +376,6 @@ impl PrimKind {
 pub enum ShapeKind {
     Record(BTreeSet<String>),
     Prim(PrimKind),
-    /// an alias that could not be resolved to a record shape yet (function,
-    /// list, or a typedecl processed later); resolved lazily at check time
-    Aliased(String),
 }
 
 #[derive(Clone, Debug)]
@@ -388,22 +404,26 @@ pub enum FunVal {
         name: Option<String>, // top-level definition name, if any
         params: Vec<Pattern>,
         applied: usize,
-        /// the arguments supplied so far, for rendering (§5.2)
+        /// the arguments supplied so far, for rendering (§5.2); in a deferred
+        /// closure, those past the first `applied` still wait to be applied
+        /// to the body's value
         applied_args: Vec<Value>,
-        /// the body has not been evaluated yet (the definition's contract is
-        /// not exhausted): the next application evaluates it, then applies
+        /// every parameter is bound but the body has not been evaluated yet,
+        /// as the definition's contract is not exhausted: further arguments
+        /// are collected until it is, then the body is evaluated and its
+        /// value applied to them
         deferred: bool,
         body: Rc<Expr>,
         env: Env,
-        src: String,
+        /// the lambda's source, which it renders as (§5.2)
+        src: crate::ast::Source,
         /// contract of this function as further arguments arrive
         pending: Option<(String, Rc<crate::shape::ContractExpr>)>,
     },
     /// `f or g` lifted pointwise over functions (§4.6)
     OrFun(Value, Value),
-    /// unevaluated composition: unfolds only when applied to a non-function
-    /// (§4.1 note — `abandon . contract everything` is a value before it is
-    /// applied, and must not run at load)
+    /// a composition `f . g` applied as `f (g x)` (§4.9); `(.)` itself
+    /// builds a builtin node instead (builtins::compose_values)
     ComposeLazy(Value, Value),
     /// a label literal %name: applies as `labelled "name"`
     Labelled(String, Value),
@@ -536,7 +556,27 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 f: *f,
                 pending,
             })),
-            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => v.clone(),
+            // `f or g` and `%name` have nowhere to hold a contract, so the
+            // definition becomes `\x -> v x` under its name, which the
+            // closure machinery checks at every argument the signature lists
+            // and at the result. The check is around the lifted `or` as a
+            // whole (§4.6): a result that violates the signature is a crash,
+            // not a reason to try the other side.
+            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => {
+                let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
+                Value::Fun(Rc::new(FunVal::Closure {
+                    name: Some(name.to_string()),
+                    params: vec![Pattern::Var("x".to_string())],
+                    applied: 0,
+                    applied_args: Vec::new(),
+                    deferred: false,
+                    body: Rc::new(Expr::App(var("f"), var("x"))),
+                    env: Env::empty().extend(vec![("f".to_string(), v.clone())]),
+                    // a named closure renders as its name (§5.2)
+                    src: crate::ast::Source::new(Rc::from(""), 0, 0),
+                    pending,
+                }))
+            }
         },
         _ => v.clone(),
     }

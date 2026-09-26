@@ -173,6 +173,56 @@ fn show_wide_roundtrips() {
 }
 
 #[test]
+fn show_wide_sees_through_lazy_files() {
+    // a commit's `files` is a thunk until forced (value.rs); `show` must give
+    // the same text for it as for the equal record holding the forced list,
+    // breaking the list one element per line (§5.2)
+    let (mut i, cfg) = make_interp();
+    let entries: Vec<Value> = (1..=4)
+        .map(|n| {
+            Value::record(&[
+                ("content", BlobVal::text_blob(&format!("content {}\n", n))),
+                ("path", Value::list(vec![Value::text(format!("file{}.txt", n))])),
+            ])
+        })
+        .collect();
+    let commit = |files: Value| {
+        Value::record(&[
+            ("files", files),
+            ("id", Value::Id(Rc::new("xruqnqvokyloollnxruqnqvokyloolln".to_string()))),
+            ("labels", Value::list(vec![])),
+            ("message", Value::text("")),
+        ])
+    };
+    let lazy = commit(j::domain::lazy_files("xruqnqvokyloollnxruqnqvokyloolln", entries.clone()));
+    let eager = commit(Value::list(entries.clone()));
+    let s = show(&i, &lazy);
+    assert_eq!(s, show(&i, &eager));
+    assert!(
+        s.lines().all(|l| j::render::width(l) <= 80),
+        "files list left on one line: {}",
+        s
+    );
+    // the broken-up list still reads back (the id above names no commit of
+    // the in-memory backend, so round-trip the files alone)
+    roundtrip(&mut i, &cfg, &Value::record(&[("files", j::domain::lazy_files("xruqnqvokyloollnxruqnqvokyloolln", entries))]));
+}
+
+#[test]
+fn show_fits_by_display_width() {
+    // "fits in 80 columns" counts display cells, not code points (§5.1): 55
+    // characters of which 45 are wide is 100 columns and must break
+    let (mut i, cfg) = make_interp();
+    let wide = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 3]);
+    let s = show(&i, &wide);
+    assert!(s.contains('\n'), "{}", s);
+    roundtrip(&mut i, &cfg, &wide);
+    // two of them are 67 columns and stay on one line
+    let narrow = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 2]);
+    assert!(!show(&i, &narrow).contains('\n'));
+}
+
+#[test]
 fn show_partial_application() {
     let (mut i, cfg) = make_interp();
     let outer = Rc::new(cfg.global_names.clone());
@@ -181,6 +231,89 @@ fn show_partial_application() {
     let v = i.eval(&Rc::new(e), &env).unwrap();
     let s = show(&i, &v);
     assert_eq!(s, "describe \"wip\"", "{}", s);
+}
+
+/// `show` of the value `src` evaluates to.
+fn show_of(i: &mut Interp, cfg: &config::Config, src: &str) -> String {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(src, outer).unwrap_or_else(|e| panic!("{:?}: {}", src, e.msg));
+    let env = i.global_env();
+    let v = i.eval(&Rc::new(e), &env).unwrap_or_else(|c| panic!("{:?}: {}", src, c.msg));
+    show(i, &v)
+}
+
+#[test]
+fn show_lambda_is_its_source_as_written() {
+    // §5.2: a lambda closure renders as its source text, exactly as written.
+    // Re-rendered from the AST it lost parentheses and printed a different
+    // program: `\x -> head (x).a` selects before it takes the head.
+    let (mut i, cfg) = make_interp();
+    for (src, want) in [
+        ("\\x -> (head x).a", "\\x -> (head x).a"),
+        ("\\x -> (if x then 1 else 2) + 1", "\\x -> (if x then 1 else 2) + 1"),
+        ("\\x -> (\\y -> y) x", "\\x -> (\\y -> y) x"),
+        ("\\x -> [(\\y -> y) x]", "\\x -> [(\\y -> y) x]"),
+        ("\\x -> (map id x).a", "\\x -> (map id x).a"),
+        ("\\x->x+1", "\\x->x+1"),
+        // escapes as typed (§3.1), not Rust's `\u{…}`
+        ("\\x -> \"a\\tb\\\"c\" ++ x", "\\x -> \"a\\tb\\\"c\" ++ x"),
+        ("\\x -> 'e\u{301}' ++ x", "\\x -> 'e\u{301}' ++ x"),
+        // a comment inside is part of what was written; a line break and a
+        // comment after the body are not
+        ("\\x -> x {- one -} + 1", "\\x -> x {- one -} + 1"),
+        ("\\x ->\n  x + 1", "\\x ->\n  x + 1"),
+        ("(\\x -> x -- trailing\n  )", "\\x -> x"),
+        ("if true then \\x -> x\n  else \\y -> y", "\\x -> x"),
+        // multi-byte characters before the lambda do not shift its span
+        ("let t = \"日本語…\" in \\x -> x ++ t", "\\x -> x ++ t"),
+    ] {
+        assert_eq!(show_of(&mut i, &cfg, src), want, "for {:?}", src);
+    }
+}
+
+#[test]
+fn show_section_is_its_source_as_written() {
+    // §5.2: a section is a lambda closure, and its source is the section
+    // (§3.4), not the desugared `\$sec1 -> ($sec1 + 1)`; being an atom, it
+    // takes no parentheses of its own in a list or as an argument
+    let (mut i, cfg) = make_interp();
+    assert_eq!(show_of(&mut i, &cfg, "(+ 1)"), "(+ 1)");
+    assert_eq!(show_of(&mut i, &cfg, "(1 +)"), "(1 +)");
+    assert_eq!(show_of(&mut i, &cfg, "(++ [\"x\"])"), "(++ [\"x\"])");
+    assert_eq!(show_of(&mut i, &cfg, "( {- c -} + (1 * 2))"), "( {- c -} + (1 * 2))");
+    assert_eq!(show_of(&mut i, &cfg, "[(+ 1) (\\x -> x)]"), "[(+ 1) (\\x -> x)]");
+    assert_eq!(show_of(&mut i, &cfg, "map (* 2)"), "map (* 2)");
+}
+
+#[test]
+fn show_partial_application_of_a_lambda() {
+    // §5.2: the function's rendering, parenthesised since a lambda is not
+    // atomic, then the arguments supplied so far; not `(…) <applied>`
+    let (mut i, cfg) = make_interp();
+    assert_eq!(show_of(&mut i, &cfg, "(\\x y -> x + y) 1"), "(\\x y -> x + y) 1");
+    assert_eq!(
+        show_of(&mut i, &cfg, "(\\x y z -> x) (+ 1) ({ a = [2] })"),
+        "(\\x y z -> x) (+ 1) ({ a = [2] })"
+    );
+    assert_eq!(
+        show_of(&mut i, &cfg, "[((\\f x -> f x) (\\y -> y))]"),
+        "[((\\f x -> f x) (\\y -> y))]"
+    );
+    // and the rendering is a function that behaves the same
+    let shown = show_of(&mut i, &cfg, "(\\x y -> x - y) 10");
+    assert_eq!(show_of(&mut i, &cfg, &format!("({}) 3", shown)), "7");
+}
+
+#[test]
+fn show_lambda_from_config_is_its_source() {
+    // the span is cut from the text the lambda was parsed from: here the
+    // config, whose comments hold multi-byte characters before it
+    let src = format!("{}\nshowMe = {{ inc = \\x -> x {{- one -}} + 1, sec = (+ 1) }}\n", CONFIG);
+    let cfg = config::load_config(&src).expect("config with an extra definition must load");
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).expect("config must evaluate");
+    assert_eq!(show_of(&mut i, &cfg, "showMe.inc"), "\\x -> x {- one -} + 1");
+    assert_eq!(show_of(&mut i, &cfg, "showMe.sec"), "(+ 1)");
 }
 
 #[test]
@@ -229,9 +362,36 @@ fn unified_diff_no_trailing_newline() {
     assert!(d.contains("-b\n"), "{}", d);
     assert!(d.contains("+c\n"), "{}", d);
     assert!(!d.contains("\n\n"), "spurious blank line: {:?}", d);
-    // and with a trailing newline the output is identical
+    // and neither does one with a trailing newline
     let with_nl = unified_diff("a\nb\n", "a\nc\n");
     assert!(!with_nl.contains("\n\n"), "{:?}", with_nl);
+}
+
+#[test]
+fn unified_diff_marks_missing_newline() {
+    // a line with no terminator is followed by the marker GNU diff and git
+    // print; without it, dropping or adding the final newline shows as the
+    // same line removed and re-added, and both directions look alike
+    const MARK: &str = "\\ No newline at end of file\n";
+    assert_eq!(
+        unified_diff("a\nb\n", "a\nb"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n+b\n{}", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb", "a\nb\n"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n{}+b\n", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb", "a\nc"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n{}+c\n{}", MARK, MARK)
+    );
+    // an unterminated context line is marked too
+    assert_eq!(
+        unified_diff("a\nb", "x\nb"),
+        format!("@@ -1,2 +1,2 @@\n-a\n+x\n b\n{}", MARK)
+    );
+    // terminated lines get no marker
+    assert!(!unified_diff("a\nb\n", "a\nc\n").contains("No newline"));
 }
 
 #[test]

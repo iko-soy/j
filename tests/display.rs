@@ -4,7 +4,7 @@ use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
 use j::eval::Interp;
 use j::parse::parse_expr;
-use j::value::{BlobVal, Env, Value};
+use j::value::{BlobContent, BlobKind, BlobVal, Crash, Env, LazyBlob, ThunkVal, Value};
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
@@ -239,6 +239,26 @@ fn show_of_focus() {
     let out = eval_and_display(&mut i, &cfg, "show . focus", repo);
     assert!(out.contains("message = \"wip\""), "{}", out);
     assert!(out.contains("@wqztbbbb"), "{}", out);
+}
+
+#[test]
+fn functions_display_as_written() {
+    // §5.1: a function displays as its name, its lambda source, or `f arg …`
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(
+        &mut i,
+        &cfg,
+        "{ f = (+ 1), g = \\x -> [(\\y -> y) x], h = (\\x y -> x) 1, k = map (1 +) }",
+        repo,
+    );
+    let rows: Vec<&str> = out.lines().map(str::trim_end).collect();
+    assert_eq!(
+        rows,
+        ["f  (+ 1)", "g  \\x -> [(\\y -> y) x]", "h  (\\x y -> x) 1", "k  map (1 +)"],
+        "{}",
+        out
+    );
 }
 
 #[test]
@@ -675,5 +695,149 @@ fn tree_glyphs_of_an_edited_lazy_repo_come_from_its_files() {
                 assert_eq!(glyph(&out, msg), *g, "{} of `{}` at {}:\n{}", msg, edit, renderer, out);
             }
         }
+    }
+}
+
+// ----------------------------------------------------------------------
+// A lazy part the store cannot read (a missing or corrupt object) must fail
+// the same way every time it is used (§7.2). Forcing parked a stand-in —
+// `false` for a `files` thunk, no bytes for a blob — while it ran and left it
+// there when the read failed, so once a crash was caught by `or`, or
+// swallowed by rendering, the next look at the same value saw the stand-in.
+// ----------------------------------------------------------------------
+
+const UNREADABLE: &str = "cannot read an object: gone";
+
+/// root -> one commit (the focus) whose `files` is `files`; a fresh value per
+/// call, since a failed force is exactly the state these tests look at
+fn unreadable_repo(files: Value) -> (Value, MemBackend) {
+    let focus = Value::record(&[
+        ("files", files),
+        ("id", Value::Id(Rc::new("kpqxaaaa".to_string()))),
+        ("labels", Value::list(vec![])),
+        (
+            "message",
+            Value::text("a message long enough that show breaks the commit over lines"),
+        ),
+    ]);
+    let repo = Value::record(&[
+        ("children", Value::list(vec![])),
+        (
+            "context",
+            Value::list(vec![Value::record(&[
+                ("left", Value::list(vec![])),
+                ("parent", lazy_commit(ROOT_ID, "", vec![])),
+                ("right", Value::list(vec![])),
+            ])]),
+        ),
+        ("root", focus),
+    ]);
+    let mut be = MemBackend::answering();
+    for (id, m) in [
+        meta(ROOT_ID, "Root", 1_700_000_000),
+        meta("kpqxaaaa", "M", 1_700_000_100),
+    ] {
+        be.metas.insert(id, m);
+    }
+    be.parents.insert(ROOT_ID.into(), vec![]);
+    be.parents.insert("kpqxaaaa".into(), vec![ROOT_ID.into()]);
+    be.empties.insert("kpqxaaaa".into(), false);
+    (repo, be)
+}
+
+/// a `files` list whose tree cannot be read
+fn unreadable_files() -> Value {
+    Value::Thunk(Rc::new(ThunkVal::new(|| Err(Crash::new(UNREADABLE)))))
+}
+
+/// a file `f.txt` whose bytes cannot be read
+fn unreadable_blob_files() -> Value {
+    let blob = Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Regular,
+        content: BlobContent::Lazy(Rc::new(LazyBlob::new("d93a6afb".into(), || {
+            Err(Crash::new(UNREADABLE))
+        }))),
+    }));
+    Value::list(vec![Value::record(&[
+        ("content", blob),
+        ("path", Value::list(vec![Value::text("f.txt")])),
+    ])])
+}
+
+/// `src` applied to `repo` and displayed, or the message it crashed with
+fn try_eval_and_display(
+    interp: &mut Interp,
+    cfg: &config::Config,
+    src: &str,
+    repo: Value,
+) -> Result<String, String> {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(src, outer).unwrap();
+    let e = config::resolve_ids(&e, interp).unwrap();
+    *interp.old_repo.borrow_mut() = Some(repo.clone());
+    let env = interp.global_env();
+    let v = interp.eval(&Rc::new(e), &env).map_err(|c| c.msg)?;
+    let v = if matches!(v, Value::Fun(_)) {
+        interp.apply(v, repo).map_err(|c| c.msg)?
+    } else {
+        v
+    };
+    j::render::display(interp, &v, false).map_err(|c| c.msg)
+}
+
+#[test]
+fn an_unreadable_file_list_crashes_every_time() {
+    for src in [
+        // caught once, then looked at again
+        "length (repo.root.files or []) + length repo.root.files",
+        "[(show repo.root.files or \"\") (show repo.root.files)]",
+        "[(null (files repo) or true) (null (files repo))]",
+    ] {
+        let (repo, be) = unreadable_repo(unreadable_files());
+        let (mut i, cfg) = make_interp(be);
+        let got = try_eval_and_display(&mut i, &cfg, &format!("(\\repo -> {})", src), repo);
+        match got {
+            Err(msg) => assert!(msg.contains(UNREADABLE), "{}: crashed with {:?}", src, msg),
+            Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
+        }
+    }
+    // `show` renders a record on one line first and again broken over lines
+    // when that is too wide: the second rendering saw the stand-in `false`
+    let (repo, be) = unreadable_repo(unreadable_files());
+    let (mut i, cfg) = make_interp(be);
+    if let Ok(out) = try_eval_and_display(&mut i, &cfg, "(\\repo -> show repo.root)", repo) {
+        assert!(!out.contains("false"), "{}", out);
+    }
+}
+
+#[test]
+fn an_unreadable_blob_crashes_every_time() {
+    for src in [
+        // caught once, then looked at again
+        "let b = contentAt [\"f.txt\"] (files repo) in [(text b or \"fallback\") (text b)]",
+        "let b = contentAt [\"f.txt\"] (files repo) in [(text b or \"\") (show (b == blob \"\"))]",
+        // the tree's size bar counts the lines of every touched file and
+        // swallowed the failure, so a later `text` read the file as empty
+        "[(tree repo) (text (contentAt [\"f.txt\"] (files repo)))]",
+    ] {
+        let (repo, be) = unreadable_repo(unreadable_blob_files());
+        let (mut i, cfg) = make_interp(be);
+        let got = try_eval_and_display(&mut i, &cfg, &format!("(\\repo -> {})", src), repo);
+        match got {
+            Err(msg) => assert!(msg.contains(UNREADABLE), "{}: crashed with {:?}", src, msg),
+            Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
+        }
+    }
+    // the same pure expression twice in one run agrees with itself
+    let (repo, be) = unreadable_repo(unreadable_blob_files());
+    let (mut i, cfg) = make_interp(be);
+    let src = "(\\repo -> [(show (files repo)) (show (files repo))])";
+    match try_eval_and_display(&mut i, &cfg, src, repo) {
+        Ok(out) => {
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), 2, "{}", out);
+            assert_eq!(lines[0], lines[1], "{}", out);
+        }
+        Err(msg) => assert!(msg.contains(UNREADABLE), "crashed with {:?}", msg),
     }
 }

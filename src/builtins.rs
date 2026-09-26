@@ -74,8 +74,8 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin(">=", 2, b_ge),
         builtin("show", 1, b_show),
         builtin("::", 2, b_cons),
-        builtin("map", 2, b_map),
-        builtin("filter", 2, b_filter),
+        builtin("map", 2, on_machine),
+        builtin("filter", 2, on_machine),
         builtin("length", 1, b_length),
         builtin("null", 1, b_null),
         builtin("head", 1, b_head),
@@ -86,7 +86,7 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("drop", 2, b_drop),
         builtin("member", 2, b_member),
         builtin("range", 2, b_range),
-        builtin("foldl", 3, b_foldl),
+        builtin("foldl", 3, on_machine),
         builtin("concat", 1, b_concat),
         builtin("++", 2, b_append),
         builtin("startsWith", 2, b_starts_with),
@@ -116,33 +116,13 @@ fn b_compose(_i: &mut Interp, args: &[Value]) -> BResult {
     compose_values(_i, f, g)
 }
 
-fn compose_apply(i: &mut Interp, args: &[Value]) -> BResult {
-    let f = args[0].clone();
-    let g = args[1].clone();
-    let x = args[2].clone();
-    // A composed function applied to a function does not run (the operand
-    // contracts are about Repo-level values); it composes pointwise so that
-    // definitions like `abandon . contract everything` and `tree . squash`
-    // are functions waiting for the repository (§4.1 note, §1.2 step 7).
-    if matches!(x, Value::Fun(_)) {
-        let next = apply_or_compose(i, g, x)?;
-        return apply_or_compose(i, f, next);
-    }
-    let gx = i.apply(g, x)?;
-    i.apply(f, gx)
-}
-
-/// Apply a signed function to an argument, composing instead when the
-/// argument is a function but the contract's next parameter is not.
-pub fn apply_or_compose(i: &mut Interp, f: Value, x: Value) -> BResult {
-    if matches!(x, Value::Fun(_)) {
-        if let Some((_, cexpr)) = pending_of(&f) {
-            if !cexpr.next_param_is_function(&i.shapes) {
-                return compose_values(i, f, x);
-            }
-        }
-    }
-    i.apply(f, x)
+/// `map`, `filter`, `foldl` and a composition node apply the functions they
+/// are given, so the evaluator runs them as steps of its machine
+/// (Interp::step_applying): applying them in a nested run put every level of
+/// a recursion through one on the native stack (§4.1). This only gives them a
+/// name and an arity here; it is never called.
+fn on_machine(_i: &mut Interp, _args: &[Value]) -> BResult {
+    Err(Crash::new("internal: a builtin that applies functions ran off the machine"))
 }
 
 /// f . g as a value, with contract propagation
@@ -163,7 +143,7 @@ pub fn compose_values(i: &mut Interp, f: Value, g: Value) -> BResult {
         name: "(.)".into(),
         arity: 3,
         args: vec![f, g],
-        f: compose_apply,
+        f: on_machine,
         pending,
     })))
 }
@@ -296,35 +276,6 @@ fn b_cons(_i: &mut Interp, args: &[Value]) -> BResult {
     Ok(Value::list(v))
 }
 
-fn b_map(i: &mut Interp, args: &[Value]) -> BResult {
-    want!(args, 0, Value::Fun(_), "a function");
-    let xs = args[1].as_list()?;
-    let mut out = Vec::with_capacity(xs.len());
-    for x in xs.iter() {
-        out.push(i.apply(args[0].clone(), x.clone())?);
-    }
-    Ok(Value::list(out))
-}
-
-fn b_filter(i: &mut Interp, args: &[Value]) -> BResult {
-    want!(args, 0, Value::Fun(_), "a function");
-    let xs = args[1].as_list()?;
-    let mut out = Vec::new();
-    for x in xs.iter() {
-        match i.apply(args[0].clone(), x.clone())? {
-            Value::Bool(true) => out.push(x.clone()),
-            Value::Bool(false) => (),
-            v => {
-                return Err(Crash::new(format!(
-                    "filter: predicate returned a {}",
-                    v.kind_name()
-                )))
-            }
-        }
-    }
-    Ok(Value::list(out))
-}
-
 fn b_length(_i: &mut Interp, args: &[Value]) -> BResult {
     Ok(Value::int(args[0].as_list()?.len() as i64))
 }
@@ -419,17 +370,6 @@ fn b_range(_i: &mut Interp, args: &[Value]) -> BResult {
         x += 1;
     }
     Ok(Value::list(out))
-}
-
-fn b_foldl(i: &mut Interp, args: &[Value]) -> BResult {
-    want!(args, 0, Value::Fun(_), "a function");
-    let xs = args[2].as_list()?;
-    let mut acc = args[1].clone();
-    for x in xs.iter() {
-        let f = i.apply(args[0].clone(), acc)?;
-        acc = i.apply(f, x.clone())?;
-    }
-    Ok(acc)
 }
 
 fn b_concat(_i: &mut Interp, args: &[Value]) -> BResult {

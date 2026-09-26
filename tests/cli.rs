@@ -193,12 +193,45 @@ fn parse_error_is_exit_3() {
 }
 
 #[test]
+fn deep_nesting_is_a_parse_error() {
+    // §1.4: however deep the input, the process exits 3 with one `j:` line
+    // rather than aborting on a stack overflow in the parser
+    let r = setup();
+    let n = 100_000;
+    for src in [format!("{}1{}", "(".repeat(n), ")".repeat(n)), "[".repeat(n)] {
+        let out = r.j_stdin(&src, &[]);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(out.stderr.starts_with("j: ") && out.stderr.lines().count() == 1, "{}", out.stderr);
+    }
+}
+
+#[test]
 fn crash_is_exit_1_with_trace() {
     let r = setup();
     let out = r.j(&["crash \"boom\""]);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("j: crash: boom"), "{}", out.stderr);
     assert!(out.stderr.contains("from crash \"boom\""), "{}", out.stderr);
+}
+
+#[test]
+fn crash_trace_names_the_innermost_definition() {
+    // §1.4, §4.13, §5.1: the second line names the innermost definition that
+    // was executing, as the spec's own examples show. Nothing recorded one
+    // at run time, so every crash printed only `from EXPR`. A builtin is no
+    // definition, so a crash outside every definition names none.
+    let r = setup();
+    for (expr, trace) in [
+        ("goto %nope", "   in goto, from goto %nope"),
+        ("describe 3", "   in describe, from describe 3"),
+        ("new . goto %nope", "   in goto, from new . goto %nope"),
+        ("squash 3", "   in squash, from squash 3"),
+        ("crash \"boom\"", "   from crash \"boom\""),
+    ] {
+        let out = r.j(&[expr]);
+        assert_eq!(out.code, 1, "{}: {}", expr, out.stderr);
+        assert_eq!(out.stderr.lines().nth(1), Some(trace), "{}: {}", expr, out.stderr);
+    }
 }
 
 #[test]
@@ -542,6 +575,24 @@ fn file_and_directory_at_one_path_refused() {
     ]);
     assert_eq!(out.code, 1, "replay dropped a file: {}", out.stdout);
     assert!(out.stderr.contains("both a file and a directory"), "{}", out.stderr);
+}
+
+#[test]
+fn edit_applied_to_an_edit_is_a_contract_crash() {
+    // `new new` gives `new` a function where its signature wants a Repo: a
+    // contract crash (§4.13), so nothing is persisted (§1.2). It used to
+    // compose instead, and persisted two new commits.
+    let r = setup();
+    let before = r.j(&["length . commits . top"]).ok().stdout;
+    let out = r.j(&["new new"]);
+    assert_eq!(out.code, 1, "stdout: {}", out.stdout);
+    assert!(
+        out.stderr.contains("contract: new expected Repo (record) as argument 1, got function"),
+        "{}",
+        out.stderr
+    );
+    let after = r.j(&["length . commits . top"]).ok().stdout;
+    assert_eq!(before, after);
 }
 
 #[test]

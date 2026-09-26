@@ -95,39 +95,24 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     }
 
     // pair signatures with definitions; a signature must immediately precede
-    // its definition (blank lines/comments fine — items between are not)
-    let mut prev_sig: Option<String> = None;
-    for item in &items {
-        match item {
-            Item::Signature(name, _, _) => {
-                prev_sig = Some(name.clone());
-            }
-            Item::Definition(name, _, _) => {
-                if let Some(s) = &prev_sig {
-                    if s != name {
-                        // signature not immediately followed by its definition
-                        if def_names.contains(s) {
-                            return verr(format!(
-                                "the signature for `{}` is not immediately followed by its definition",
-                                s
-                            ));
-                        }
-                    }
-                }
-                prev_sig = None;
-            }
-            Item::TypeDecl(_, _) => {
-                prev_sig = None;
+    // its definition (blank lines/comments fine — items between are not, a
+    // typedecl or another signature included). A builtin's signature has no
+    // definition, so any item, or the end of the file, may follow it.
+    let mut prev_sig: Option<&String> = None;
+    for item in items.iter().map(Some).chain([None]) {
+        if let Some(s) = prev_sig {
+            let paired = matches!(item, Some(Item::Definition(name, _, _)) if name == s);
+            if !paired && def_names.contains(s) {
+                return verr(format!(
+                    "the signature for `{}` is not immediately followed by its definition",
+                    s
+                ));
             }
         }
-    }
-    if let Some(s) = &prev_sig {
-        if def_names.contains(s) {
-            return verr(format!(
-                "the signature for `{}` is not immediately followed by its definition",
-                s
-            ));
-        }
+        prev_sig = match item {
+            Some(Item::Signature(name, _, _)) => Some(name),
+            _ => None,
+        };
     }
 
     let mut builtin_names: HashSet<String> = HashSet::new();
@@ -179,7 +164,18 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     })
 }
 
-/// topological order by references outside lambdas (§4.1)
+/// Evaluation order of the definitions (§4.1).
+///
+/// References outside lambdas decide it, and only they can form a cycle;
+/// ready definitions are taken in name order. That alone can apply a
+/// function at load before a definition its body refers to (`opts = mk 1`
+/// with `mk = \d -> { lanes = lanes }` and `lanes` still waiting), an unbound
+/// name with no cycle anywhere. So the definitions are then grouped into the
+/// strongly connected components of all references, lambda bodies included,
+/// and the groups evaluated referenced first, the members of each in the
+/// first order. Every definition still follows its references outside
+/// lambdas, and since evaluating one looks up only names it reaches by
+/// references, whatever the first order had bound in time still is.
 fn dependency_order(
     defs: &HashMap<String, Rc<Expr>>,
 ) -> Result<Vec<(String, Rc<Expr>)>, ConfigError> {
@@ -194,7 +190,7 @@ fn dependency_order(
     let mut done: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = defs.keys().cloned().collect();
     names.sort();
-    loop {
+    while done.len() < names.len() {
         let mut progress = false;
         for n in &names {
             if done.contains(n) {
@@ -206,14 +202,200 @@ fn dependency_order(
                 progress = true;
             }
         }
-        if done.len() == names.len() {
-            return Ok(ordered);
-        }
         if !progress {
             return Err(ConfigError::Validation(
                 "config.j: a cycle among top-level definitions".into(),
             ));
         }
+    }
+    let position: HashMap<&str, usize> =
+        ordered.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+    let edges: Vec<Vec<usize>> = ordered
+        .iter()
+        .map(|(n, e)| {
+            let mut free = deps[n].clone();
+            e.free_vars(&mut Vec::new(), &mut free);
+            free.iter().filter_map(|n| position.get(n.as_str()).copied()).collect()
+        })
+        .collect();
+    let mut grouped = Vec::with_capacity(ordered.len());
+    for mut group in components(&edges) {
+        group.sort_unstable();
+        grouped.extend(group.into_iter().map(|i| ordered[i].clone()));
+    }
+    Ok(grouped)
+}
+
+/// The strongly connected components of a graph given as adjacency lists,
+/// each listed after every component it has an edge into (Tarjan's
+/// algorithm, on an explicit stack so a long chain of definitions cannot
+/// overflow the native one).
+fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = edges.len();
+    let (mut index, mut low, mut on_stack) = (vec![UNSEEN; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next) = (Vec::new(), Vec::new(), 0);
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        // (vertex, how many of its edges have been followed)
+        let mut work = vec![(root, 0)];
+        while let Some(&(v, i)) = work.last() {
+            if i == 0 {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = edges[v].get(i) {
+                work.last_mut().unwrap().1 = i + 1;
+                if index[w] == UNSEEN {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    group.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(group);
+            }
+        }
+    }
+    out
+}
+
+/// Evaluation order of the bindings of a `let` block (§4.1), as indices into
+/// them, or `None` when references outside lambdas form a cycle.
+///
+/// The rule is `dependency_order`'s, with ready bindings taken in source
+/// order: a binding follows every binding it refers to outside a lambda, and
+/// the bindings are then grouped by all their references, so a function
+/// applied in a binding finds the bindings its body refers to. That order is
+/// the source order when every reference is to an earlier binding, or from
+/// inside a lambda to its own, as in nearly every block, which is so taken
+/// without the sorting: this runs each time a block is evaluated.
+pub(crate) fn let_order(bs: &[(String, Rc<Expr>)]) -> Option<Vec<usize>> {
+    let refs: Vec<Vec<(usize, bool)>> = bs
+        .iter()
+        .map(|(_, e)| {
+            let mut out = Vec::new();
+            binding_refs(e, bs, false, &mut out);
+            out
+        })
+        .collect();
+    let in_order =
+        |i: usize, r: &[(usize, bool)]| r.iter().all(|&(j, outside)| j < i || (j == i && !outside));
+    if refs.iter().enumerate().all(|(i, r)| in_order(i, r)) {
+        return Some((0..bs.len()).collect());
+    }
+    let mut ordered = Vec::with_capacity(bs.len());
+    let mut done = vec![false; bs.len()];
+    while ordered.len() < bs.len() {
+        let mut progress = false;
+        for i in 0..bs.len() {
+            if !done[i] && refs[i].iter().all(|&(j, outside)| !outside || done[j]) {
+                done[i] = true;
+                ordered.push(i);
+                progress = true;
+            }
+        }
+        if !progress {
+            return None;
+        }
+    }
+    let mut position = vec![0; bs.len()];
+    for (p, &i) in ordered.iter().enumerate() {
+        position[i] = p;
+    }
+    let edges: Vec<Vec<usize>> = ordered
+        .iter()
+        .map(|&i| refs[i].iter().map(|&(j, _)| position[j]).collect())
+        .collect();
+    let mut grouped = Vec::with_capacity(bs.len());
+    for mut group in components(&edges) {
+        group.sort_unstable();
+        grouped.extend(group.into_iter().map(|p| ordered[p]));
+    }
+    Some(grouped)
+}
+
+/// Record the references in `e` to the names a `let` block binds, as indices
+/// into its bindings `bs`, each with whether it lies outside every lambda,
+/// where evaluating `e` needs that binding's value (§4.1). No binder inside
+/// the block may reuse one of its names (§4.2), so every occurrence is one.
+fn binding_refs(
+    e: &Expr,
+    bs: &[(String, Rc<Expr>)],
+    in_lambda: bool,
+    out: &mut Vec<(usize, bool)>,
+) {
+    let mut sub = |e: &Expr| binding_refs(e, bs, in_lambda, out);
+    match e {
+        Expr::Var(n) => {
+            if let Some(j) = bs.iter().position(|(b, _)| b == n) {
+                out.push((j, !in_lambda));
+            }
+        }
+        Expr::Lambda(_, body, _) => binding_refs(body, bs, true, out),
+        Expr::If(a, b, c) => {
+            sub(a);
+            sub(b);
+            sub(c);
+        }
+        Expr::Let(inner, body) => {
+            for (_, e) in inner {
+                sub(e);
+            }
+            sub(body);
+        }
+        Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Or(a, b) => {
+            sub(a);
+            sub(b);
+        }
+        Expr::Select(a, _) | Expr::Paren(a) => sub(a),
+        Expr::Update(a, fs) => {
+            sub(a);
+            for (_, v) in fs {
+                sub(v);
+            }
+        }
+        Expr::Record(fs) => {
+            for (_, v) in fs {
+                sub(v);
+            }
+        }
+        Expr::List(es) => {
+            for e in es {
+                sub(e);
+            }
+        }
+        // `%main` refers to `labelled`, a top-level name, never a binding
+        Expr::TypeName(_)
+        | Expr::Int(_)
+        | Expr::Text(_)
+        | Expr::IdLit(_)
+        | Expr::Id(_)
+        | Expr::NewId
+        | Expr::LabelLit(_)
+        | Expr::PathLit(_)
+        | Expr::Bool(_)
+        | Expr::SelectorFun(_)
+        | Expr::Crash => {}
     }
 }
 
@@ -276,6 +458,10 @@ fn load_deps(e: &Expr, out: &mut BTreeSet<String>) {
                 load_deps(e, out);
             }
         }
+        // `%main` is `labelled "main"` (§4.11), evaluated where it stands
+        Expr::LabelLit(_) => {
+            out.insert("labelled".to_string());
+        }
         _ => {}
     }
 }
@@ -310,13 +496,13 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
     for (name, expr) in &cfg.defs {
         *interp.current_def.borrow_mut() = Some(name.clone());
         let v = interp.eval(expr, &genv)?;
-        // value-level contract for non-function definitions
+        // the value itself, one level deep, against the whole signature
+        // (§4.13): under a function type, including an alias of one, it must
+        // be a function, however it was built (`conflicts : Revset` is a
+        // partial application, `myEdit : Edit` with `myEdit = 5` is refused)
         if let Some(ty) = cfg.sigs.get(name) {
-            let c = compile_contract(&interp.shapes, ty);
-            if c.params.is_empty() {
-                if let Err(msg) = crate::shape::check(&interp.shapes, &c.result, &v) {
-                    return Err(Crash::new(format!("contract: {}: {}", name, msg)));
-                }
+            if let Err(msg) = crate::shape::check(&interp.shapes, ty, &v) {
+                return Err(Crash::new(format!("contract: {}: {}", name, msg)));
             }
         }
         cell.borrow_mut().push((name.clone(), v.clone()));
