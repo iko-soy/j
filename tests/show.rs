@@ -173,6 +173,56 @@ fn show_wide_roundtrips() {
 }
 
 #[test]
+fn show_wide_sees_through_lazy_files() {
+    // a commit's `files` is a thunk until forced (value.rs); `show` must give
+    // the same text for it as for the equal record holding the forced list,
+    // breaking the list one element per line (§5.2)
+    let (mut i, cfg) = make_interp();
+    let entries: Vec<Value> = (1..=4)
+        .map(|n| {
+            Value::record(&[
+                ("content", BlobVal::text_blob(&format!("content {}\n", n))),
+                ("path", Value::list(vec![Value::text(format!("file{}.txt", n))])),
+            ])
+        })
+        .collect();
+    let commit = |files: Value| {
+        Value::record(&[
+            ("files", files),
+            ("id", Value::Id(Rc::new("xruqnqvokyloollnxruqnqvokyloolln".to_string()))),
+            ("labels", Value::list(vec![])),
+            ("message", Value::text("")),
+        ])
+    };
+    let lazy = commit(j::domain::lazy_files(entries.clone()));
+    let eager = commit(Value::list(entries.clone()));
+    let s = show(&i, &lazy);
+    assert_eq!(s, show(&i, &eager));
+    assert!(
+        s.lines().all(|l| j::render::width(l) <= 80),
+        "files list left on one line: {}",
+        s
+    );
+    // the broken-up list still reads back (the id above names no commit of
+    // the in-memory backend, so round-trip the files alone)
+    roundtrip(&mut i, &cfg, &Value::record(&[("files", j::domain::lazy_files(entries))]));
+}
+
+#[test]
+fn show_fits_by_display_width() {
+    // "fits in 80 columns" counts display cells, not code points (§5.1): 55
+    // characters of which 45 are wide is 100 columns and must break
+    let (mut i, cfg) = make_interp();
+    let wide = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 3]);
+    let s = show(&i, &wide);
+    assert!(s.contains('\n'), "{}", s);
+    roundtrip(&mut i, &cfg, &wide);
+    // two of them are 67 columns and stay on one line
+    let narrow = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 2]);
+    assert!(!show(&i, &narrow).contains('\n'));
+}
+
+#[test]
 fn show_partial_application() {
     let (mut i, cfg) = make_interp();
     let outer = Rc::new(cfg.global_names.clone());

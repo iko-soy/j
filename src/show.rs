@@ -5,8 +5,9 @@ use crate::value::{BlobContent, Crash, FunVal, Value};
 
 pub fn show(interp: &Interp, v: &Value) -> String {
     let s = render(interp, v);
-    // line breaking: one line if it fits in 80 columns
-    if s.chars().count() <= 80 {
+    // line breaking: one line if it fits in 80 columns, counted in display
+    // cells as everywhere else (§5.1), not code points
+    if crate::render::width(&s) <= 80 {
         return s;
     }
     render_wide(interp, v, 0)
@@ -202,6 +203,12 @@ pub fn text_literal(s: &str) -> String {
 
 fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
     match v {
+        // see through a lazy `files` list as `render` does, so that it breaks
+        // like the equal forced list instead of staying on one line
+        Value::Thunk(t) => match t.force() {
+            Ok(v) => render_wide(interp, &v, indent),
+            Err(_) => "<lazy>".to_string(),
+        },
         Value::List(xs) if !xs.is_empty() => {
             let mut out = String::from("[");
             for (i, x) in xs.iter().enumerate() {

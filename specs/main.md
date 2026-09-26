@@ -656,9 +656,10 @@ truncates.
 | lambda closure | its source text, exactly as written |
 | partial application | the function's rendering followed by the arguments' renderings, each parenthesised if not atomic: `describe "wip"`, `at (parents) (describe "x")` |
 
-Line breaking: one line if it fits in 80 columns; otherwise the outermost
-list or record breaks one element per line, two-space indented, with leading
-commas for records and nothing between list elements, recursively.
+Line breaking: one line if it fits in 80 columns (display width, as in §5.1);
+otherwise the outermost list or record breaks one element per line, two-space
+indented, with leading commas for records and nothing between list elements,
+recursively.
 
 Since `show` returns a `Text` and a top-level `Text` displays raw,
 `j show . focus` prints the literal of the focused commit, and
