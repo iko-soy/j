@@ -238,6 +238,18 @@ fn block_comments_nest() {
 }
 
 #[test]
+fn block_comment_ends_the_line_only_if_it_spans_one() {
+    // a comment is whitespace (§3.1): layout sees the line breaks inside it
+    // and nothing else, so `toks` (which drops Newline) cannot test this
+    let raw = |src: &str| -> Vec<Tok> { lex(src).unwrap().into_iter().map(|t| t.tok).collect() };
+    let (a, b) = (Tok::Ident("a".into()), Tok::Ident("b".into()));
+    assert_eq!(raw("a {- x -} b"), vec![a.clone(), b.clone(), Tok::Eof]);
+    assert_eq!(raw("a {- x -}.b"), vec![a.clone(), Tok::Selector("b".into()), Tok::Eof]);
+    assert_eq!(raw("a {- x\n y -} b"), vec![a.clone(), Tok::Newline, b.clone(), Tok::Eof]);
+    assert_eq!(raw("a {- x -}\nb"), vec![a, Tok::Newline, b, Tok::Eof]);
+}
+
+#[test]
 fn columns_tracked() {
     let t = lex("a\n  b\nc").unwrap();
     let cols: Vec<usize> = t

@@ -230,6 +230,25 @@ fn comments_ignored_in_config() {
 }
 
 #[test]
+fn block_comment_within_a_line_is_whitespace() {
+    // §3.1: a `{- -}` that stays on its line does not break it, so it may
+    // sit wherever a space may
+    assert_eq!(r(&p("r {- c -} .a")), "r.a");
+    assert!(matches!(p("r {- c -} { a = 2 }"), Expr::Update(_, _)));
+    assert_eq!(r(&p("[r {- c -} .a]")), "[r.a]");
+    assert!(matches!(p("let a {- c -} = 1 in a"), Expr::Let(_, _)));
+    assert!(matches!(p("\\x {- c -} -> x"), Expr::Lambda(ref ps, _, _) if ps.len() == 1));
+    assert_eq!(r(&p("{ a {- c -} = 1 }")), "{ a = 1 }");
+    assert!(matches!(p("( {- c -} + 1)"), Expr::Lambda(_, _, _)));
+    let items = cfg("f {- c -} = 1\ng {- c -} : Int\n(++) {- c -} : m -> m -> m\n");
+    assert_eq!(items.len(), 3);
+    // one spanning lines still ends the line it started on (§3.3)
+    let e = p("let\n  x = 1 {- a\n-}\n  y = 2\nin y");
+    assert!(matches!(e, Expr::Let(ref bs, _) if bs.len() == 2));
+    assert_eq!(cfg("x = f {- a\n-}\ny = 2\n").len(), 2);
+}
+
+#[test]
 fn multiline_signature_arrow() {
     let items = cfg("f : Int\n  -> Int\nf = \\x -> x\n");
     assert!(matches!(&items[0], Item::Signature(n, _, _) if n == "f"));

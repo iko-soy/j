@@ -167,7 +167,8 @@ same value if they have the same field names with equal values.
 
 ### 3.1 Lexical structure
 
-- **Comments.** `--` to end of line. `{-` … `-}`, nesting.
+- **Comments.** `--` to end of line. `{-` … `-}`, nesting. A comment is
+  whitespace: a block comment ends a line (§3.3) only by containing a line break.
 - **Identifiers.** `[a-z_][A-Za-z0-9_']*`. Keywords are excluded:
   `let in if then else or true false`.
 - **Type names.** `[A-Z][A-Za-z0-9_]*`. Declared as shapes in `config.j`;

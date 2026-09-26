@@ -159,9 +159,9 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             if depth > 0 {
                 err!("unterminated block comment");
             }
-            // a comment spanning lines must not leave later tokens looking
-            // like continuations of the line it started on
-            push!(Tok::Newline, line, col);
+            // a comment is whitespace (§3.1): one spanning lines has already
+            // ended the line it started on, with the Newlines pushed above,
+            // and one that does not must leave its line unbroken
             continue;
         }
         // arrow `->` (check before operator `-`)
