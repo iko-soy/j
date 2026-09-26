@@ -979,21 +979,22 @@ impl JjBackend {
     pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<(), OpenError> {
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
-        let (value, vis) = self.eval_push_expr(cfg, expr_text, &base)?;
+        let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
-        check_push_records(&records, &base)?;
+        check_push_records(&records, &base, &immutable)?;
         let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
         Ok(())
     }
 
     /// evaluate `EXPR` against the recorded repository, without snapshotting
-    /// (§1.1), apply a function result to the repo value once (§7.6)
+    /// (§1.1), apply a function result to the repo value once (§7.6); also
+    /// return the immutable set of that repository (§7.5 step 3)
     fn eval_push_expr(
         &self,
         cfg: &mut Config,
         expr_text: &str,
         base: &Arc<ReadonlyRepo>,
-    ) -> Result<(Value, Arc<VisibleRepo>), OpenError> {
+    ) -> Result<(Value, Arc<VisibleRepo>, BTreeSet<String>), OpenError> {
         let outer = Rc::new(cfg.global_names.clone());
         let expr = crate::parse::parse_expr(expr_text, outer)
             .map_err(|p| (3, format!("line {}: {}", p.line, p.msg)))?;
@@ -1007,6 +1008,10 @@ impl JjBackend {
             }
         })?;
         crate::config::eval_config(&mut interp, cfg).map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+        // the set a push may not move a bookmark out of (§7.6); build_interp
+        // evaluated it for this value to place the focus, so it is cached
+        let immutable = crate::repo::compute_immutable(&mut interp, &current)
+            .map_err(|c| (1, format!("crash: {}", c.msg)))?;
         let env = interp.global_env();
         let expr_rc = Rc::new(expr);
         let mut v = interp
@@ -1025,7 +1030,7 @@ impl JjBackend {
             .unwrap()
             .clone()
             .ok_or_else(|| (2, "internal: repository value not loaded".to_string()))?;
-        Ok((v, vis))
+        Ok((v, vis, immutable))
     }
 
     /// push the updates to `origin` and record the new remote-bookmark
@@ -1790,13 +1795,59 @@ fn parse_push_records(
     Ok(out)
 }
 
-/// §7.6: refuse to send commits with unresolved files or empty descriptions
+/// §7.6: refuse to move a bookmark whose current target is immutable to a
+/// commit that does not descend from that target, or to delete it; and
+/// refuse to send commits with unresolved files or empty descriptions
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
     repo: &Arc<ReadonlyRepo>,
+    immutable: &BTreeSet<String>,
 ) -> Result<(), OpenError> {
     let store = repo.store().clone();
     let origin = RemoteName::new("origin");
+    for (name, target) in records {
+        let Some(current) = repo
+            .view()
+            .get_remote_bookmark(RefName::new(name).to_remote_symbol(origin))
+            .target
+            .as_resolved()
+            .cloned()
+            .unwrap_or(None)
+        else {
+            continue;
+        };
+        let change_id = block_on(store.get_commit_async(&current))
+            .map_err(|e| (2, format!("cannot read a commit: {}", e)))?
+            .change_id()
+            .reverse_hex();
+        if !immutable.contains(&change_id) {
+            continue;
+        }
+        match target {
+            None => {
+                return Err((
+                    1,
+                    format!(
+                        "push: `{}` is on the immutable commit `@{}` and cannot be deleted",
+                        name, change_id
+                    ),
+                ))
+            }
+            Some(new) => {
+                let descends = block_on(repo.index().is_ancestor(&current, new))
+                    .map_err(|e| (2, format!("cannot read the index: {}", e)))?;
+                if !descends {
+                    return Err((
+                        1,
+                        format!(
+                            "push: `{}` is on the immutable commit `@{}` and can only move to a descendant of it",
+                            name, change_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     // the commits that would be sent: ancestors of the new targets that no
     // bookmark on the remote already reaches; a delete sends none
     let heads: Vec<CommitId> = records.iter().filter_map(|(_, t)| t.clone()).collect();

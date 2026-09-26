@@ -343,11 +343,11 @@ fn push_refusals() {
     // deleting a bookmark the remote doesn't have
     let out = env.j(&dest, &["push (unlabel \"nothere\")"]);
     assert_eq!(out.code, 1);
-    // moving immutable master backward refused
+    // moving immutable master forward is allowed: the child descends from it
+    // (moving it elsewhere is refused: push_refuses_moving_an_immutable_bookmark)
     std::fs::write(dest.join("a.txt"), "x\n").unwrap();
     env.j(&dest, &["describe \"w\""]).ok();
     let out = env.j(&dest, &["push (label \"master\" here)"]);
-    // allowed only if it descends — it does descend (child of master)
     assert_eq!(out.code, 0, "{}", out.stderr);
 }
 
@@ -390,6 +390,53 @@ fn push_of_an_empty_list_pushes_nothing() {
     let out = env.j(&plain, &["push []"]);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("no remote origin"), "{}", out.stderr);
+}
+
+#[test]
+fn push_refuses_moving_an_immutable_bookmark() {
+    // §7.6: a bookmark whose current target is immutable may only move to a
+    // descendant of that target, and may not be deleted. Nothing checked
+    // this: pushes rewound master to its parent, moved it onto a side line,
+    // and deleted a bookmark on master's history, all with exit 0
+    let env = setup();
+    let seed = env.dir.join("seed");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
+    git(&seed, &["checkout", "-q", "master"]);
+    git(&seed, &["push", "-q", "origin", "master:old"]);
+    std::fs::write(seed.join("a.txt"), "two\n").unwrap();
+    git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qam", "two"]);
+    git(&seed, &["push", "-q", "origin", "master"]);
+    let refs = || git(&env.remote, &["for-each-ref"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let before = refs();
+
+    // backward, to its parent
+    let out = env.j(&dest, &["push (label \"master\" (labelled \"old\"))"]);
+    assert_eq!(out.code, 1, "rewound master");
+    assert!(out.stderr.contains("immutable"), "{}", out.stderr);
+    assert_eq!(refs(), before);
+    // sideways, onto a new line off its parent
+    env.j(&dest, &["new . goto (labelled \"old\")"]).ok();
+    std::fs::write(dest.join("side.txt"), "side\n").unwrap();
+    env.j(&dest, &["describe \"side\""]).ok();
+    let out = env.j(&dest, &["push (label \"master\" here)"]);
+    assert_eq!(out.code, 1, "moved master sideways");
+    assert!(out.stderr.contains("immutable"), "{}", out.stderr);
+    assert_eq!(refs(), before);
+    // deleted
+    let out = env.j(&dest, &["push (unlabel \"old\")"]);
+    assert_eq!(out.code, 1, "deleted an immutable bookmark");
+    assert!(out.stderr.contains("immutable"), "{}", out.stderr);
+    assert_eq!(refs(), before);
+
+    // forward is allowed, and so is moving a mutable bookmark anywhere
+    env.j(&dest, &["push (label \"old\" trunk)"]).ok();
+    env.j(&dest, &["push (label \"side\" here)"]).ok();
+    env.j(&dest, &["push (label \"side\" trunk)"]).ok();
+    let master = git(&env.remote, &["rev-parse", "master"]);
+    assert_eq!(git(&env.remote, &["rev-parse", "old"]), master);
+    assert_eq!(git(&env.remote, &["rev-parse", "side"]), master);
 }
 
 #[test]
