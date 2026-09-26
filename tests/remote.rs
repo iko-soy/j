@@ -352,6 +352,47 @@ fn push_refusals() {
 }
 
 #[test]
+fn push_of_an_empty_list_pushes_nothing() {
+    // §7.6: an empty list of records sets and deletes no bookmark. It went to
+    // git as a push with no refspecs, which git fills in from push.default:
+    // it published a local git branch nobody named, or failed with "has no
+    // upstream branch"
+    let env = setup();
+    let master = || git(&env.remote, &["rev-parse", "master"]);
+    let before = master();
+    let work = env.dir.join("work");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), work.to_str().unwrap()]);
+    git(&work, &["checkout", "-q", "master"]);
+    std::fs::write(work.join("l.txt"), "local\n").unwrap();
+    git(&work, &["add", "l.txt"]);
+    git(&work, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "local unpushed"]);
+    env.j(&work, &["init"]).ok();
+    env.j(&work, &["push []"]).ok();
+    assert_eq!(master(), before, "push [] moved the remote's master");
+    // it records one operation (§7.7)
+    let ops = env.j(&work, &["ops"]).ok().stdout;
+    assert!(ops.lines().next().unwrap_or("").ends_with(" []"), "{}", ops);
+
+    // a clone's git branch has no upstream
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    env.j(&dest, &["describe \"x\""]).ok();
+    env.j(&dest, &["push []"]).ok();
+    env.j(&dest, &["push (label \"nope\" (labelled \"zzz\"))"]).ok();
+    assert_eq!(master(), before);
+    let refs = git(&env.remote, &["for-each-ref", "--format=%(refname)"]);
+    assert_eq!(refs.trim(), "refs/heads/master");
+
+    // without origin it still exits 1
+    let plain = env.dir.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    env.j(&plain, &["init"]).ok();
+    let out = env.j(&plain, &["push []"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("no remote origin"), "{}", out.stderr);
+}
+
+#[test]
 fn push_conflicted_commit_refused() {
     let env = setup();
     let dest = uniq("clone");

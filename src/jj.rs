@@ -1049,6 +1049,16 @@ impl JjBackend {
                 .push((jj_lib::ref_name::RefNameBuf::from(name.clone()), Diff::new(before, after.clone())));
         }
         let mut tx = base.start_transaction();
+        if records.is_empty() {
+            // nothing to set or delete; push_refs would still run `git push
+            // origin` without refspecs, which pushes whatever git's
+            // push.default picks
+            if !remote_has_url(git_backend(base.store())?, origin) {
+                return Err((1, "no remote origin".to_string()));
+            }
+            let (_, repo) = block_on(self.publish_tx(tx, &truncate_chars(description, 200)))?;
+            return Ok(repo);
+        }
         let subprocess_options = self.git_subprocess_options()?;
         let mut callback = QuietGitCallback;
         let stats = jj_lib::git::push_refs(
