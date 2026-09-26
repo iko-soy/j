@@ -170,6 +170,60 @@ fn init_over_git_records_the_heads_files() {
 }
 
 #[test]
+fn clone_starts_on_the_remotes_default_bookmark() {
+    // §7.8: the working-copy commit is a child of the target of the bookmark
+    // the remote's HEAD names (master here), not of whichever bookmark sorts
+    // first
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    git(&other, &["checkout", "-qb", "aaa"]);
+    std::fs::write(other.join("side.txt"), "side\n").unwrap();
+    git(&other, &["add", "side.txt"]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "side"]);
+    git(&other, &["push", "-q", "origin", "aaa"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let parent = env.j(&dest, &["(.message) . focus . up"]).ok().stdout;
+    assert_eq!(parent.trim(), "one");
+    assert!(!dest.join("side.txt").exists(), "aaa was checked out");
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
+fn init_over_git_starts_on_head() {
+    // §7.8: init over an existing git repository creates the working-copy
+    // commit as a child of git's HEAD: not of the bookmark that sorts first,
+    // and also when HEAD is detached from every branch
+    let env = setup();
+    let commit = |dir: &PathBuf, file: &str, msg: &str| {
+        std::fs::write(dir.join(file), format!("{}\n", msg)).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", msg]);
+    };
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    git(&dir, &["checkout", "-qb", "aaa"]);
+    commit(&dir, "side.txt", "side");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit(&dir, "a.txt", "main work");
+    env.j(&dir, &["init"]).ok();
+    let parent = env.j(&dir, &["(.message) . focus . up"]).ok().stdout;
+    assert_eq!(parent.trim(), "main work");
+    assert!(!dir.join("side.txt").exists());
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+
+    let dir = env.dir.join("detached");
+    git_repo_with_base(&dir);
+    git(&dir, &["checkout", "-q", "--detach"]);
+    commit(&dir, "d.txt", "detached work");
+    env.j(&dir, &["init"]).ok();
+    let parent = env.j(&dir, &["(.message) . focus . up"]).ok().stdout;
+    assert_eq!(parent.trim(), "detached work");
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
 fn init_over_git_keeps_uncommitted_changes() {
     // §7.8: init writes no file over an existing git working tree; what it
     // holds beyond the head (an edit, a deletion) becomes the working-copy

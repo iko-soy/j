@@ -1332,11 +1332,27 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
         let mut tx = backend.current_repo().start_transaction();
         block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
             .map_err(|e| (2, format!("cannot import the git history: {}", e)))?;
+        // HEAD too: it is the head the working-copy commit starts on, and a
+        // detached HEAD's commits are reachable from no ref
+        block_on(jj_lib::git::import_head(
+            tx.repo_mut(),
+            &backend.inner.workspace_name,
+            &cwd,
+        ))
+        .map_err(|e| (2, format!("cannot import the git HEAD: {}", e)))?;
         block_on(tx.repo_mut().rebase_descendants())
             .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
         let _ = block_on(backend.publish_tx(tx, "import git refs"))?;
     }
-    create_initial_wc_commit(&backend, cfg, "init", had_git)?;
+    // §7.8: the current head is git's HEAD (none on an unborn branch)
+    let head = backend
+        .current_repo()
+        .view()
+        .git_head(&backend.inner.workspace_name)
+        .as_resolved()
+        .cloned()
+        .flatten();
+    create_initial_wc_commit(&backend, cfg, "init", head, had_git)?;
     Ok(())
 }
 
@@ -1379,46 +1395,45 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
         .map_err(|e| (1, format!("cannot set the remote: {}", e)))?;
     backend.git_fetch_refs(tx.repo_mut(), origin)?;
+    let default_branch =
+        git_default_branch(git_backend(tx.repo().store())?.git_repo_path(), origin)?;
     let import_options = backend.git_import_options()?;
     block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
         .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
     block_on(tx.repo_mut().rebase_descendants())
         .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
-    let _ = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
-    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url), false)?;
+    let (_, repo) = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
+    // §7.8: the default bookmark's target (none when the remote's HEAD names
+    // no branch, or a branch it does not have)
+    let head = default_branch.and_then(|name| {
+        repo.view()
+            .get_remote_bookmark(RefName::new(&name).to_remote_symbol(origin))
+            .target
+            .as_resolved()
+            .cloned()
+            .flatten()
+    });
+    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url), head, false)?;
     Ok(())
 }
 
-/// §7.8: after init/clone, create a working-copy commit as a child of the
-/// current head (a bookmark target if there is one, otherwise the root
-/// commit) and check it out. The commit is empty: it holds its parent's
-/// files. `adopt` says the working directory already holds a checkout of the
-/// parent (init over an existing git repository): the working copy is then
-/// reset to the commit instead of written, so no file is touched and what
-/// the directory holds beyond the parent is the next snapshot's change.
+/// §7.8: after init/clone, create a working-copy commit as a child of
+/// `head` (the root commit when there is none) and check it out. The commit
+/// is empty: it holds its parent's files. `adopt` says the working directory
+/// already holds a checkout of the parent (init over an existing git
+/// repository): the working copy is then reset to the commit instead of
+/// written, so no file is touched and what the directory holds beyond the
+/// parent is the next snapshot's change.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
     description: &str,
+    head: Option<CommitId>,
     adopt: bool,
 ) -> Result<(), OpenError> {
     let base = backend.current_repo();
     let store = base.store().clone();
-    let mut parent = store.root_commit_id().clone();
-    'outer: for (_name, target) in base.view().local_bookmarks() {
-        if let Some(id) = target.as_resolved().and_then(|t| t.clone()) {
-            parent = id;
-            break 'outer;
-        }
-    }
-    if parent == *store.root_commit_id() {
-        for (_name, remote_ref) in base.view().remote_bookmarks(RemoteName::new("origin")) {
-            if let Some(id) = remote_ref.target.as_resolved().and_then(|t| t.clone()) {
-                parent = id;
-                break;
-            }
-        }
-    }
+    let parent = head.unwrap_or_else(|| store.root_commit_id().clone());
     // jj's own init already created a working-copy commit; if it is already
     // a child of the target parent, keep it and just check it out
     let mut to_abandon: Option<CommitId> = None;
@@ -1561,6 +1576,37 @@ fn git_fetch_subprocess(git_dir: &std::path::Path, remote: &RemoteName) -> Resul
             ),
         ))
     }
+}
+
+/// the branch the remote's HEAD names, its default bookmark (§7.8), asked of
+/// the remote with `git ls-remote --symref` (the git `git_fetch_subprocess`
+/// runs); `None` when HEAD names no branch (a detached HEAD)
+fn git_default_branch(
+    git_dir: &std::path::Path,
+    remote: &RemoteName,
+) -> Result<Option<String>, OpenError> {
+    let exe = std::env::var("J_GIT").unwrap_or_else(|_| "git".to_string());
+    let out = std::process::Command::new(exe)
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["ls-remote", "--symref", remote.as_str(), "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| (1, format!("cannot run git ls-remote: {}", e)))?;
+    if !out.status.success() {
+        return Err((
+            1,
+            format!(
+                "cannot read the remote's default branch: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    // `ref: refs/heads/<branch>\tHEAD`
+    Ok(String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+        let branch = line.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD")?;
+        Some(branch.to_string())
+    }))
 }
 
 enum OpKind {
