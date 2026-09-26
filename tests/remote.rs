@@ -125,6 +125,68 @@ fn clone_sets_origin_and_labels() {
 }
 
 #[test]
+fn clone_checks_out_the_parents_files() {
+    // §7.8: the working-copy commit clone creates is empty, so the default
+    // bookmark's files are checked out and nothing is changed in it. Built on
+    // the empty tree, it deleted every file: the clone held none, and the
+    // first persisting run recorded their deletion in the user's change.
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    assert!(dest.join("a.txt").is_file(), "the clone checked out no files");
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+    env.j(&dest, &["describe \"mine\""]).ok();
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+}
+
+/// a git repository in `dir` on branch `main` with one commit, `base`,
+/// holding a.txt and b.txt
+fn git_repo_with_base(dir: &PathBuf) {
+    std::fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "base"]);
+}
+
+#[test]
+fn init_over_git_records_the_heads_files() {
+    // §7.8: init over an existing git repository gives the working-copy
+    // commit the head's files. Built on the empty tree, the operation init
+    // recorded deleted every file, so undoing the first run after init
+    // emptied the working directory.
+    let env = setup();
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    env.j(&dir, &["init"]).ok();
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+    env.j(&dir, &["describe \"x\""]).ok();
+    env.j(&dir, &["undo"]).ok();
+    assert!(dir.join("a.txt").is_file(), "undo deleted a.txt");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "two\n");
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
+fn init_over_git_keeps_uncommitted_changes() {
+    // §7.8: init writes no file over an existing git working tree; what it
+    // holds beyond the head (an edit, a deletion) becomes the working-copy
+    // commit's change rather than being checked out over
+    let env = setup();
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
+    std::fs::remove_file(dir.join("b.txt")).unwrap();
+    env.j(&dir, &["init"]).ok();
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "edited\n");
+    assert!(!dir.join("b.txt").exists(), "init restored a deleted file");
+    let changed = env.j(&dir, &["changed"]).ok().stdout;
+    assert!(changed.contains("a.txt") && changed.contains("b.txt"), "{}", changed);
+}
+
+#[test]
 fn push_label_and_relabel() {
     let env = setup();
     let dest = uniq("clone");

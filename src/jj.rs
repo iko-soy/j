@@ -1336,7 +1336,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
             .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
         let _ = block_on(backend.publish_tx(tx, "import git refs"))?;
     }
-    create_initial_wc_commit(&backend, cfg, "init")?;
+    create_initial_wc_commit(&backend, cfg, "init", had_git)?;
     Ok(())
 }
 
@@ -1385,17 +1385,22 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     block_on(tx.repo_mut().rebase_descendants())
         .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
     let _ = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
-    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url))?;
+    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url), false)?;
     Ok(())
 }
 
 /// §7.8: after init/clone, create a working-copy commit as a child of the
 /// current head (a bookmark target if there is one, otherwise the root
-/// commit) and check it out.
+/// commit) and check it out. The commit is empty: it holds its parent's
+/// files. `adopt` says the working directory already holds a checkout of the
+/// parent (init over an existing git repository): the working copy is then
+/// reset to the commit instead of written, so no file is touched and what
+/// the directory holds beyond the parent is the next snapshot's change.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
     description: &str,
+    adopt: bool,
 ) -> Result<(), OpenError> {
     let base = backend.current_repo();
     let store = base.store().clone();
@@ -1427,6 +1432,9 @@ fn create_initial_wc_commit(
             to_abandon = Some(existing.id().clone());
         }
     }
+    let parent_tree = block_on(store.get_commit_async(&parent))
+        .map_err(|e| (1, format!("cannot read the parent commit: {}", e)))?
+        .tree();
     let user_sig = backend
         .user_signature(cfg)
         .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
@@ -1439,7 +1447,7 @@ fn create_initial_wc_commit(
     }
     let wc = block_on(
         tx.repo_mut()
-            .new_commit(vec![parent], store.empty_merged_tree())
+            .new_commit(vec![parent], parent_tree)
             .set_author(user_sig.clone())
             .set_committer(user_sig)
             .write(),
@@ -1456,7 +1464,11 @@ fn create_initial_wc_commit(
     let repo = block_on(unpublished.publish())
         .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
     *backend.inner.repo.lock().unwrap() = repo;
-    block_on(backend.checkout(&wc, None, op_id)).map_err(|c| (1, c.msg))?;
+    // an adopted directory is reset to the commit, not checked out over:
+    // checking out from the empty tree jj's init recorded would recreate
+    // the files the user deleted there
+    let on_disk = if adopt { Some(&wc) } else { None };
+    block_on(backend.checkout(&wc, on_disk, op_id)).map_err(|c| (1, c.msg))?;
     Ok(())
 }
 

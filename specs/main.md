@@ -937,9 +937,11 @@ that state, §7.2 applies.
   initialised on top of the existing git repository and its history is
   imported (subject to §7.2). Either way a working-copy commit is created as a
   child of the current head (or of the root commit for an empty repository)
-  and checked out. It exits 2 if the directory is already inside a jj
-  repository, or if `.git` exists but is not a directory (a git worktree or
-  submodule). It requires `user` (§7.9).
+  and checked out. Over an existing git repository the checkout writes no
+  file: the working directory is taken as it is, and what it holds beyond the
+  head becomes the working-copy commit's change. It exits 2 if the directory
+  is already inside a jj repository, or if `.git` exists but is not a
+  directory (a git worktree or submodule). It requires `user` (§7.9).
 - **`clone URL [DIR]`** creates `DIR` (exit 2 if it exists and is non-empty),
   clones `URL` into it as a colocated repository, sets `origin` to `URL`,
   fetches, and creates an empty working-copy commit as a child of the
