@@ -350,6 +350,30 @@ fn label_literal_depends_on_labelled() {
 }
 
 #[test]
+fn load_order_follows_lambda_bodies() {
+    // `opts` applies `mk` at load and `mk`'s body needs `lanes`, a reference
+    // inside a lambda that §4.1 does not count: `opts` used to be evaluated
+    // as soon as `mk` was, before `lanes` (which waits for `names`)
+    let i = eval_cfg(&format!(
+        "{}\nnames = 1\nlanes = [names]\nmk = \\d -> {{ lanes = lanes }}\nopts = mk 1\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    let opts = i.globals.lookup("opts").expect("opts");
+    let want = Value::record(&[("lanes", Value::list(vec![Value::int(1)]))]);
+    assert!(j::value::value_eq(&opts, &want).unwrap());
+    // mutually referring definitions keep the order that references outside
+    // lambdas give them: `b` applies `a`, whose body needs `y`, and `y` refers
+    // back to `b`; `b` waits for `z`, so `y` is bound by then
+    let i = eval_cfg(&format!(
+        "{}\na = \\_ -> y\nb = a z\ny = \\_ -> b\nz = 1\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    assert!(i.globals.lookup("b").is_some());
+}
+
+#[test]
 fn user_must_be_wellformed() {
     let cfg = config::load_config("user = { name = \"\", email = \"a\" }\nimmutable = \\_ -> []\ntree = \\_ -> \"\"\nlabelled = \\_ _ -> []\n").unwrap();
     let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());

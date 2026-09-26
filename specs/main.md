@@ -314,7 +314,10 @@ refers to outside a lambda. A cycle among such references (two non-lambda
 definitions each needing the other's value) is a configuration error;
 references inside lambda bodies never form cycles, since a lambda is a value
 before it is applied. The bindings of a `let` block are evaluated by the same
-rule, with a cycle being a crash. A lambda body is evaluated on each
+rule, with a cycle being a crash. A top-level definition is moreover evaluated
+after every definition it reaches through a chain of references of either
+kind that does not also reach it back, so a function applied at load finds
+the definitions its body refers to. A lambda body is evaluated on each
 application.
 Recursion is unbounded; the interpreter must handle deep recursion without
 stack overflow (or turn exhaustion into a crash).

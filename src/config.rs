@@ -164,7 +164,18 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     })
 }
 
-/// topological order by references outside lambdas (§4.1)
+/// Evaluation order of the definitions (§4.1).
+///
+/// References outside lambdas decide it, and only they can form a cycle;
+/// ready definitions are taken in name order. That alone can apply a
+/// function at load before a definition its body refers to (`opts = mk 1`
+/// with `mk = \d -> { lanes = lanes }` and `lanes` still waiting), an unbound
+/// name with no cycle anywhere. So the definitions are then grouped into the
+/// strongly connected components of all references, lambda bodies included,
+/// and the groups evaluated referenced first, the members of each in the
+/// first order. Every definition still follows its references outside
+/// lambdas, and since evaluating one looks up only names it reaches by
+/// references, whatever the first order had bound in time still is.
 fn dependency_order(
     defs: &HashMap<String, Rc<Expr>>,
 ) -> Result<Vec<(String, Rc<Expr>)>, ConfigError> {
@@ -179,7 +190,7 @@ fn dependency_order(
     let mut done: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = defs.keys().cloned().collect();
     names.sort();
-    loop {
+    while done.len() < names.len() {
         let mut progress = false;
         for n in &names {
             if done.contains(n) {
@@ -191,15 +202,81 @@ fn dependency_order(
                 progress = true;
             }
         }
-        if done.len() == names.len() {
-            return Ok(ordered);
-        }
         if !progress {
             return Err(ConfigError::Validation(
                 "config.j: a cycle among top-level definitions".into(),
             ));
         }
     }
+    let position: HashMap<&str, usize> =
+        ordered.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+    let edges: Vec<Vec<usize>> = ordered
+        .iter()
+        .map(|(n, e)| {
+            let mut free = deps[n].clone();
+            e.free_vars(&mut Vec::new(), &mut free);
+            free.iter().filter_map(|n| position.get(n.as_str()).copied()).collect()
+        })
+        .collect();
+    let mut grouped = Vec::with_capacity(ordered.len());
+    for mut group in components(&edges) {
+        group.sort_unstable();
+        grouped.extend(group.into_iter().map(|i| ordered[i].clone()));
+    }
+    Ok(grouped)
+}
+
+/// The strongly connected components of a graph given as adjacency lists,
+/// each listed after every component it has an edge into (Tarjan's
+/// algorithm, on an explicit stack so a long chain of definitions cannot
+/// overflow the native one).
+fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = edges.len();
+    let (mut index, mut low, mut on_stack) = (vec![UNSEEN; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next) = (Vec::new(), Vec::new(), 0);
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        // (vertex, how many of its edges have been followed)
+        let mut work = vec![(root, 0)];
+        while let Some(&(v, i)) = work.last() {
+            if i == 0 {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = edges[v].get(i) {
+                work.last_mut().unwrap().1 = i + 1;
+                if index[w] == UNSEEN {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    group.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(group);
+            }
+        }
+    }
+    out
 }
 
 /// Names a definition's value depends on at load time (§4.1). Lambda bodies

@@ -89,13 +89,18 @@ impl Expr {
                     out.insert(n.clone());
                 }
             }
+            // `%main` is `labelled "main"` (§4.11)
+            Expr::LabelLit(_) => {
+                if !bound.iter().any(|b| b == "labelled") {
+                    out.insert("labelled".to_string());
+                }
+            }
             Expr::TypeName(_)
             | Expr::Int(_)
             | Expr::Text(_)
             | Expr::IdLit(_)
             | Expr::Id(_)
             | Expr::NewId
-            | Expr::LabelLit(_)
             | Expr::PathLit(_)
             | Expr::Bool(_)
             | Expr::SelectorFun(_)
