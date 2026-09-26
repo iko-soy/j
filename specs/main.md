@@ -232,9 +232,11 @@ Two layout rules and nothing else.
 2. **`let` blocks.** After `let`, the column of the first token opens a block.
    A subsequent line whose first token is in exactly that column begins a new
    binding; a line indented further continues the current binding; the block
-   ends at `in` or at the first token in a smaller column. Bindings on a single
-   line are separated by `;`. Blank and comment-only lines are ignored here
-   too.
+   ends at `in` or at the first token in a smaller column. An `in` that begins
+   a line obeys the enclosing layout like any other token: in an item it must
+   be past column 1, and in an outer block's binding past that block's column.
+   Bindings on a single line are separated by `;`. Blank and comment-only
+   lines are ignored here too.
 
 An expression given on the command line or on stdin is a single `expr`, not a
 list of items, so rule 1 does not apply to it; rule 2 does.

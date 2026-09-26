@@ -149,12 +149,15 @@ impl Parser {
         Ok(items)
     }
 
+    /// One item. Under rule 1 (§3.3) a line starting past column 1 continues
+    /// it, so a line break before its `=` or `:` is skipped when the next
+    /// line starts past column 1, like one inside its type or expression.
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         match self.peek().clone() {
             Tok::TypeName(name) => {
                 // typedecl: TYPENAME '=' type
                 self.bump();
-                self.skip_newlines();
+                self.skip_layout_newlines(1);
                 self.expect(&Tok::Equals)?;
                 let ty = self.parse_type()?;
                 Ok(Item::TypeDecl(name, ty))
@@ -162,6 +165,7 @@ impl Parser {
             Tok::Ident(name) => {
                 let line = self.line();
                 self.bump();
+                self.skip_layout_newlines(1);
                 match self.peek().clone() {
                     Tok::Colon => {
                         self.bump();
@@ -193,6 +197,7 @@ impl Parser {
                     }
                 };
                 self.expect(&Tok::RParen)?;
+                self.skip_layout_newlines(1);
                 self.expect(&Tok::Colon)?;
                 let ty = self.parse_type()?;
                 Ok(Item::Signature(op.to_string(), ty, line))
@@ -211,48 +216,19 @@ impl Parser {
         self.nested(Self::parse_type_inner)
     }
 
+    /// Types occur only in top-level items, so their layout limit is always
+    /// rule 1's column 1 (§3.3): a line break may fall anywhere in a type,
+    /// before or after `->` alike, when the next line starts past column 1.
     fn parse_type_inner(&mut self) -> Result<TypeExpr, ParseError> {
-        self.skip_newlines_in_type();
+        self.skip_layout_newlines(1);
         let lhs = self.parse_atype()?;
-        self.skip_newlines_in_type();
+        self.skip_layout_newlines(1);
         if matches!(self.peek(), Tok::Arrow) {
             self.bump();
             let rhs = self.parse_type()?;
             Ok(TypeExpr::Fun(Rc::new(lhs), Rc::new(rhs)))
         } else {
             Ok(lhs)
-        }
-    }
-
-    /// In types (signatures) we allow newlines before `->` continuation when
-    /// indented; keep it simple: skip newlines if the next token is `->`.
-    fn skip_newlines_in_type(&mut self) {
-        let save = self.pos;
-        loop {
-            if matches!(self.peek(), Tok::Newline) {
-                self.pos += 1;
-                // only continue skipping if Arrow follows after the newlines
-                let _ = &save;
-                let mut p = self.pos;
-                while matches!(self.toks[p].tok, Tok::Newline) {
-                    p += 1;
-                }
-                if matches!(self.toks[p].tok, Tok::Arrow) {
-                    self.pos = p;
-                    return;
-                } else {
-                    self.pos = save;
-                    // restore to before newlines? we must not consume them if
-                    // not followed by Arrow, since layout needs them.
-                    // Walk back: find first newline we consumed.
-                    while self.pos > 0 && matches!(self.toks[self.pos - 1].tok, Tok::Newline) {
-                        self.pos -= 1;
-                    }
-                    return;
-                }
-            } else {
-                return;
-            }
         }
     }
 
@@ -276,7 +252,7 @@ impl Parser {
                 self.bump();
                 let mut fields = Vec::new();
                 loop {
-                    self.skip_newlines();
+                    self.skip_layout_newlines(1);
                     if matches!(self.peek(), Tok::RBrace) {
                         self.bump();
                         break;
@@ -290,10 +266,11 @@ impl Parser {
                             ))
                         }
                     };
+                    self.skip_layout_newlines(1);
                     self.expect(&Tok::Colon)?;
                     let t = self.parse_type()?;
                     fields.push((name, Rc::new(t)));
-                    self.skip_newlines();
+                    self.skip_layout_newlines(1);
                     match self.peek() {
                         Tok::Comma => {
                             self.bump();
@@ -477,6 +454,16 @@ impl Parser {
                     }
                     let next_col = self.toks[q].col;
                     if matches!(self.toks[q].tok, Tok::In) {
+                        // like any token that begins a line, an `in` at or
+                        // left of the limit belongs to an outer construct
+                        // (§3.3): a new top-level item or an outer let's
+                        // binding line, never this let
+                        if next_col <= min_col {
+                            return Err(ParseError::new(
+                                format!("`in` must be indented past column {}", min_col),
+                                self.toks[q].line,
+                            ));
+                        }
                         self.pos = q;
                         self.bump();
                         break;

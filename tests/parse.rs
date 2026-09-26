@@ -272,6 +272,74 @@ fn multiline_signature_arrow() {
 }
 
 #[test]
+fn indented_lines_continue_signatures_and_typedecls() {
+    // §3.3 rule 1 holds for every item, not only definitions: a line that
+    // starts past column 1 continues it, wherever the line break falls
+    let items = cfg("f : Int ->\n  Int\nf = \\x -> x\n");
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0], Item::Signature(n, TypeExpr::Fun(_, _), _) if n == "f"));
+    match &cfg("Foo =\n  { a : Int }\n")[0] {
+        Item::TypeDecl(n, TypeExpr::Record(fs)) => assert!(n == "Foo" && fs.len() == 1),
+        other => panic!("expected a record typedecl, got {:?}", other),
+    }
+    for src in [
+        "f :\n  Int -> Int\n",
+        "f\n  : Int -> Int\n",
+        "(++) :\n  m -> m -> m\n",
+        "(++)\n  : m -> m -> m\n",
+        "f : [\n  Int\n  ]\n",
+        "f : (Int\n  -> Int)\n",
+        "Foo\n  = Int\n",
+        "Foo = {\n  a : Int\n  , b : Int\n  }\n",
+        "Foo = { a\n  : Int }\n",
+        "x\n  = 1\n",
+    ] {
+        match parse_config(src, outer()) {
+            Ok(items) => assert_eq!(items.len(), 1, "{:?}", src),
+            Err(e) => panic!("{:?}: line {}: {}", src, e.line, e.msg),
+        }
+    }
+}
+
+#[test]
+fn a_column_1_line_never_continues_an_item() {
+    // §3.3 rule 1: a token in column 1 begins the next item, so each of
+    // these is malformed, though it is one item with that line indented
+    for src in [
+        "f : Int\n-> Int\n",
+        "f\n: Int\n",
+        "(++)\n: m -> m -> m\n",
+        "Foo\n= Int\n",
+        "Foo\n\n= Int\n",
+        "Foo = { a : Int\n, b : Int }\n",
+        "Foo = { a : Int\n}\n",
+        "Foo = { a\n: Int }\n",
+        "x = let a = 1\nin a\n",
+        "x = let a = 1\n\nin a\n",
+    ] {
+        assert!(parse_config(src, outer()).is_err(), "{:?} parsed", src);
+    }
+}
+
+#[test]
+fn a_later_line_in_closes_a_let_only_within_its_layout() {
+    // an `in` that begins a line obeys layout like any other token (§3.3):
+    // in a binding of an outer let it closes the inner let only when it is
+    // indented past the outer block's column
+    let e = p("let a = let b = 1\n        in b\nin a");
+    assert!(matches!(&e, Expr::Let(bs, _) if matches!(*bs[0].1, Expr::Let(_, _))));
+    let msg = perr("let a = let b = 1\n    in b\nin a");
+    assert!(msg.contains("indented past column 5"), "{}", msg);
+    // in a definition it is under rule 1; in a lone expression it is not
+    assert_eq!(cfg("x = let a = 1\n  in a\n").len(), 1);
+    match parse_config("x = let a = 1\nin a\n", outer()) {
+        Ok(_) => panic!("`in` in column 1 continued a definition"),
+        Err(e) => assert!(e.msg.contains("indented past column 1"), "{}", e.msg),
+    }
+    assert!(matches!(p("let a = 1\nin a"), Expr::Let(_, _)));
+}
+
+#[test]
 fn expression_stops_at_eof_cleanly() {
     perr("x y z (");
     perr("let x = 1 in");
