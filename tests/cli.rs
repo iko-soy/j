@@ -190,6 +190,26 @@ fn crash_is_exit_1_with_trace() {
 }
 
 #[test]
+fn crash_trace_names_the_innermost_definition() {
+    // §1.4, §4.13, §5.1: the second line names the innermost definition that
+    // was executing, as the spec's own examples show. Nothing recorded one
+    // at run time, so every crash printed only `from EXPR`. A builtin is no
+    // definition, so a crash outside every definition names none.
+    let r = setup();
+    for (expr, trace) in [
+        ("goto %nope", "   in goto, from goto %nope"),
+        ("describe 3", "   in describe, from describe 3"),
+        ("new . goto %nope", "   in goto, from new . goto %nope"),
+        ("squash 3", "   in squash, from squash 3"),
+        ("crash \"boom\"", "   from crash \"boom\""),
+    ] {
+        let out = r.j(&[expr]);
+        assert_eq!(out.code, 1, "{}: {}", expr, out.stderr);
+        assert_eq!(out.stderr.lines().nth(1), Some(trace), "{}: {}", expr, out.stderr);
+    }
+}
+
+#[test]
 fn full_edit_flow() {
     let r = setup();
     r.write("a.txt", "one\n");

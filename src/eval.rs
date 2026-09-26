@@ -206,6 +206,29 @@ pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
     parent_rc(k).map(|r| (**r).clone())
 }
 
+/// The innermost definition whose application `k` continues (§1.4): a signed
+/// definition's body runs under a `CheckExpr` of its result, which stays on
+/// the chain until the body has returned. Only used on a crash no `Try`
+/// caught, so there is no `Try` on the chain to stop the walk early.
+fn innermost_def(k: &Cont) -> Option<String> {
+    let mut k = k;
+    loop {
+        if let Cont::CheckExpr { name, .. } = k {
+            return Some(name.clone());
+        }
+        k = parent_rc(k)?;
+    }
+}
+
+/// `c`, raised while applying the definition `def`, is in it unless
+/// something nearer, a nested run, already named one (§1.4)
+fn in_def(mut c: Crash, def: &str) -> Crash {
+    if c.def.is_none() {
+        c.def = Some(def.to_string());
+    }
+    c
+}
+
 impl Interp {
     pub fn new(backend: Rc<dyn Backend>, shapes: Shapes, globals: Env) -> Interp {
         Interp {
@@ -322,6 +345,19 @@ impl Interp {
         c
     }
 
+    /// `c`, raised while applying the builtin `builtin` under the contract
+    /// named `cname`, is in that definition when the builtin is a signed
+    /// definition's value (`squash = abandon . …`). A builtin's own name, or
+    /// a composition's made from its operands', names no definition, and the
+    /// crash is in whichever definition applied it (§1.4).
+    fn blame_builtin(&self, c: Crash, builtin: &str, cname: &str) -> Crash {
+        if cname != builtin && self.contracts.contains_key(cname) {
+            in_def(c, cname)
+        } else {
+            c
+        }
+    }
+
     fn run(&mut self, st: State) -> EResult {
         match self.trampoline(st) {
             Ok(v) => Ok(v),
@@ -374,7 +410,13 @@ impl Interp {
                     };
                     match caught {
                         Some(next) => st = next,
-                        None => return Err(c),
+                        None => {
+                            let mut c = c;
+                            if c.def.is_none() {
+                                c.def = innermost_def(&active);
+                            }
+                            return Err(c);
+                        }
                     }
                 }
             }
@@ -847,7 +889,7 @@ impl Interp {
                         // baked into a partial application (§4.13)
                         let at = c.position().unwrap_or(args.len());
                         if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
-                            return Run::Crash(cr);
+                            return Run::Crash(self.blame_builtin(cr, name, &cname));
                         }
                     }
                     all.push(arg);
@@ -867,13 +909,15 @@ impl Interp {
                                         if let Err(cr) =
                                             c.check_result(&self.shapes, &cname, &r)
                                         {
-                                            return Run::Crash(cr);
+                                            return Run::Crash(
+                                                self.blame_builtin(cr, name, &cname),
+                                            );
                                         }
                                     }
                                 }
                                 Run::Step(State::Ret(r, k))
                             }
-                            Err(c) => Run::Crash(c),
+                            Err(c) => Run::Crash(self.blame_builtin(c, name, &cname)),
                         }
                     } else {
                         Run::Step(State::Ret(
@@ -916,7 +960,7 @@ impl Interp {
                         if let Some(c) = &cexpr {
                             let at = c.position().unwrap_or(applied_args.len());
                             if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
-                                return Run::Crash(cr);
+                                return Run::Crash(in_def(cr, &cname));
                             }
                         }
                         let advanced = cexpr
@@ -964,7 +1008,9 @@ impl Interp {
                         let fname = cname.clone().unwrap_or_default();
                         let at = c.position().unwrap_or(applied_args.len());
                         if let Err(cr) = c.check_arg_at(&self.shapes, &fname, at, &arg) {
-                            return Run::Crash(cr);
+                            // a violation is in the definition checked
+                            // (§1.4, §4.13's `describe 3`)
+                            return Run::Crash(in_def(cr, &fname));
                         }
                     }
                     let p = &params[*applied];

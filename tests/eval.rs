@@ -410,6 +410,86 @@ fn deferred_body_is_contract_checked() {
     assert!(m.contains("argument 2"), "{}", m);
 }
 
+/// Definitions that crash at different depths, for the crash trace (§1.4).
+const NESTED: &str = r#"
+inner : Int -> Int
+inner = \n -> if n > 0 then n else crash "not positive"
+
+outer : Int -> Int
+outer = \n -> inner n + 1
+
+after : Int -> Int
+after = \n -> inner n + head []
+
+caught : Int -> Int
+caught = \n -> (inner 0 or n) + head []
+
+viaMap : [Int] -> [Int]
+viaMap = \xs -> map (\x -> x + head []) xs
+
+mapInner : [Int] -> [Int]
+mapInner = \xs -> map inner xs
+
+first : [Int] -> Int
+first = head
+"#;
+
+/// The message of the crash `src` raises and the definition it is in.
+fn crash_in(interp: &mut Interp, cfg: &config::Config, src: &str) -> (String, Option<String>) {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(src, outer).unwrap_or_else(|p| panic!("{}: {}", src, p.msg));
+    let e = config::resolve_ids(&e, interp).unwrap_or_else(|_| panic!("{}: ids", src));
+    let env = interp.global_env();
+    match interp.eval(&Rc::new(e), &env) {
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Err(c) => (c.msg, c.def),
+    }
+}
+
+#[test]
+fn crash_names_the_innermost_definition_executing() {
+    // §1.4, §5.1: a crash reports the innermost definition that was
+    // executing. Nothing recorded one once loading was over, so every crash
+    // at run time reported none and the CLI printed only `from EXPR`.
+    let (mut i, cfg) = make_interp_with(&format!("{}{}", DEFERRED, NESTED));
+    let goto = format!("goto (\\_ -> []) ({})", REPO);
+    for (src, want) in [
+        ("inner 0", Some("inner")),
+        // §5.1's example, on a repository literal
+        (goto.as_str(), Some("goto")),
+        // the definition running, not the one that called it
+        ("outer 0", Some("inner")),
+        // once `inner` has returned it is no longer executing
+        ("after 1", Some("after")),
+        // a crash `or` caught in `inner` does not name the next one
+        ("caught 1", Some("caught")),
+        // a lambda a builtin runs is in the definition that made it; a
+        // definition a builtin runs is itself the innermost
+        ("viaMap [1]", Some("viaMap")),
+        ("mapInner [0]", Some("inner")),
+        // a deferred body runs in its definition too (§5.2)
+        ("choose 0 5", Some("choose")),
+        // a contract violation is in the definition checked (§4.13),
+        // whether an argument, a deferred argument, or the result
+        ("inner \"x\"", Some("inner")),
+        ("outer \"x\"", Some("outer")),
+        ("bad 1 \"x\"", Some("bad")),
+        ("bad 1 2", Some("bad")),
+        ("describe 3", Some("describe")),
+        // a definition whose value is a builtin runs under its own name
+        ("first []", Some("first")),
+        ("first \"x\"", Some("first")),
+        ("squash 3", Some("squash")),
+        // a builtin is no definition: outside every definition, none
+        ("head []", None),
+        ("crash \"top\"", None),
+        ("(\\x -> x + head []) 1", None),
+    ] {
+        let (msg, def) = crash_in(&mut i, &cfg, src);
+        assert_eq!(def.as_deref(), want, "{} crashed with {}", src, msg);
+    }
+}
+
 #[test]
 fn new_id_mints_distinct_ids() {
     let (mut i, cfg) = make_interp();
