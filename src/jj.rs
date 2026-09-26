@@ -1073,18 +1073,34 @@ impl JjBackend {
             jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
             other => (1, format!("push failed: {}", other)),
         })?;
+        // git push is not atomic: the remote may accept some updates and
+        // reject others. push_refs has set the accepted ones in `tx`, and
+        // they are on the remote, so they are recorded before the rest is
+        // reported; a push the remote refused entirely records nothing
+        let mut repo = base.clone();
+        if stats.all_ok() || stats.some_exported() {
+            let unpublished = block_on(tx.write(truncate_chars(description, 200)))
+                .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+            repo = block_on(unpublished.publish())
+                .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+            *self.inner.repo.lock().unwrap() = repo.clone();
+        }
         if !stats.all_ok() {
             let mut names: Vec<String> = Vec::new();
             for (name, _) in stats.rejected.iter().chain(stats.remote_rejected.iter()) {
                 names.push(name.as_str().to_string());
             }
-            return Err((1, format!("push rejected: {}", names.join(", "))));
+            // pushed, but not exported to the colocated git repo, so jj-lib
+            // left them out of `tx`
+            for (symbol, _) in &stats.unexported_bookmarks {
+                names.push(format!("{} (pushed but not recorded)", symbol.name.as_str()));
+            }
+            let mut msg = format!("push rejected: {}", names.join(", "));
+            if stats.some_exported() {
+                msg.push_str("; the other bookmarks were pushed and recorded");
+            }
+            return Err((1, msg));
         }
-        let unpublished = block_on(tx.write(truncate_chars(description, 200)))
-            .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
-        let repo = block_on(unpublished.publish())
-            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
-        *self.inner.repo.lock().unwrap() = repo.clone();
         Ok(repo)
     }
 

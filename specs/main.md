@@ -888,7 +888,10 @@ language: `fetch` and `push` are the only things that change them.
   Moving a bookmark whose current target is not immutable to an unrelated
   commit is allowed; that is how a rewritten stack is re-pushed. After a
   successful push the labels reflect the new positions. It records one
-  operation. An empty list sends nothing to the remote.
+  operation. An empty list sends nothing to the remote. If the remote
+  accepts some of the updates and rejects others, that operation records the
+  accepted ones, whose labels move, and `push` exits 1 naming the rejected
+  bookmarks.
 
 Only the remote named `origin` is supported in this version; `fetch` and
 `push` exit 1 with `j: no remote origin` when it is not configured.

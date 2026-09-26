@@ -393,6 +393,37 @@ fn push_of_an_empty_list_pushes_nothing() {
 }
 
 #[test]
+fn partial_push_records_what_the_remote_accepted() {
+    // git push is not atomic: when the remote accepts `aaa` and rejects
+    // `bbb`, aaa is on the remote. The run exited 1 without recording the
+    // push, so the aaa label was missing until the next fetch and a push
+    // naming aaa was refused or rejected on its stale lease (§7.6: a label
+    // is the remote's bookmark as of the last push)
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup();
+    let hook = env.remote.join("hooks/update");
+    std::fs::write(&hook, "#!/bin/sh\n[ \"$1\" = refs/heads/bbb ] && exit 1\nexit 0\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "two\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    let expr = "push (\\r -> label \"aaa\" here r ++ label \"bbb\" here r)";
+    let out = env.j(&dest, &[expr]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("bbb"), "{}", out.stderr);
+    let branches = git(&env.remote, &["branch"]);
+    assert!(branches.contains("aaa") && !branches.contains("bbb"), "{}", branches);
+    // the accepted half is the push's one operation
+    let ops = env.j(&dest, &["ops"]).ok().stdout;
+    assert!(ops.lines().next().unwrap_or("").contains("label \"aaa\""), "{}", ops);
+    let tree = env.j(&dest, &["tree"]).ok().stdout;
+    assert!(tree.lines().any(|l| l.contains("work") && l.contains("aaa")), "{}", tree);
+    env.j(&dest, &["push (unlabel \"aaa\")"]).ok();
+    assert!(!git(&env.remote, &["branch"]).contains("aaa"));
+}
+
+#[test]
 fn push_conflicted_commit_refused() {
     let env = setup();
     let dest = uniq("clone");
