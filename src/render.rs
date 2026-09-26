@@ -1769,22 +1769,15 @@ fn build_row_text(
     pal: &Palette,
     with_focus: bool,
     prefix_len: &dyn Fn(&str) -> usize,
-    run_extra: usize,
     id_w: usize,
 ) -> RowText {
     let c = n.commit();
     let is_focus = c.map(|x| x.is_focus).unwrap_or(false);
     let gutter = if is_focus && with_focus { "▶ " } else { "  " }.to_string();
-    // id (on a run row the count follows ╎; only the part that overflows the
-    // rails area spills into the id column)
+    // id (blank on a run row, whose count `rail_row` draws: the part that
+    // overflows the rails area runs on into the id column)
     let id = match n {
-        Display::Run { .. } => {
-            let mut s = String::new();
-            while width(&s) < run_extra + id_w {
-                s.push(' ');
-            }
-            s
-        }
+        Display::Run { .. } => " ".repeat(id_w),
         _ => match c {
             Some(info) => {
                 let k = prefix_len(&info.id);
@@ -1899,20 +1892,14 @@ fn draw_rows(
     term_w: Option<usize>,
 ) -> Result<String, Crash> {
     let rail_chars = 2 * lanes_n;
-    // id column width: 4-char min prefix plus the `@` literal prefix, and any
-    // overflow of a run count past the rails area
+    // id column width: 4-char min prefix plus the `@` literal prefix, and
+    // what a run count past the rails area writes into it: ` n` is written
+    // from character 2l+1 and runs on through the space after the rails
     let mut id_w = 5usize;
     for (idx, n) in rows.iter().enumerate() {
-        if let Display::Run { count, .. } = n {
-            if let Some(l) = placements[idx].lane {
-                let digits = format!("{}", count).len();
-                let extra = (2 * l + 1 + digits).saturating_sub(rail_chars);
-                // digits written from 2l+1; rails hold rail_chars; overflow
-                // goes into the id column
-                if extra > 0 {
-                    id_w = id_w.max(4 + extra);
-                }
-            }
+        if let (Display::Run { count, .. }, Some(l)) = (n, placements[idx].lane) {
+            let end = 2 * l + 2 + count.to_string().len();
+            id_w = id_w.max(end.saturating_sub(rail_chars + 1));
         }
     }
     for n in rows {
@@ -1925,17 +1912,8 @@ fn draw_rows(
         .any(|n| n.commit().map(|c| !c.labels.is_empty()).unwrap_or(false));
     // build row texts
     let mut texts: Vec<RowText> = Vec::new();
-    for (idx, n) in rows.iter().enumerate() {
-        let run_extra = match (n, placements[idx].lane) {
-            (Display::Run { count, .. }, Some(l)) => {
-                let digits = format!("{}", count).len();
-                (2 * l + 1 + digits).saturating_sub(rail_chars)
-            }
-            _ => 0,
-        };
-        texts.push(build_row_text(
-            n, rows, opts, pal, with_focus, prefix_len, run_extra, id_w,
-        ));
+    for n in rows {
+        texts.push(build_row_text(n, rows, opts, pal, with_focus, prefix_len, id_w));
     }
     // Columns 4–8 start at the same offset on every row (§Step 4). The size
     // bar's column is there when any row draws a bar — ` ▅`, two columns —
@@ -2267,6 +2245,7 @@ fn rail_state_below(
 
 /// rails characters for the row of node `idx` (§Step 4, the character table).
 /// Returns the characters and, per character, whether it belongs to lane 0.
+/// On a run row they go on past the rails area when its count does not fit.
 fn rail_row(
     rows: &[&Display],
     placements: &[Placement],
@@ -2330,11 +2309,15 @@ fn rail_row(
         chars[2 * i] = c;
         lane0[2 * i] = i == 0;
     }
-    // on a run row the count follows ╎, written into the rails area
+    // on a run row the count follows ╎, written into the rails area and, if
+    // needed, on through the space after it into the blank id column
     if let (Display::Run { count, .. }, Some(l)) = (n, pl.lane) {
         for (k, d) in format!(" {}", count).chars().enumerate() {
             let pos = 2 * l + 1 + k;
-            if pos < chars.len() {
+            if pos == chars.len() {
+                chars.push(d);
+                lane0.push(l == 0);
+            } else {
                 chars[pos] = d;
                 lane0[pos] = l == 0;
             }

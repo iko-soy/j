@@ -591,14 +591,19 @@ fn contains_id(sub: &Value, id: &str) -> bool {
 }
 
 fn worked_example() -> (Value, MemBackend) {
+    worked_example_with_run(14)
+}
+
+/// The worked example with `n` uninteresting commits in its run.
+fn worked_example_with_run(n: usize) -> (Value, MemBackend) {
     let t = now();
     let h = 3600;
     let d = 24 * h;
     let w = 7 * d;
-    // root -> 14 uninteresting commits -> aaaa -> kpqx (trunk head)
+    // root -> n uninteresting commits -> aaaa -> kpqx (trunk head)
     let root = commit(ROOT_ID, "", &[], vec![]);
     let mut kids: Vec<Value> = Vec::new();
-    let ids: Vec<String> = (0..14).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
+    let ids: Vec<String> = (0..n).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
 
     // the base snapshot (the last run commit's files): three files of 40
     // lines. Each commit's diff against its parent sizes its bar (§7.11
@@ -704,7 +709,8 @@ fn worked_example() -> (Value, MemBackend) {
                 hash: format!("h{}", id),
                 author: "Mary Ojeda".into(),
                 email: "a@x".into(),
-                time: t - 3 * w - 3600 + (i as i64) * 60,
+                // a minute apart, all older than aaaa
+                time: t - 3 * w - (60 * n as i64).max(3600) + (i as i64) * 60,
             },
         );
     }
@@ -934,6 +940,51 @@ fn a_row_without_a_bar_keeps_the_bar_slot() {
     let text = tree_text(&mut i, &cfg, &src, repo);
     assert!(row_of(&text, "@ptlm").contains("@ptlm    docs"), "{}", text);
     assert!(row_of(&text, "@wqzt").contains("@wqzt ▃  wip"), "{}", text);
+}
+
+// ----------------------------------------------------------------------
+// the rails area (§Step 4): `2 · lanes` columns on every row, so the id
+// column after it starts at one offset
+// ----------------------------------------------------------------------
+
+/// The worked example's options with `lanes` lanes and the `icons` glyph set
+/// if `icons`.
+fn lanes_opts(lanes: usize, icons: bool) -> String {
+    format!(
+        "{{ detail = 2, margin = true, elide = true, icons = {}, color = \"never\", lanes = {}, author = false, date = false, files = false }}",
+        icons, lanes
+    )
+}
+
+/// The display column of the id on every commit row of the worked example.
+fn id_cols(text: &str) -> Vec<usize> {
+    WORKED_ROWS
+        .iter()
+        .map(|(id, _, _)| col_of(row_of(text, id), id))
+        .collect()
+}
+
+#[test]
+fn a_run_count_runs_on_into_the_id_column() {
+    // the count was cut where the rails area ends: `╎` alone at lanes = 1,
+    // and `╎ 12` for a run of 123 at lanes = 2. At lanes = 1 the id column
+    // was also widened by one, though nothing was written into it.
+    // A history 123 commits deep needs more stack than a test thread has in
+    // a debug build (the binary runs on 512 MB).
+    let deep = std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+        for lanes in 1..=3 {
+            let (repo, be) = worked_example_with_run(123);
+            let (mut i, cfg) = make_interp(be);
+            let src = format!("treeWith ({})", lanes_opts(lanes, false));
+            let text = tree_text(&mut i, &cfg, &src, repo);
+            let ctx = format!("lanes {}\n{}", lanes, text);
+            assert_eq!(text.lines().next(), Some("  ╎ 123"), "{}", ctx);
+            // the rest of the count fits the id column as it is
+            assert_eq!(id_cols(&text), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "{}", ctx);
+            assert!(row_of(&text, "@aaaa").contains("@aaaa ▅  add parser"), "{}", ctx);
+        }
+    });
+    deep.unwrap().join().unwrap();
 }
 
 // ----------------------------------------------------------------------
