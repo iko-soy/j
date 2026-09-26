@@ -218,37 +218,20 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
                 match shape.as_str() {
-                    "Commit" => return commit_line(interp, v, pal, false, &BTreeSet::new(), false),
+                    "Commit" => return commit_line(interp, v, pal, &Standing::default()),
                     "Entry" => return entry_line(interp, v, pal),
                     "Subtree" => {
-                        return commit_line(
-                            interp,
-                            &v.field("root")?,
-                            pal,
-                            false,
-                            &BTreeSet::new(),
-                            false,
-                        )
+                        return commit_line(interp, &v.field("root")?, pal, &Standing::default())
                     }
                     "Repo" => {
-                        return commit_line(
-                            interp,
-                            &v.field("root")?,
-                            pal,
-                            true,
-                            &BTreeSet::new(),
-                            false,
-                        )
+                        let focus = Standing {
+                            focus: true,
+                            ..Standing::default()
+                        };
+                        return commit_line(interp, &v.field("root")?, pal, &focus);
                     }
                     "Frame" => {
-                        return commit_line(
-                            interp,
-                            &v.field("parent")?,
-                            pal,
-                            false,
-                            &BTreeSet::new(),
-                            false,
-                        )
+                        return commit_line(interp, &v.field("parent")?, pal, &Standing::default())
                     }
                     "Change" => {
                         let n = touched_paths(v)?.len();
@@ -452,13 +435,26 @@ fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
     Ok(m)
 }
 
+/// What a commit's glyph says about where it stands in a history
+/// (specs/tree.md §Glyphs), beyond what its own files say. A `Commit` value
+/// records none of it, so each form fills in what it knows: a `Repo`'s line
+/// that its root is the focus, a `Commit` block what the loaded repository
+/// says (`Loaded`).
+#[derive(Default)]
+struct Standing {
+    focus: bool,
+    /// an ancestor of the focus
+    ancestor: bool,
+    immutable: bool,
+    /// no change against its parent
+    empty: bool,
+}
+
 fn commit_line(
     interp: &Interp,
     c: &Value,
     pal: &Palette,
-    focus: bool,
-    immutable: &BTreeSet<String>,
-    has_conflicts_hint: bool,
+    standing: &Standing,
 ) -> Result<String, Crash> {
     let id = match c.field("id")? {
         Value::Id(i) => i.to_string(),
@@ -472,14 +468,13 @@ fn commit_line(
         .iter()
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
-    let glyph = node_glyph(interp, c, &id, focus, immutable, pal)?;
+    let glyph = node_glyph(c, &id, standing)?;
     let id_s = display_id(interp, &id, pal);
     let labels_s = if labels.is_empty() {
         String::new()
     } else {
         pal.green(&labels.join("  "))
     };
-    let _ = has_conflicts_hint;
     Ok(if labels_s.is_empty() {
         format!("{} {}  {}", glyph, id_s, msg_first)
     } else {
@@ -487,28 +482,23 @@ fn commit_line(
     })
 }
 
-fn node_glyph(
-    interp: &Interp,
-    c: &Value,
-    id: &str,
-    focus: bool,
-    immutable: &BTreeSet<String>,
-    pal: &Palette,
-) -> Result<String, Crash> {
+/// The glyph of a commit line, by `tree`'s precedence (`glyph_for`).
+fn node_glyph(c: &Value, id: &str, standing: &Standing) -> Result<String, Crash> {
     let g = if id == ROOT_ID {
         "⌂"
     } else if has_conflict(c)? {
         "⊗"
-    } else if is_empty_commit(interp, c)? {
+    } else if standing.empty {
         "◌"
-    } else if immutable.contains(id) {
+    } else if standing.immutable {
         "◆"
-    } else if focus {
+    } else if standing.focus {
         "◉"
+    } else if standing.ancestor {
+        "●"
     } else {
         "○"
     };
-    let _ = pal;
     Ok(g.to_string())
 }
 
@@ -521,12 +511,6 @@ fn has_conflict(c: &Value) -> Result<bool, Crash> {
             }
         }
     }
-    Ok(false)
-}
-
-/// empty: no change against its parent — needs the parent; we only compute
-/// this meaningfully in tree rendering. In line display, treat as false.
-fn is_empty_commit(_interp: &Interp, _c: &Value) -> Result<bool, Crash> {
     Ok(false)
 }
 
@@ -561,7 +545,10 @@ fn display_block(
     }
     if let Some(shape) = shape_of_record(interp, v) {
         match shape.as_str() {
-            "Commit" => return display_commit_block(interp, v, pal, indent, out),
+            "Commit" => {
+                let loaded = Loaded::of(interp)?;
+                return display_commit_block(interp, v, pal, indent, out, &loaded);
+            }
             "Entry" => {
                 out.push_str(&pad);
                 out.push_str(&entry_line(interp, v, pal)?);
@@ -595,26 +582,15 @@ fn display_block(
                     interp,
                     &v.field("parent")?,
                     pal,
-                    false,
-                    &BTreeSet::new(),
-                    false,
+                    &Standing::default(),
                 )?);
                 out.push('\n');
                 return Ok(());
             }
             "Change" => {
-                for (p, mark, unresolved) in touched_paths(v)? {
+                for (p, mark, _) in touched_paths(v)? {
                     out.push_str(&pad);
-                    let ms = mark.to_string();
-                    let colored = match mark {
-                        '+' => pal.green(&ms),
-                        '−' => pal.red(&ms),
-                        '~' => pal.yellow(&ms),
-                        '✖' => pal.red(&ms),
-                        _ => ms,
-                    };
-                    let _ = unresolved;
-                    out.push_str(&format!("{} {}\n", colored, p));
+                    out.push_str(&format!("{} {}\n", colored_mark(mark, pal), p));
                 }
                 return Ok(());
             }
@@ -656,23 +632,99 @@ fn indent_multiline(s: &str, indent: usize) -> String {
         + "\n"
 }
 
+/// A change mark (`+ ~ − ✖`), coloured by what it means.
+fn colored_mark(mark: char, pal: &Palette) -> String {
+    let ms = mark.to_string();
+    match mark {
+        '+' => pal.green(&ms),
+        '−' | '✖' => pal.red(&ms),
+        '~' => pal.yellow(&ms),
+        _ => ms,
+    }
+}
+
+/// The loaded repository (§1.2), indexed for displaying `Commit` values. A
+/// commit value records neither its parent nor where it stands, so its block
+/// reads both from the commit with the same id there, as it reads author and
+/// age (§5.1). Indexed once per displayed value, not once per commit: a list
+/// of commits would otherwise walk the history once for each.
+struct Loaded {
+    /// the parent of every commit that has one
+    parents: BTreeMap<String, Value>,
+    focus: String,
+    /// the focus's ancestors, the focus excluded
+    ancestors: BTreeSet<String>,
+    immutable: BTreeSet<String>,
+}
+
+impl Loaded {
+    fn of(interp: &mut Interp) -> Result<Loaded, Crash> {
+        let mut loaded = Loaded {
+            parents: BTreeMap::new(),
+            focus: String::new(),
+            ancestors: BTreeSet::new(),
+            immutable: BTreeSet::new(),
+        };
+        let old = interp.old_repo.borrow().clone();
+        let Some(repo) = old else {
+            return Ok(loaded);
+        };
+        if let Value::Id(i) = repo.field("root")?.field("id")? {
+            loaded.focus = i.to_string();
+        }
+        for frame in repo.field("context")?.as_list()?.iter() {
+            loaded.ancestors.insert(id_of_frame_parent(frame)?);
+        }
+        // as `tree_render` does: a config whose `immutable` crashes draws no `◆`
+        loaded.immutable = crate::repo::compute_immutable(interp, &repo).unwrap_or_default();
+        // every commit's parent, walking down from the top of the history
+        let top = crate::repo::by_id(&repo, &top_id(&repo)?)?.unwrap_or_else(|| repo.clone());
+        let mut todo = vec![(top.field("root")?, top.field("children")?)];
+        while let Some((parent, children)) = todo.pop() {
+            for c in children.as_list()?.iter() {
+                let root = c.field("root")?;
+                if let Value::Id(i) = root.field("id")? {
+                    loaded.parents.insert(i.to_string(), parent.clone());
+                }
+                todo.push((root, c.field("children")?));
+            }
+        }
+        Ok(loaded)
+    }
+}
+
 fn display_commit_block(
     interp: &mut Interp,
     c: &Value,
     pal: &Palette,
     indent: usize,
     out: &mut String,
+    loaded: &Loaded,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
-    out.push_str(&pad);
-    out.push_str(&commit_line(interp, c, pal, true, &BTreeSet::new(), false)?);
-    out.push('\n');
-    // author · age · n files — from metadata by id (§5.1)
     let id = match c.field("id")? {
         Value::Id(i) => i.to_string(),
         _ => String::new(),
     };
-    let files = c.field("files").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
+    // the paths it changes against its parent in the loaded repository; with
+    // no parent there — the top of the history, or a commit the expression
+    // made — against no files, as `changeOf` does at the top
+    let from = match loaded.parents.get(&id) {
+        Some(parent) => snapshot_map_of(&parent.field("files")?)?,
+        None => SnapMap::new(),
+    };
+    let touched = touched_in_maps(&from, &snapshot_map_of(&c.field("files")?)?)?;
+    // the line `tree` draws for it (§5.1: "a `tree` line without rails")
+    let standing = Standing {
+        focus: id == loaded.focus,
+        ancestor: loaded.ancestors.contains(&id),
+        immutable: loaded.immutable.contains(&id),
+        empty: touched.is_empty(),
+    };
+    out.push_str(&pad);
+    out.push_str(&commit_line(interp, c, pal, &standing)?);
+    out.push('\n');
+    // author · age · n files — from metadata by id (§5.1)
     if let Ok(meta) = interp.backend.meta(&id) {
         let age = render_age(meta.time);
         out.push_str(&pad);
@@ -680,19 +732,19 @@ fn display_commit_block(
             "  {} · {} · {} files\n",
             meta.author,
             age,
-            files.len()
+            touched.len()
         ));
     }
-    for e in files.iter() {
-        let path = path_string(&e.field("path")?)?;
-        let content = e.field("content")?;
-        let unresolved = matches!(&content, Value::Blob(b) if b.is_unresolved());
+    if !touched.is_empty() {
+        out.push('\n');
+    }
+    for (path, mark, _) in &touched {
         out.push_str(&pad);
-        if unresolved {
-            out.push_str(&format!("  {} {}\n", pal.red("✖"), path));
-        } else {
-            out.push_str(&format!("    {}\n", path));
-        }
+        out.push_str(&format!(
+            "  {} {}\n",
+            colored_mark(*mark, pal),
+            path.join("/")
+        ));
     }
     Ok(())
 }
@@ -888,12 +940,22 @@ fn display_list_block(
         out.push('\n');
         return Ok(());
     }
-    // one block per item, separated by a blank line
+    // one block per item, separated by a blank line; the commits among them
+    // share one index of the loaded repository
+    let mut loaded: Option<Loaded> = None;
     for (i, x) in xs.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        display_block(interp, x, pal, indent, out)?;
+        if is_commit(interp, x) {
+            if loaded.is_none() {
+                loaded = Some(Loaded::of(interp)?);
+            }
+            let loaded = loaded.as_ref().expect("just set");
+            display_commit_block(interp, x, pal, indent, out, loaded)?;
+        } else {
+            display_block(interp, x, pal, indent, out)?;
+        }
     }
     Ok(())
 }

@@ -329,6 +329,109 @@ fn entry_list_aligns_by_display_width() {
     );
 }
 
+/// The glyph `tree` draws on the row of the commit whose message is `msg`.
+fn tree_glyph(out: &str, msg: &str) -> char {
+    let row = out
+        .lines()
+        .find(|l| l.contains(&format!("  {}", msg)))
+        .unwrap_or_else(|| panic!("no row for {:?}:\n{}", msg, out));
+    row.chars().find(|c| "◉●○◆◌⊗⌂".contains(*c)).unwrap()
+}
+
+#[test]
+fn focus_example() {
+    // the block listed the commit's whole snapshot, counted and unmarked, and
+    // drew every commit with the focus glyph; §5.1's `j focus` lists the paths
+    // it changes against its parent, marked, under the line `tree` draws
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "focus", repo.clone());
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "◉ wqztbbbb  wip  feature", "{}", out);
+    assert!(
+        lines[1].starts_with("  Montelot · ") && lines[1].ends_with(" · 2 files"),
+        "{}",
+        out
+    );
+    assert_eq!(lines[2..], ["", "  + src/lexer.rs", "  ~ src/parser.rs"], "{}", out);
+    // the parent is not the focus, and `main` puts it in the immutable set
+    let tree = eval_and_display(&mut i, &cfg, "tree", repo.clone());
+    let out = eval_and_display(&mut i, &cfg, "\\r -> (up r).root", repo);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(tree_glyph(&tree, "add parser"), '◆', "{}", tree);
+    assert_eq!(lines[0], "◆ kpqxaaaa  add parser  main", "{}", out);
+    assert!(lines[1].ends_with(" · 1 files"), "{}", out);
+    assert_eq!(lines[2..], ["", "  + src/parser.rs"], "{}", out);
+}
+
+/// A linear history above the root with eager file lists, oldest first,
+/// focused on its last commit.
+fn linear_repo(chain: Vec<(&str, &str, Vec<(&str, &str)>)>) -> (Value, MemBackend) {
+    let frame = |c: Value| {
+        Value::record(&[
+            ("left", Value::list(vec![])),
+            ("parent", c),
+            ("right", Value::list(vec![])),
+        ])
+    };
+    let mut be = MemBackend::new();
+    be.metas.insert(ROOT_ID.to_string(), meta(ROOT_ID, "Root", 1_700_000_000).1);
+    let mut frames = vec![frame(commit(ROOT_ID, "", &[], vec![]))];
+    let mut parent = ROOT_ID.to_string();
+    let n = chain.len();
+    let mut focus = None;
+    for (k, (id, msg, files)) in chain.into_iter().enumerate() {
+        be.metas.insert(id.to_string(), meta(id, "M", 1_700_000_100 + k as i64).1);
+        be.parents.insert(id.to_string(), vec![parent]);
+        let c = commit(id, msg, &[], files);
+        if k + 1 == n {
+            focus = Some(c);
+        } else {
+            frames.push(frame(c));
+        }
+        parent = id.to_string();
+    }
+    frames.reverse();
+    let repo = Value::record(&[
+        ("children", Value::list(vec![])),
+        ("context", Value::list(frames)),
+        ("root", focus.unwrap()),
+    ]);
+    (repo, be)
+}
+
+#[test]
+fn commit_block_marks_deletions_and_draws_the_tree_glyph() {
+    // a deleted path was missing from the block, an unchanged one listed, an
+    // ancestor of the focus drawn as the focus, and an empty commit never
+    // drawn `◌` (§5.1; specs/tree.md §Glyphs)
+    //
+    // root -> a -> b (edits f, deletes g) -> c (the focus, b's files: empty)
+    let (repo, be) = linear_repo(vec![
+        ("kpqxaaaa", "msg-a", vec![("f.txt", "one\n"), ("g.txt", "g\n")]),
+        ("kpqxbbbb", "msg-b", vec![("f.txt", "two\n")]),
+        ("kpqxcccc", "msg-c", vec![("f.txt", "two\n")]),
+    ]);
+    let (mut i, cfg) = make_interp(be);
+    let tree = eval_and_display(&mut i, &cfg, "tree", repo.clone());
+    let b = eval_and_display(&mut i, &cfg, "\\r -> (up r).root", repo.clone());
+    let lines: Vec<&str> = b.lines().collect();
+    assert_eq!(tree_glyph(&tree, "msg-b"), '●', "{}", tree);
+    assert_eq!(lines[0], "● kpqxbbbb  msg-b", "{}", b);
+    assert!(lines[1].starts_with("  M · ") && lines[1].ends_with(" · 2 files"), "{}", b);
+    assert_eq!(lines[2..], ["", "  ~ f.txt", "  − g.txt"], "{}", b);
+    // the focus changes nothing: no paths under it
+    let c = eval_and_display(&mut i, &cfg, "focus", repo.clone());
+    let lines: Vec<&str> = c.lines().collect();
+    assert_eq!(tree_glyph(&tree, "msg-c"), '◌', "{}", tree);
+    assert_eq!(lines[0], "◌ kpqxcccc  msg-c", "{}", c);
+    assert!(lines[1].ends_with(" · 0 files"), "{}", c);
+    assert_eq!(lines.len(), 2, "{}", c);
+    // a list holding commits among other values prints each one's block
+    let both = eval_and_display(&mut i, &cfg, "\\r -> [(up r).root r.root 1]", repo);
+    assert_eq!(both, format!("{}\n{}\n1\n", b, c));
+}
+
 // ----------------------------------------------------------------------
 // The jj backend differs from the default in-memory one in two ways that
 // changed behaviour and were invisible to the suite: a commit's `files` is a

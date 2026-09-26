@@ -823,6 +823,42 @@ fn tree_data_sizes_commits_by_their_changes() {
 }
 
 #[test]
+fn focus_lists_the_paths_the_commit_changes() {
+    // `j focus` listed the whole snapshot, counted and unmarked, so a deleted
+    // file never showed, and any commit shown as a block was drawn as the
+    // focus (§5.1)
+    let r = setup();
+    r.write("a.txt", "a\n");
+    r.write("b.txt", "b\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "a2\n");
+    std::fs::remove_file(r.dir.join("b.txt")).unwrap();
+    r.write("c.txt", "c\n");
+    r.j(&["describe \"B\""]).ok();
+    let out = r.j(&["focus"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("◉ ") && lines[0].ends_with("  B"), "{}", out);
+    assert!(lines[1].ends_with(" · 3 files"), "{}", out);
+    assert_eq!(lines[2..], ["", "  ~ a.txt", "  − b.txt", "  + c.txt"], "{}", out);
+    // the parent is drawn as `tree` draws it
+    let out = r.j(&["\\r -> (up r).root"]).ok().stdout;
+    let tree = r.j(&["tree"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(tree_row(&tree, "A").contains('●'), "{}", tree);
+    assert!(lines[0].starts_with("● ") && lines[0].ends_with("  A"), "{}", out);
+    assert!(lines[1].ends_with(" · 2 files"), "{}", out);
+    assert_eq!(lines[2..], ["", "  + a.txt", "  + b.txt"], "{}", out);
+    // a new commit changes nothing
+    r.j(&["new"]).ok();
+    let out = r.j(&["focus"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("◌ "), "{}", out);
+    assert!(lines[1].ends_with(" · 0 files"), "{}", out);
+    assert_eq!(lines.len(), 2, "{}", out);
+}
+
+#[test]
 fn redo_twice_in_a_row() {
     // the second redo followed the redo marker to the undo it reversed and
     // restored *that* view, instead of looking outward for an undo that had
