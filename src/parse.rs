@@ -1,6 +1,6 @@
 //! Parser for the j language (§3.2–3.4), including the two layout rules.
 
-use crate::ast::{Expr, Item, Pattern, TypeExpr};
+use crate::ast::{Expr, Item, Pattern, Source, TypeExpr};
 use crate::lex::{lex, LexError, SpTok, Tok};
 use num_bigint::BigInt;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -31,6 +31,8 @@ impl From<LexError> for ParseError {
 }
 
 pub struct Parser {
+    /// the text being parsed, of which each lambda keeps its span (§5.2)
+    src: Rc<str>,
     toks: Vec<SpTok>,
     pos: usize,
     /// Names in scope (top-level + builtins) for the no-shadowing rule.
@@ -81,6 +83,7 @@ fn is_nonassoc(op: &str) -> bool {
 impl Parser {
     pub fn new(src: &str, outer_names: Rc<BTreeSet<String>>) -> Result<Self, ParseError> {
         Ok(Parser {
+            src: Rc::from(src),
             toks: lex(src)?,
             pos: 0,
             outer_names,
@@ -832,6 +835,7 @@ impl Parser {
                 Ok(Expr::Record(fields))
             }
             Tok::LParen => {
+                let open = self.toks[self.pos].clone();
                 self.bump();
                 // (op) | (op expr) | (expr op) | (expr)
                 if let Tok::Op(o) = self.peek().clone() {
@@ -865,7 +869,7 @@ impl Parser {
                     return Ok(Expr::Lambda(
                         vec![Pattern::Var(var)],
                         Rc::new(body),
-                        "section".into(),
+                        self.source_slice(&open),
                     ));
                 }
                 let first = self.parse_expr(min_col)?;
@@ -882,7 +886,7 @@ impl Parser {
                     return Ok(Expr::Lambda(
                         vec![Pattern::Var(var)],
                         Rc::new(body),
-                        "section".into(),
+                        self.source_slice(&open),
                     ));
                 }
                 self.expect(&Tok::RParen)?;
@@ -895,9 +899,16 @@ impl Parser {
         }
     }
 
-    fn source_slice(&self, _start: &SpTok) -> String {
-        // source text of a lambda for display; we re-render from the AST.
-        String::new()
+    /// The source of a lambda or section, from its first token `start` to
+    /// the last token consumed, for its rendering (§5.2: exactly as
+    /// written). Line breaks the layout rules skipped looking for more of it
+    /// are not part of it, nor is a comment after its last token.
+    fn source_slice(&self, start: &SpTok) -> Source {
+        let mut last = self.pos - 1;
+        while matches!(self.toks[last].tok, Tok::Newline) {
+            last -= 1;
+        }
+        Source::new(self.src.clone(), start.start, self.toks[last].end)
     }
 
     /// Parse a single command-line expression. Layout rule 1 does not apply.

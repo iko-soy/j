@@ -29,7 +29,7 @@ pub enum Expr {
     LabelLit(String),
     PathLit(Vec<String>),
     Bool(bool),
-    Lambda(Vec<Pattern>, Rc<Expr>, String), // params, body, source text
+    Lambda(Vec<Pattern>, Rc<Expr>, Source), // params, body, source text
     If(Rc<Expr>, Rc<Expr>, Rc<Expr>),
     Let(Vec<(String, Rc<Expr>)>, Rc<Expr>),
     App(Rc<Expr>, Rc<Expr>),
@@ -43,6 +43,34 @@ pub enum Expr {
     /// an explicitly parenthesised expression (for non-assoc chain checks)
     Paren(Rc<Expr>),
     Crash, // internal marker if needed
+}
+
+/// The source text of a lambda or section, exactly as written, which is how
+/// its closure renders (§5.2): a span of the program text it was parsed
+/// from. The lambdas of one program share that text instead of each holding
+/// a copy, so nested lambdas cost a span each, not their text again.
+#[derive(Clone)]
+pub struct Source {
+    text: Rc<str>,
+    start: usize,
+    end: usize,
+}
+
+impl Source {
+    /// The bytes `start..end` of `text`, which must fall on char boundaries.
+    pub fn new(text: Rc<str>, start: usize, end: usize) -> Self {
+        Source { text, start, end }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text[self.start..self.end]
+    }
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]

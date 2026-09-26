@@ -208,9 +208,8 @@ fn show_renders_literals() {
     check!(i, cfg, "show (++)", Value::text("(++)"));
     check!(i, cfg, "show Commit", Value::text("Commit"));
     check!(i, cfg, "show id", Value::text("id"));
-    // lambda shows its source
-    let v = ok(&mut i, &cfg, "show (\\x -> x + 1)");
-    assert!(v.as_text().unwrap().contains("x"), "{}", v.as_text().unwrap());
+    // lambda shows its source, exactly as written (§5.2)
+    check!(i, cfg, "show (\\x -> x + 1)", Value::text("\\x -> x + 1"));
 }
 
 #[test]

@@ -122,25 +122,27 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
         }
         FunVal::Closure {
             name: None,
-            applied,
+            applied_args,
             params,
             body,
             src,
             ..
         } => {
-            if *applied == 0 {
-                if src.is_empty() || src == "section" {
-                    crate::parse::render_lambda(params, body)
-                } else {
-                    src.clone()
-                }
+            // a lambda or section renders as its source, exactly as written
+            // (§5.2); only an AST built without source is re-rendered
+            let base = if src.as_str().is_empty() {
+                crate::parse::render_lambda(params, body)
             } else {
-                let base = if src.is_empty() || src == "section" {
-                    crate::parse::render_lambda(params, body)
-                } else {
-                    src.clone()
-                };
-                format!("({}) <applied>", base)
+                src.as_str().to_string()
+            };
+            if applied_args.is_empty() {
+                base
+            } else {
+                // partial application: the lambda, parenthesised as it is not
+                // atomic, followed by the arguments supplied so far (§5.2)
+                let args: Vec<String> =
+                    applied_args.iter().map(|a| render_atom(interp, a)).collect();
+                format!("({}) {}", base, args.join(" "))
             }
         }
         FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a), render_atom(interp, b)),
@@ -157,12 +159,27 @@ fn render_atom(interp: &Interp, v: &Value) -> String {
     let atomic = matches!(
         v,
         Value::Int(_) | Value::Text(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) | Value::List(_)
-    );
+    ) || is_section(v);
     let s = render(interp, v);
     if atomic {
         s
     } else {
         format!("({})", s)
+    }
+}
+
+/// A section renders as its source, `(op e)` or `(e op)` (§5.2), which is
+/// already an atom (§3.4) and takes no parentheses of its own. A lambda's
+/// source begins with its `\` instead, and a section, taking one argument,
+/// is never partially applied.
+fn is_section(v: &Value) -> bool {
+    match v {
+        Value::Fun(f) => matches!(
+            f.as_ref(),
+            FunVal::Closure { name: None, applied_args, src, .. }
+                if applied_args.is_empty() && src.as_str().starts_with('(')
+        ),
+        _ => false,
     }
 }
 
@@ -227,7 +244,8 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
                         | Value::Shape(_)
                         | Value::List(_)
                         | Value::Record(_)
-                ) {
+                ) || is_section(x)
+                {
                     out.push_str(&s);
                 } else {
                     out.push_str(&format!("({})", s));

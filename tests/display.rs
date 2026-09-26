@@ -242,6 +242,26 @@ fn show_of_focus() {
 }
 
 #[test]
+fn functions_display_as_written() {
+    // §5.1: a function displays as its name, its lambda source, or `f arg …`
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(
+        &mut i,
+        &cfg,
+        "{ f = (+ 1), g = \\x -> [(\\y -> y) x], h = (\\x y -> x) 1, k = map (1 +) }",
+        repo,
+    );
+    let rows: Vec<&str> = out.lines().map(str::trim_end).collect();
+    assert_eq!(
+        rows,
+        ["f  (+ 1)", "g  \\x -> [(\\y -> y) x]", "h  (\\x y -> x) 1", "k  map (1 +)"],
+        "{}",
+        out
+    );
+}
+
+#[test]
 fn conflicts_table() {
     // a repo where the focus has an unresolved file
     let (repo, be) = sample_repo();

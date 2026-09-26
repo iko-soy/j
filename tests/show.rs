@@ -233,6 +233,89 @@ fn show_partial_application() {
     assert_eq!(s, "describe \"wip\"", "{}", s);
 }
 
+/// `show` of the value `src` evaluates to.
+fn show_of(i: &mut Interp, cfg: &config::Config, src: &str) -> String {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(src, outer).unwrap_or_else(|e| panic!("{:?}: {}", src, e.msg));
+    let env = i.global_env();
+    let v = i.eval(&Rc::new(e), &env).unwrap_or_else(|c| panic!("{:?}: {}", src, c.msg));
+    show(i, &v)
+}
+
+#[test]
+fn show_lambda_is_its_source_as_written() {
+    // §5.2: a lambda closure renders as its source text, exactly as written.
+    // Re-rendered from the AST it lost parentheses and printed a different
+    // program: `\x -> head (x).a` selects before it takes the head.
+    let (mut i, cfg) = make_interp();
+    for (src, want) in [
+        ("\\x -> (head x).a", "\\x -> (head x).a"),
+        ("\\x -> (if x then 1 else 2) + 1", "\\x -> (if x then 1 else 2) + 1"),
+        ("\\x -> (\\y -> y) x", "\\x -> (\\y -> y) x"),
+        ("\\x -> [(\\y -> y) x]", "\\x -> [(\\y -> y) x]"),
+        ("\\x -> (map id x).a", "\\x -> (map id x).a"),
+        ("\\x->x+1", "\\x->x+1"),
+        // escapes as typed (§3.1), not Rust's `\u{…}`
+        ("\\x -> \"a\\tb\\\"c\" ++ x", "\\x -> \"a\\tb\\\"c\" ++ x"),
+        ("\\x -> 'e\u{301}' ++ x", "\\x -> 'e\u{301}' ++ x"),
+        // a comment inside is part of what was written; a line break and a
+        // comment after the body are not
+        ("\\x -> x {- one -} + 1", "\\x -> x {- one -} + 1"),
+        ("\\x ->\n  x + 1", "\\x ->\n  x + 1"),
+        ("(\\x -> x -- trailing\n  )", "\\x -> x"),
+        ("if true then \\x -> x\n  else \\y -> y", "\\x -> x"),
+        // multi-byte characters before the lambda do not shift its span
+        ("let t = \"日本語…\" in \\x -> x ++ t", "\\x -> x ++ t"),
+    ] {
+        assert_eq!(show_of(&mut i, &cfg, src), want, "for {:?}", src);
+    }
+}
+
+#[test]
+fn show_section_is_its_source_as_written() {
+    // §5.2: a section is a lambda closure, and its source is the section
+    // (§3.4), not the desugared `\$sec1 -> ($sec1 + 1)`; being an atom, it
+    // takes no parentheses of its own in a list or as an argument
+    let (mut i, cfg) = make_interp();
+    assert_eq!(show_of(&mut i, &cfg, "(+ 1)"), "(+ 1)");
+    assert_eq!(show_of(&mut i, &cfg, "(1 +)"), "(1 +)");
+    assert_eq!(show_of(&mut i, &cfg, "(++ [\"x\"])"), "(++ [\"x\"])");
+    assert_eq!(show_of(&mut i, &cfg, "( {- c -} + (1 * 2))"), "( {- c -} + (1 * 2))");
+    assert_eq!(show_of(&mut i, &cfg, "[(+ 1) (\\x -> x)]"), "[(+ 1) (\\x -> x)]");
+    assert_eq!(show_of(&mut i, &cfg, "map (* 2)"), "map (* 2)");
+}
+
+#[test]
+fn show_partial_application_of_a_lambda() {
+    // §5.2: the function's rendering, parenthesised since a lambda is not
+    // atomic, then the arguments supplied so far; not `(…) <applied>`
+    let (mut i, cfg) = make_interp();
+    assert_eq!(show_of(&mut i, &cfg, "(\\x y -> x + y) 1"), "(\\x y -> x + y) 1");
+    assert_eq!(
+        show_of(&mut i, &cfg, "(\\x y z -> x) (+ 1) ({ a = [2] })"),
+        "(\\x y z -> x) (+ 1) ({ a = [2] })"
+    );
+    assert_eq!(
+        show_of(&mut i, &cfg, "[((\\f x -> f x) (\\y -> y))]"),
+        "[((\\f x -> f x) (\\y -> y))]"
+    );
+    // and the rendering is a function that behaves the same
+    let shown = show_of(&mut i, &cfg, "(\\x y -> x - y) 10");
+    assert_eq!(show_of(&mut i, &cfg, &format!("({}) 3", shown)), "7");
+}
+
+#[test]
+fn show_lambda_from_config_is_its_source() {
+    // the span is cut from the text the lambda was parsed from: here the
+    // config, whose comments hold multi-byte characters before it
+    let src = format!("{}\nshowMe = {{ inc = \\x -> x {{- one -}} + 1, sec = (+ 1) }}\n", CONFIG);
+    let cfg = config::load_config(&src).expect("config with an extra definition must load");
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).expect("config must evaluate");
+    assert_eq!(show_of(&mut i, &cfg, "showMe.inc"), "\\x -> x {- one -} + 1");
+    assert_eq!(show_of(&mut i, &cfg, "showMe.sec"), "(+ 1)");
+}
+
 #[test]
 fn show_id_full() {
     let (i, _cfg) = make_interp();

@@ -656,6 +656,10 @@ truncates.
 | lambda closure | its source text, exactly as written |
 | partial application | the function's rendering followed by the arguments' renderings, each parenthesised if not atomic: `describe "wip"`, `at (parents) (describe "x")` |
 
+A lambda's source text runs from its `\` to the last token of its body,
+comments within it included, and a section's is the section itself, which
+unlike a lambda is an atom: `map (+ 1)`, `(\x y -> x + y) 1`.
+
 Line breaking: one line if it fits in 80 columns (display width, as in §5.1);
 otherwise the outermost list or record breaks one element per line, two-space
 indented, with leading commas for records and nothing between list elements,

@@ -355,7 +355,8 @@ pub enum FunVal {
         deferred: bool,
         body: Rc<Expr>,
         env: Env,
-        src: String,
+        /// the lambda's source, which it renders as (§5.2)
+        src: crate::ast::Source,
         /// contract of this function as further arguments arrive
         pending: Option<(String, Rc<crate::shape::ContractExpr>)>,
     },
