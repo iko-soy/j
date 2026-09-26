@@ -95,39 +95,24 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     }
 
     // pair signatures with definitions; a signature must immediately precede
-    // its definition (blank lines/comments fine — items between are not)
-    let mut prev_sig: Option<String> = None;
-    for item in &items {
-        match item {
-            Item::Signature(name, _, _) => {
-                prev_sig = Some(name.clone());
-            }
-            Item::Definition(name, _, _) => {
-                if let Some(s) = &prev_sig {
-                    if s != name {
-                        // signature not immediately followed by its definition
-                        if def_names.contains(s) {
-                            return verr(format!(
-                                "the signature for `{}` is not immediately followed by its definition",
-                                s
-                            ));
-                        }
-                    }
-                }
-                prev_sig = None;
-            }
-            Item::TypeDecl(_, _) => {
-                prev_sig = None;
+    // its definition (blank lines/comments fine — items between are not, a
+    // typedecl or another signature included). A builtin's signature has no
+    // definition, so any item, or the end of the file, may follow it.
+    let mut prev_sig: Option<&String> = None;
+    for item in items.iter().map(Some).chain([None]) {
+        if let Some(s) = prev_sig {
+            let paired = matches!(item, Some(Item::Definition(name, _, _)) if name == s);
+            if !paired && def_names.contains(s) {
+                return verr(format!(
+                    "the signature for `{}` is not immediately followed by its definition",
+                    s
+                ));
             }
         }
-    }
-    if let Some(s) = &prev_sig {
-        if def_names.contains(s) {
-            return verr(format!(
-                "the signature for `{}` is not immediately followed by its definition",
-                s
-            ));
-        }
+        prev_sig = match item {
+            Some(Item::Signature(name, _, _)) => Some(name),
+            _ => None,
+        };
     }
 
     let mut builtin_names: HashSet<String> = HashSet::new();

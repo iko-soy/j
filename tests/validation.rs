@@ -306,6 +306,28 @@ fn signature_must_precede_definition() {
 }
 
 #[test]
+fn no_item_between_signature_and_definition() {
+    // §3.4, §6.2.2: a typedecl or another signature is an item too; either
+    // used to detach the signature silently and still attach it as `f`'s
+    // contract
+    for between in ["T = Int\n", "g : Int\ng = 1\n"] {
+        let e = cfg_err(&format!("{}\nf : Int\n{}f = 2\n", MINIMAL, between));
+        assert!(
+            e.contains("the signature for `f` is not immediately followed"),
+            "{:?}: {}",
+            between,
+            e
+        );
+    }
+    // a builtin's signature has no definition to precede
+    config::load_config(&format!(
+        "{}\nlength : [a] -> Int\nT = Int\nnull : [a] -> Bool\nf : Int\nf = 1\n",
+        MINIMAL
+    ))
+    .expect("builtin signatures may be followed by any item");
+}
+
+#[test]
 fn user_must_be_wellformed() {
     let cfg = config::load_config("user = { name = \"\", email = \"a\" }\nimmutable = \\_ -> []\ntree = \\_ -> \"\"\nlabelled = \\_ _ -> []\n").unwrap();
     let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
