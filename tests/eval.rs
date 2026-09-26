@@ -210,6 +210,62 @@ fn shapes_as_values() {
     assert!(m.contains("shape"), "{}", m);
 }
 
+/// The reference config with `extra` appended, loaded and evaluated.
+fn make_interp_with(extra: &str) -> (Interp, config::Config) {
+    let src = format!("{}\n{}", CONFIG, extra);
+    let cfg = config::load_config(&src).expect("config must load");
+    let mut interp = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut interp, &cfg).expect("config must evaluate");
+    (interp, cfg)
+}
+
+#[test]
+fn cyclic_alias_is_not_a_usable_shape() {
+    // §4.12, §4.7: an alias that never reaches a type is a catchable crash
+    // when used as a shape. Resolving it recursed until the native stack
+    // overflowed (an abort `or` cannot catch), and so did displaying any
+    // record, since display asks every typedecl for its shape.
+    let (mut i, cfg) = make_interp_with("Self = Self\nA = B\nB = A\n");
+    for name in ["Self", "A", "B"] {
+        let m = crash(&mut i, &cfg, name);
+        assert!(m.contains(&format!("`{}` does not name a usable shape", name)), "{}", m);
+    }
+    check!(i, cfg, "Self or 1", Value::int(1));
+    check!(i, cfg, "A or 7", Value::int(7));
+    let m = crash(&mut i, &cfg, "extract Self [1]");
+    assert!(m.contains("usable shape"), "{}", m);
+    let rec = ok(&mut i, &cfg, "{ a = 1 }");
+    assert_eq!(j::render::display(&mut i, &rec, false).unwrap(), "a  1\n");
+}
+
+#[test]
+fn cyclic_alias_in_a_signature_loads() {
+    // §4.13: an alias of a function type is unfolded into the contract.
+    // Unfolding a cyclic alias never stopped, so every run hung at load; a
+    // self-referring function alias is unfolded once, and its result is
+    // checked as the alias itself.
+    let (mut i, cfg) = make_interp_with(
+        "A = B\nB = A\n\nf : A\nf = 1\n\nStream = Int -> Stream\n\ng : Stream\ng = \\x -> g\n",
+    );
+    check!(i, cfg, "f", Value::int(1));
+    let v = ok(&mut i, &cfg, "g 1 2 3");
+    assert!(matches!(v, Value::Fun(_)));
+    let m = crash(&mut i, &cfg, "g 1 \"x\"");
+    assert!(m.contains("g expected Int as argument 1, got Text"), "{}", m);
+}
+
+#[test]
+fn alias_of_an_undeclared_type_is_not_a_usable_shape() {
+    // §4.12: an alias takes its type's shape, and an undeclared type's shape
+    // is a crash when used. It used to be a shape nothing matched, so
+    // `extract Foo xs` quietly returned [].
+    let (mut i, cfg) = make_interp_with("Foo = Bar\n");
+    let m = crash(&mut i, &cfg, "Foo");
+    assert!(m.contains("`Foo` does not name a usable shape"), "{}", m);
+    let m = crash(&mut i, &cfg, "extract Foo [1 \"a\"]");
+    assert!(m.contains("usable shape"), "{}", m);
+}
+
 #[test]
 fn new_id_mints_distinct_ids() {
     let (mut i, cfg) = make_interp();

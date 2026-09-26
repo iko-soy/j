@@ -336,9 +336,6 @@ impl PrimKind {
 pub enum ShapeKind {
     Record(BTreeSet<String>),
     Prim(PrimKind),
-    /// an alias that could not be resolved to a record shape yet (function,
-    /// list, or a typedecl processed later); resolved lazily at check time
-    Aliased(String),
 }
 
 #[derive(Clone, Debug)]

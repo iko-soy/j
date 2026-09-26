@@ -476,7 +476,8 @@ A type name used in an expression evaluates to a *shape*: for a `typedecl`
 whose type is a record, the set of its field names; for a primitive kind
 (`Int`, `Text`, `Bool`, `Id`, `Blob`), that kind; for a `typedecl` that is an
 alias of another type, that type's shape. A shape whose type is a function
-(`Edit`, `Revset`), a list, or undeclared is a crash when used.
+(`Edit`, `Revset`), a list, or undeclared is a crash when used, as is an
+alias that never reaches a type (`A = B` with `B = A`).
 
 `extract S v` returns every subvalue of `v` that is an `S`, as a list. It
 walks lists in order and records in ascending field-name order, descending
@@ -517,7 +518,7 @@ field values:
 | `{ a : T, … }`, or a shape name | the value is a record with exactly those field names |
 | `A -> B` | the value is a function |
 | a type variable | anything |
-| an alias (`Edit`, `Revset`, `Snapshot`) | the type it stands for; an alias of a function type is unfolded so that further arguments and the final result are checked against it (`at : Revset -> Edit -> Edit` checks three arguments and a `Repo` result) |
+| an alias (`Edit`, `Revset`, `Snapshot`) | the type it stands for; an alias of a function type is unfolded so that further arguments and the final result are checked against it (`at : Revset -> Edit -> Edit` checks three arguments and a `Repo` result); an alias the unfolding has already unfolded is not unfolded again, so `Stream = Int -> Stream` checks one argument and a function result |
 
 Field values and list elements are not checked because that would make every
 call cost the size of the value and would force lazily backed snapshots and
