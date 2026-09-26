@@ -279,9 +279,36 @@ fn unified_diff_no_trailing_newline() {
     assert!(d.contains("-b\n"), "{}", d);
     assert!(d.contains("+c\n"), "{}", d);
     assert!(!d.contains("\n\n"), "spurious blank line: {:?}", d);
-    // and with a trailing newline the output is identical
+    // and neither does one with a trailing newline
     let with_nl = unified_diff("a\nb\n", "a\nc\n");
     assert!(!with_nl.contains("\n\n"), "{:?}", with_nl);
+}
+
+#[test]
+fn unified_diff_marks_missing_newline() {
+    // a line with no terminator is followed by the marker GNU diff and git
+    // print; without it, dropping or adding the final newline shows as the
+    // same line removed and re-added, and both directions look alike
+    const MARK: &str = "\\ No newline at end of file\n";
+    assert_eq!(
+        unified_diff("a\nb\n", "a\nb"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n+b\n{}", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb", "a\nb\n"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n{}+b\n", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb", "a\nc"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\n{}+c\n{}", MARK, MARK)
+    );
+    // an unterminated context line is marked too
+    assert_eq!(
+        unified_diff("a\nb", "x\nb"),
+        format!("@@ -1,2 +1,2 @@\n-a\n+x\n b\n{}", MARK)
+    );
+    // terminated lines get no marker
+    assert!(!unified_diff("a\nb\n", "a\nc\n").contains("No newline"));
 }
 
 #[test]

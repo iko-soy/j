@@ -270,12 +270,19 @@ pub fn unified_diff(a: &str, b: &str) -> String {
             };
             out.push_str(sign);
             let text = change.to_string();
-            // similar yields the line with its terminator when present; the
-            // last line of a file without a trailing newline has none, so add
-            // one to keep the diff line-oriented
+            // similar yields the line with its terminator when present (and
+            // supplies a `\n` for the last line of a text without a trailing
+            // newline); a lone `\r` also ends a line for it, so add a `\n` to
+            // keep the diff line-oriented
             out.push_str(&text);
             if !text.ends_with('\n') {
                 out.push('\n');
+            }
+            // mark a line that had no terminator, as GNU diff and git do:
+            // otherwise dropping the final newline shows as the same line
+            // removed and re-added, alike in both directions
+            if change.missing_newline() {
+                out.push_str("\\ No newline at end of file\n");
             }
         }
     }
