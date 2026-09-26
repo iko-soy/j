@@ -706,6 +706,43 @@ fn tree_row<'a>(out: &'a str, msg: &str) -> &'a str {
 }
 
 #[test]
+fn dry_run_tree_glyphs_come_from_the_edited_history() {
+    // `⊗` and `◌` were read off the stored commits by change id, so a dry run
+    // drew what is stored rather than what the edit would produce (§1.2): a
+    // rebase that conflicts showed no `⊗`, an edit that resolves a stored
+    // conflict kept it, and emptying a commit left its glyph and its
+    // untouched child's as they were
+    let r = setup();
+    r.write("f.txt", "base\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("f.txt", "left\n");
+    r.j(&["describe \"left\""]).ok();
+    r.j(&["describe \"tip\" . new"]).ok();
+    // `right`: a sibling of `left` on `base`
+    r.j(&["new . prev . prev"]).ok();
+    r.write("f.txt", "right\n");
+    r.j(&["describe \"right\""]).ok();
+
+    let out = r.j(&["tree . rebase siblings"]).ok().stdout;
+    assert!(tree_row(&out, "right").contains('⊗'), "conflict not drawn:\n{}", out);
+
+    let emptied = "tree . at siblings (\\r -> r { root = r.root { files = (up r).root.files } })";
+    let out = r.j(&[emptied]).ok().stdout;
+    assert!(tree_row(&out, "left").contains('◌'), "emptied commit not empty:\n{}", out);
+    assert!(!tree_row(&out, "tip").contains('◌'), "changed child still empty:\n{}", out);
+
+    // stored with the conflict, then resolved by an edit that is not persisted
+    r.j(&["rebase siblings"]).ok();
+    let out = r.j(&["tree"]).ok().stdout;
+    assert!(tree_row(&out, "right").contains('⊗'), "{}", out);
+    let resolved = "tree . (\\r -> r { root = r.root { files = (up r).root.files } })";
+    let out = r.j(&[resolved]).ok().stdout;
+    let row = tree_row(&out, "right");
+    assert!(!row.contains('⊗') && row.contains('◌'), "resolved commit drawn as {:?}:\n{}", row, out);
+}
+
+#[test]
 fn tree_draws_the_size_bar_of_the_focus_parent() {
     // the focus's parent diffs against its own parent, whose file list was
     // only loaded when that grandparent was the root: every other parent of

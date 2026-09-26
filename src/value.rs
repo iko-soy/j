@@ -64,6 +64,12 @@ impl std::ops::Deref for ListVal {
 
 pub struct ThunkVal {
     state: std::cell::RefCell<ThunkState>,
+    /// for a commit's `files` as the backend built them: the change id of the
+    /// stored commit whose tree this loads. An edit that changes the files
+    /// replaces the thunk, so a commit still holding the one tagged with its
+    /// own id holds exactly the stored tree — the only case in which the
+    /// backend's answers about that tree describe the value (§7.2).
+    origin: Option<String>,
 }
 
 enum ThunkState {
@@ -84,7 +90,21 @@ impl ThunkVal {
     pub fn new(f: impl FnOnce() -> Result<Value, Crash> + 'static) -> Self {
         ThunkVal {
             state: std::cell::RefCell::new(ThunkState::Pending(Box::new(f))),
+            origin: None,
         }
+    }
+
+    /// the lazy `files` of the stored commit with change id `origin`
+    pub fn stored(origin: String, f: impl FnOnce() -> Result<Value, Crash> + 'static) -> Self {
+        ThunkVal {
+            origin: Some(origin),
+            ..ThunkVal::new(f)
+        }
+    }
+
+    /// the change id of the stored commit whose tree this loads, if any
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     /// the value, computing it on first call and memoizing

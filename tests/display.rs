@@ -347,8 +347,12 @@ fn lazy_commit(id: &str, msg: &str, files: Vec<(&str, &str)>) -> Value {
             ])
         })
         .collect();
+    lazy_commit_of(id, msg, entries)
+}
+
+fn lazy_commit_of(id: &str, msg: &str, entries: Vec<Value>) -> Value {
     Value::record(&[
-        ("files", j::domain::lazy_files(entries)),
+        ("files", j::domain::lazy_files(id, entries)),
         ("id", Value::Id(Rc::new(id.to_string()))),
         ("labels", Value::list(vec![])),
         ("message", Value::text(msg)),
@@ -453,5 +457,120 @@ fn tree_draws_the_focus_parents_bar_when_files_are_lazy() {
     for (msg, bar) in [("commit 0", false), ("commit 1", true), ("commit 2", true)] {
         let row = out.lines().find(|l| l.ends_with(msg)).unwrap();
         assert_eq!(row.contains(bars), bar, "{:?}\n{}", row, out);
+    }
+}
+
+fn conflicted_entry(path: &str) -> Value {
+    Value::record(&[
+        (
+            "content",
+            Value::Blob(Rc::new(BlobVal {
+                kind: j::value::BlobKind::Regular,
+                content: j::value::BlobContent::Conflict(vec![
+                    Some(j::value::ConflictSide::regular(b"ours\n")),
+                    Some(j::value::ConflictSide::regular(b"base\n")),
+                    Some(j::value::ConflictSide::regular(b"theirs\n")),
+                ]),
+            })),
+        ),
+        ("path", Value::list(vec![Value::text(path)])),
+    ])
+}
+
+fn text_entry(path: &str, text: &str) -> Value {
+    Value::record(&[
+        ("content", BlobVal::text_blob(text)),
+        ("path", Value::list(vec![Value::text(path)])),
+    ])
+}
+
+#[test]
+fn tree_glyphs_of_an_edited_lazy_repo_come_from_its_files() {
+    // the backend answers `has_conflict`/`is_empty` for the *stored* commits;
+    // an edit keeps a commit's id but not its files, and the tree still drew
+    // the stored glyphs — for the edited commit and for its untouched child —
+    // wherever the focus's neighbourhood did not force a diff (§1.2 dry run)
+    //
+    // root -> a -> b (same files: stored empty) -> c (stored conflict)
+    //      -> d -> e (focus)
+    let f1 = || text_entry("f.txt", "one\n");
+    let chain: Vec<(&str, &str, Vec<Value>)> = vec![
+        ("kpqxkkkk", "msg-a", vec![f1()]),
+        ("kpqxllll", "msg-b", vec![f1()]),
+        ("kpqxmmmm", "msg-c", vec![conflicted_entry("f.txt")]),
+        ("kpqxnnnn", "msg-d", vec![conflicted_entry("f.txt"), text_entry("g.txt", "g\n")]),
+        ("kpqxoooo", "msg-e", vec![text_entry("f.txt", "two\n"), text_entry("g.txt", "g\n")]),
+    ];
+    let mut be = MemBackend::answering();
+    be.metas.insert(ROOT_ID.to_string(), meta(ROOT_ID, "Root", 1_700_000_000).1);
+    be.parents.insert(ROOT_ID.to_string(), vec![]);
+    let mut frames = vec![Value::record(&[
+        ("left", Value::list(vec![])),
+        ("parent", lazy_commit_of(ROOT_ID, "", vec![])),
+        ("right", Value::list(vec![])),
+    ])];
+    let mut parent = ROOT_ID;
+    let mut focus = None;
+    for (k, (id, msg, entries)) in chain.into_iter().enumerate() {
+        be.metas.insert(id.to_string(), meta(id, "M", 1_700_000_100 + k as i64).1);
+        be.parents.insert(id.to_string(), vec![parent.to_string()]);
+        be.empties.insert(id.to_string(), id == "kpqxllll");
+        be.conflicts.insert(id.to_string(), id == "kpqxmmmm" || id == "kpqxnnnn");
+        let c = lazy_commit_of(id, msg, entries);
+        if id == "kpqxoooo" {
+            focus = Some(c);
+        } else {
+            frames.push(Value::record(&[
+                ("left", Value::list(vec![])),
+                ("parent", c),
+                ("right", Value::list(vec![])),
+            ]));
+        }
+        parent = id;
+    }
+    frames.reverse();
+    let repo = Value::record(&[
+        ("children", Value::list(vec![])),
+        ("context", Value::list(frames)),
+        ("root", focus.unwrap()),
+    ]);
+    let (mut i, cfg) = make_interp(be);
+    let glyph = |out: &str, msg: &str| -> char {
+        let row = out
+            .lines()
+            .find(|l| l.contains(&format!("  {}", msg)))
+            .unwrap_or_else(|| panic!("no row for {:?}:\n{}", msg, out));
+        row.chars().find(|c| "◉●○◆◌⊗⌂".contains(*c)).unwrap()
+    };
+
+    // unedited: the stored answers hold
+    let out = eval_and_display(&mut i, &cfg, "tree", repo.clone());
+    assert_eq!(glyph(&out, "msg-a"), '●', "{}", out);
+    assert_eq!(glyph(&out, "msg-b"), '◌', "{}", out);
+    assert_eq!(glyph(&out, "msg-c"), '⊗', "{}", out);
+
+    for (edit, want) in [
+        // `a` emptied: it is empty now, and `b` (untouched) no longer is
+        (
+            "at (const [@kpqxkkkk]) (mapRoot (\\c -> c { files = [] }))",
+            vec![("msg-a", '◌'), ("msg-b", '●'), ("msg-c", '⊗')],
+        ),
+        // `c`'s conflict resolved to its parent's files
+        (
+            "at (const [@kpqxmmmm]) (\\r -> r { root = r.root { files = (up r).root.files } })",
+            vec![("msg-a", '●'), ("msg-b", '◌'), ("msg-c", '◌')],
+        ),
+        // `b` given `c`'s conflicted files
+        (
+            "\\r -> at (const [@kpqxllll]) (mapRoot (\\c -> c { files = (commitAt @kpqxmmmm r).files })) r",
+            vec![("msg-a", '●'), ("msg-b", '⊗'), ("msg-c", '⊗')],
+        ),
+    ] {
+        for renderer in ["tree", "treeFull"] {
+            let out = eval_and_display(&mut i, &cfg, &format!("{} . ({})", renderer, edit), repo.clone());
+            for (msg, g) in &want {
+                assert_eq!(glyph(&out, msg), *g, "{} of `{}` at {}:\n{}", msg, edit, renderer, out);
+            }
+        }
     }
 }

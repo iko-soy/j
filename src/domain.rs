@@ -42,14 +42,18 @@ pub trait Backend {
     fn meta(&self, id: &str) -> Result<MetaInfo, Crash>;
     /// True if the change id denotes a merge commit (2+ parents).
     fn is_merge(&self, id: &str) -> bool;
-    /// True if the commit's tree contains a conflict, if the backend can say
-    /// without reading files (jj: O(1)); None means "unknown, compare files".
+    /// True if the stored commit's tree contains a conflict, if the backend
+    /// can say without reading files (jj: O(1)); None means "unknown, compare
+    /// files". It describes a commit value only while that value still holds
+    /// the stored files (`ThunkVal::origin`), which is when the renderer asks.
     fn has_conflict(&self, _id: &str) -> Option<bool> {
         None
     }
-    /// True if the commit's tree equals its first parent's tree, if the
-    /// backend can say without reading files; None means "compare files".
-    fn is_empty(&self, _id: &str) -> Option<bool> {
+    /// True if the stored commit `id`'s tree equals the stored commit
+    /// `parent`'s, if the backend can say without reading files; None means
+    /// "compare files". Asked, like `has_conflict`, only for values that still
+    /// hold both stored trees.
+    fn is_empty(&self, _id: &str, _parent: &str) -> Option<bool> {
         None
     }
     /// All ancestors (inclusive) of the given change ids, through every
@@ -300,11 +304,12 @@ impl MemBackend {
 }
 
 /// A snapshot that is only materialised on first use, the way the jj backend
-/// builds a commit's `files` (§7.2). The laziness must stay invisible to the
-/// language, which is exactly what is easy to get wrong, so tests need to be
-/// able to build repos this way.
-pub fn lazy_files(entries: Vec<Value>) -> Value {
-    Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+/// builds a commit's `files` (§7.2): tagged as the stored tree of commit `id`,
+/// so a backend's answers about that commit apply while it holds this list.
+/// The laziness must stay invisible to the language, which is exactly what is
+/// easy to get wrong, so tests need to be able to build repos this way.
+pub fn lazy_files(id: &str, entries: Vec<Value>) -> Value {
+    Value::Thunk(Rc::new(crate::value::ThunkVal::stored(id.to_string(), move || {
         Ok(Value::list(entries))
     })))
 }
@@ -330,12 +335,14 @@ impl Backend for MemBackend {
         }
         Some(self.conflicts.get(id).copied().unwrap_or(false))
     }
-    fn is_empty(&self, id: &str) -> Option<bool> {
+    fn is_empty(&self, id: &str, parent: &str) -> Option<bool> {
         if !self.answers_tree_queries {
             return None;
         }
-        // like jj: only answerable against a recorded first parent
-        self.parents.get(id)?.first()?;
+        // `empties` records each commit against its first parent only
+        if self.parents.get(id)?.first()? != parent {
+            return None;
+        }
         Some(self.empties.get(id).copied().unwrap_or(false))
     }
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {

@@ -1043,6 +1043,8 @@ struct ParentSnap<'a> {
     commit: &'a Value,
     files: &'a std::cell::OnceCell<Value>,
     map: &'a std::cell::OnceCell<SnapMap>,
+    /// the commit's id when its files are still the stored tree
+    stored: Option<&'a str>,
 }
 
 impl ParentSnap<'_> {
@@ -1058,6 +1060,19 @@ impl ParentSnap<'_> {
             let _ = self.map.set(snapshot_map_of(self.files()?)?);
         }
         Ok(self.map.get().expect("just set"))
+    }
+}
+
+/// The id of the stored commit whose tree `commit`'s files are, read without
+/// loading them: the tag on the backend's lazy list (`ThunkVal::origin`). An
+/// edit that changes the files replaces that list, so this is `None` for them.
+fn stored_origin(commit: &Value) -> Option<&str> {
+    match commit {
+        Value::Record(m) => match m.get("files") {
+            Some(Value::Thunk(t)) => t.origin(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1087,9 +1102,13 @@ fn build_info(
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
     // conflict and empty are O(1) backend queries when the backend can answer
-    // them from tree ids (jj), without touching the file list at all; the
-    // in-memory backend cannot, so fall back to walking the files
-    let conflict = match interp.backend.has_conflict(&id) {
+    // them from tree ids (jj), without touching the file list at all. Those
+    // answers are about the stored commits, so they are asked only while this
+    // commit — and, for empty, its parent here — still holds its stored files:
+    // a dry run (§1.2) renders edits that keep their ids but not their files.
+    // Otherwise, as on the in-memory backend, fall back to walking the files.
+    let stored = stored_origin(commit).filter(|o| *o == id);
+    let conflict = match stored.and_then(|s| interp.backend.has_conflict(s)) {
         Some(c) => c,
         None => has_conflict(commit)?,
     };
@@ -1102,7 +1121,10 @@ fn build_info(
             matches!(c.field("root").and_then(|r| r.field("id")), Ok(Value::Id(i)) if *i == focus_id)
         });
     let want_diff = opts.detail >= 2 || is_focus_pre || child_is_focus || parent_is_focus;
-    let backend_empty = interp.backend.is_empty(&id);
+    let backend_empty = match (stored, parent_files.and_then(|p| p.stored)) {
+        (Some(me), Some(parent)) => interp.backend.is_empty(me, parent),
+        _ => None,
+    };
     // this commit's own snapshot and its map, each built on first use — here
     // or by a child that compares against it — and shared with every child
     let my_files: std::cell::OnceCell<Value> = std::cell::OnceCell::new();
@@ -1111,6 +1133,7 @@ fn build_info(
         commit,
         files: &my_files,
         map: &my_map,
+        stored,
     };
     // the files list is only materialized when something needs it: the diff
     // (detail/focus), the files data column, or the emptiness fallback
@@ -1148,14 +1171,10 @@ fn build_info(
             }
         }
         None => {
-            // the top of the history: no parent to compare against, so ask
-            // the backend, and fall back to the file count only when it could
-            // not answer (the files were loaded for exactly that case)
-            let empty = match backend_empty {
-                Some(e) => e && id != ROOT_ID,
-                None => nfiles == 0 && id != ROOT_ID,
-            };
-            (empty, None, Vec::new())
+            // the top of the history: no parent to compare against, and so no
+            // backend answer either — the files were loaded, and it is empty
+            // iff it has none (the root never counts as empty)
+            (nfiles == 0 && id != ROOT_ID, None, Vec::new())
         }
     };
     let meta = interp.backend.meta(&id).ok();

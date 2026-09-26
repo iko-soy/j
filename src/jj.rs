@@ -1962,12 +1962,12 @@ impl Backend for JjBackend {
         vis.and_then(|v| v.commits.get(id).map(|r| r.commit.has_conflict()))
     }
 
-    fn is_empty(&self, id: &str) -> Option<bool> {
+    fn is_empty(&self, id: &str, parent: &str) -> Option<bool> {
         let vis = self.inner.visible.lock().unwrap().clone();
-        // O(1): empty iff the tree id equals the first parent's tree id
+        // O(1): empty iff the tree id equals the parent's tree id
         vis.and_then(|v| {
             let rec = v.commits.get(id)?;
-            let parent = v.commits.get(&rec.first_parent)?;
+            let parent = v.commits.get(parent)?;
             Some(rec.commit.tree_ids() == parent.commit.tree_ids())
         })
     }
@@ -2428,13 +2428,15 @@ fn build_subtree(
     entries: &EntryCache,
 ) -> Result<Value, OpenError> {
     // the files list is lazy (§7.2): most commits are never inspected, so
-    // their file entries are materialized only on first `field("files")`
+    // their file entries are materialized only on first `field("files")`.
+    // Tagged with the change id, it tells the renderer when the O(1)
+    // `has_conflict`/`is_empty` answers still describe the commit's files.
     let files_thunk = {
         let store = store.clone();
         let tree = rec.commit.tree();
         let cache = cache.clone();
         let entries = entries.clone();
-        Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+        Value::Thunk(Rc::new(crate::value::ThunkVal::stored(rec.change_id.clone(), move || {
             let files = block_on(tree_to_files(&store, &tree, &cache, &entries))?;
             Ok(Value::list(files))
         })))
