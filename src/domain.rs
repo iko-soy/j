@@ -107,11 +107,42 @@ pub fn snapshot_map(entries: &[Value]) -> Result<BTreeMap<Vec<String>, Value>, C
                     .map_err(|_| Crash::new("replay: not a well-formed snapshot (path component not Text)"))
             })
             .collect::<Result<Vec<String>, Crash>>()?;
+        // `./` is the root directory, which no entry can be
+        if path.is_empty() {
+            return Err(Crash::new(
+                "replay: not a well-formed snapshot (an entry at the root path ./)",
+            ));
+        }
         if m.insert(path, content).is_some() {
             return Err(Crash::new("replay: not a well-formed snapshot (duplicate paths)"));
         }
     }
+    if let Some(p) = file_and_directory(m.keys()) {
+        return Err(Crash::new(format!(
+            "replay: not a well-formed snapshot (`{}` is both a file and a directory)",
+            p.join("/")
+        )));
+    }
     Ok(m)
+}
+
+/// The first of `sorted` paths that is also a directory of another: a tree
+/// holds `a` as a file or as a directory, never both (§7.3). A path's
+/// descendants sort directly after it (`a` < `a/b` < `a.txt`), so comparing
+/// each path with the next finds every clash.
+pub fn file_and_directory<'a>(
+    sorted: impl IntoIterator<Item = &'a Vec<String>>,
+) -> Option<&'a [String]> {
+    let mut prev: Option<&'a Vec<String>> = None;
+    for p in sorted {
+        if let Some(q) = prev {
+            if p.len() > q.len() && p.starts_with(q) {
+                return Some(q);
+            }
+        }
+        prev = Some(p);
+    }
+    None
 }
 
 pub fn map_to_snapshot(m: BTreeMap<Vec<String>, Value>) -> Vec<Value> {

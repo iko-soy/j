@@ -320,9 +320,18 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
             .iter()
             .map(|c| c.as_text().map(|s| s.to_string()))
             .collect::<Result<_, _>>()?;
+        if key.is_empty() {
+            return Err(Crash::new("persistence: a snapshot has an entry at the root path ./"));
+        }
         if !paths.insert(key) {
             return Err(Crash::new("persistence: a snapshot has duplicate paths"));
         }
+    }
+    if let Some(p) = crate::domain::file_and_directory(&paths) {
+        return Err(Crash::new(format!(
+            "persistence: a snapshot has `{}` as both a file and a directory",
+            p.join("/")
+        )));
     }
     let children = loc.field("children")?;
     for c in children.as_list()?.iter() {

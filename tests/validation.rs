@@ -118,6 +118,47 @@ fn duplicate_paths_rejected() {
     assert!(e.contains("duplicate paths"), "{}", e);
 }
 
+/// `two_commit_repo` with the focus `a` holding `files`
+fn focus_with_files(files: Vec<Value>) -> Value {
+    let old = two_commit_repo(&[]);
+    Value::record(&[
+        ("children", old.field("children").unwrap()),
+        ("context", old.field("context").unwrap()),
+        ("root", commit("kaaaaaaa", "a", &[], files)),
+    ])
+}
+
+fn entry_at(path: &[&str], content: &str) -> Value {
+    Value::record(&[
+        ("content", j::value::BlobVal::text_blob(content)),
+        ("path", Value::list(path.iter().map(|c| Value::text(*c)).collect())),
+    ])
+}
+
+#[test]
+fn root_path_entry_rejected() {
+    // `./` is the root, which cannot hold a file: persistence panicked in
+    // jj's tree builder (exit 101) while validate let it through
+    let old = two_commit_repo(&[]);
+    let new = focus_with_files(vec![entry_at(&[], "x")]);
+    let e = validate_with(&old, &new).unwrap_err();
+    assert!(e.contains("root path"), "{}", e);
+}
+
+#[test]
+fn file_and_directory_at_one_path_rejected() {
+    // a jj tree cannot hold both; persisting kept `a/b` and silently dropped
+    // the file `a`
+    let old = two_commit_repo(&[]);
+    let new = focus_with_files(vec![entry("a", "file"), entry("a/b", "nested")]);
+    let e = validate_with(&old, &new).unwrap_err();
+    assert!(e.contains("both a file and a directory"), "{}", e);
+    let deep = focus_with_files(vec![entry("d/e", "1"), entry("d/e0", "2"), entry("d/e/f/g", "3")]);
+    assert!(validate_with(&old, &deep).is_err());
+    let fine = focus_with_files(vec![entry("a.txt", "1"), entry("a/b", "2"), entry("ab", "3")]);
+    assert!(validate_with(&old, &fine).is_ok());
+}
+
 #[test]
 fn labels_cannot_change() {
     let old = two_commit_repo(&["feat"]);

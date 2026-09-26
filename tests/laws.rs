@@ -42,11 +42,15 @@ fn commit_strategy(id: String) -> impl Strategy<Value = GCommit> {
         ),
     )
         .prop_map(|(id, message, labels, files)| {
-            // unique paths
-            let mut seen = BTreeSet::new();
+            // a well-formed snapshot (§7.3): unique paths, none both a file
+            // and a directory
+            let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
             let files: Vec<(Vec<String>, String)> = files
                 .into_iter()
-                .filter(|(p, _)| seen.insert(p.clone()))
+                .filter(|(p, _)| {
+                    !seen.iter().any(|q| q.starts_with(p) || p.starts_with(q))
+                        && seen.insert(p.clone())
+                })
                 .collect();
             GCommit {
                 id,

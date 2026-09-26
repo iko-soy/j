@@ -133,6 +133,35 @@ fn replay_malformed_snapshots_crash() {
 }
 
 #[test]
+fn replay_rejects_root_entries_and_file_directory_clashes() {
+    // an entry at the root path ./ names no file: jj's tree builder panicked
+    // on it (exit 101) while this backend accepted it
+    let at_root = vec![Value::record(&[
+        ("content", BlobVal::text_blob("x")),
+        ("path", Value::list(vec![])),
+    ])];
+    for (onto, from, to) in [
+        (&at_root[..], &[][..], &[][..]),
+        (&[][..], &[][..], &at_root[..]),
+        (&[][..], &at_root[..], &[][..]),
+    ] {
+        let e = simple_replay(onto, from, to).unwrap_err();
+        assert!(e.msg.contains("not a well-formed snapshot"), "{}", e.msg);
+    }
+    // `a` as a file and a directory at once: jj's tree keeps only one of
+    // them, so the real backend silently dropped the file `a` (§7.3, §10)
+    let clash = snap(vec![entry("a", "file"), entry("a/b", "nested")]);
+    let e = simple_replay(&clash, &[], &[]).unwrap_err();
+    assert!(e.msg.contains("both a file and a directory"), "{}", e.msg);
+    let deep = snap(vec![entry("d/e", "1"), entry("d/e0", "2"), entry("d/e/f/g", "3")]);
+    assert!(simple_replay(&[], &[], &deep).is_err());
+    // sharing a prefix of a component's text is no clash
+    let fine = snap(vec![entry("a.txt", "1"), entry("a/b", "2"), entry("ab", "3")]);
+    let out = simple_replay(&fine, &fine, &fine).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b", "a.txt", "ab"]);
+}
+
+#[test]
 fn replay_identity_laws() {
     // replay b { from = b, to = x } = x
     let b = snap(vec![entry("a", "1"), entry("dir/b", "2")]);

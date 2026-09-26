@@ -769,7 +769,8 @@ an expression can make agrees with the eager value.
   jj's merge would resolve them (identical changes, changes from the current
   content, non-overlapping line-level hunks). It never crashes on content. It
   crashes if any of the three is not a well-formed snapshot (a list of `Entry`
-  records with unique paths).
+  records with unique paths, none of them the root `./`, and none both a file
+  and a directory as `./a` beside `./a/b` would be).
 - `unresolved`, `blob`, and `text` are as in §4.9. `blob` produces a regular
   file. File type (executable, symlink) travels with a `Blob` but cannot be
   changed in the language. `text` of a symlink is its target; `text` of a
@@ -802,7 +803,8 @@ recorded, described by the expression text (truncated to 200 characters).
 Within it:
 
 1. **Validate shape.** `new` has the shape of a `Repo`; every `id` occurs
-   exactly once; every snapshot has unique paths. Violations crash with a
+   exactly once; every snapshot has unique paths, none of them the root `./`
+   and none both a file and a directory (§7.3). Violations crash with a
    message naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,

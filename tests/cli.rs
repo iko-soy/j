@@ -399,6 +399,55 @@ fn crash_leaves_repo_untouched() {
 }
 
 #[test]
+fn root_path_entry_is_a_crash_not_a_panic() {
+    // jj's tree builder asserts a path is not the root: exit 101 and a Rust
+    // panic, which `or` could not catch
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"stable\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let out = r.j(&["replay [{ path = ./, content = blob \"x\" }] ({ from = [], to = [] })"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.starts_with("j: crash:"), "{}", out.stderr);
+    let out = r
+        .j(&["(show (replay [] ({ from = [], to = [{ path = ./, content = blob \"x\" }] }))) or \"caught\""])
+        .ok();
+    assert_eq!(out.stdout.trim(), "caught");
+    let edit = "mapRoot (\\c -> c { files = c.files ++ [{ path = ./, content = blob \"x\" }] })";
+    let out = r.j(&[&format!("tree . validate . {}", edit)]);
+    assert_eq!(out.code, 1, "validate accepted it: {}", out.stdout);
+    let out = r.j(&[edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("root path"), "{}", out.stderr);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+#[test]
+fn file_and_directory_at_one_path_refused() {
+    // a jj tree holds `a` as a file or as a directory, not both: persisting
+    // kept `a/b` and silently dropped the file `a`, and replay did the same,
+    // disagreeing with the in-memory backend (§7.3, §10)
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"stable\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let edit = "mapRoot (\\c -> c { files = [({ path = [\"a\"], content = blob \"x\\n\" }) ({ path = [\"a\" \"b\"], content = blob \"y\\n\" })] })";
+    let out = r.j(&[&format!("tree . validate . {}", edit)]);
+    assert_eq!(out.code, 1, "validate accepted it: {}", out.stdout);
+    let out = r.j(&[edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("both a file and a directory"), "{}", out.stderr);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.read("a.txt"), "x\n");
+    assert!(!r.dir.join("a").exists());
+    let out = r.j(&[
+        "let x = [({ path = ./a, content = blob \"file\" }) ({ path = ./a/b, content = blob \"nested\" })] in replay x ({ from = [], to = [] })",
+    ]);
+    assert_eq!(out.code, 1, "replay dropped a file: {}", out.stdout);
+    assert!(out.stderr.contains("both a file and a directory"), "{}", out.stderr);
+}
+
+#[test]
 fn split_and_contract_paths() {
     let r = setup();
     r.write("code.rs", "fn main() {}\n");
