@@ -747,7 +747,9 @@ a value as follows.
   `fetch` found the remote's `main` pointing at it — the snapshot cannot go
   into it; the focus is instead a new empty child of it holding the snapshot,
   as `abandon` would leave it, and persisting records that child. Nothing
-  else is written by loading.
+  else is written by loading. The value as loaded (§1.2 step 8) has the same
+  child holding the commit's own files, so `j id` records the child exactly
+  when the working directory differs from that commit.
 
 The record is the *semantics*. An implementation may back `files`, `children`,
 and `context` with lazily materialised structures, provided every observation

@@ -252,7 +252,8 @@ pub struct JjInner {
     repo: Mutex<Arc<ReadonlyRepo>>,
     workspace_name: WorkspaceNameBuf,
     /// visible map backing the `Backend` lookups during evaluation; filled by
-    /// build_interp with the post-snapshot map
+    /// build_interp with the post-snapshot map, or the loaded one when the
+    /// snapshot goes into a new child of an immutable focus (§7.2)
     visible: Mutex<Option<Arc<VisibleRepo>>>,
     lock_guard: Mutex<Option<FileLock>>,
     /// the snapshot's unpublished rewrite, kept between build_interp and
@@ -266,7 +267,6 @@ pub struct JjInner {
 /// holding the file keeps the flock
 pub struct FileLock(#[allow(dead_code)] std::fs::File);
 
-#[allow(dead_code)]
 struct PendingSnapshot {
     /// repo as loaded at head, before the snapshot
     pre_repo: Arc<ReadonlyRepo>,
@@ -274,6 +274,9 @@ struct PendingSnapshot {
     /// persisting operation (§1.2 step 8, §7.7)
     new_wc_id: CommitId,
     tree: MergedTree,
+    /// false when the wc commit is immutable: the snapshot then belongs to
+    /// the focus's new child (§7.2), and the wc commit is kept as stored
+    fold_into_wc: bool,
 }
 
 #[derive(Clone)]
@@ -361,7 +364,7 @@ impl JjBackend {
         let head_repo = block_on(self.inner.workspace.lock().unwrap().repo_loader().load_at_head())
             .map_err(|e| (2, format!("cannot reload the repository at head: {}", e)))?;
         *self.inner.repo.lock().unwrap() = head_repo;
-        let loaded_visible = block_on(read_visible(&self.current_repo()))?;
+        let loaded_visible = Arc::new(block_on(read_visible(&self.current_repo()))?);
         let loaded = build_repo_value(&loaded_visible, &loaded_visible.wc_change_id)?;
 
         let current = if snapshot {
@@ -373,7 +376,7 @@ impl JjBackend {
                 // no working-copy change: the repo is the one already loaded,
                 // so reuse its value instead of rebuilding it
                 None => {
-                    *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+                    *self.inner.visible.lock().unwrap() = Some(loaded_visible.clone());
                     loaded.clone()
                 }
                 Some(pending) => {
@@ -385,7 +388,7 @@ impl JjBackend {
                 }
             }
         } else {
-            *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+            *self.inner.visible.lock().unwrap() = Some(loaded_visible.clone());
             loaded.clone()
         };
 
@@ -410,24 +413,36 @@ impl JjBackend {
         // §7.2: if the focused commit is in the immutable set, the snapshot
         // cannot go into it; the focus is a new empty child of it holding the
         // snapshot, and persisting records that child
-        match self.focus_if_immutable(&mut interp, cfg, &current)? {
-            Some(adjusted) => {
-                // the persisted child is part of the loaded value too, so a
-                // run that changes nothing is a no-op
-                Ok((interp, adjusted.clone(), adjusted))
+        match self.focus_if_immutable(&mut interp, cfg, &loaded, &current)? {
+            Some((loaded, current)) => {
+                // the snapshot's rewrite of the wc commit (and its rebase of
+                // the descendants) is not the repository's: lookups answer
+                // from the stored commits, and persisting leaves the wc
+                // commit as stored rather than folding the snapshot into it
+                *self.inner.visible.lock().unwrap() = Some(loaded_visible);
+                if let Some(p) = self.inner.pending.lock().unwrap().as_mut() {
+                    p.fold_into_wc = false;
+                }
+                Ok((interp, loaded, current))
             }
             None => Ok((interp, loaded, current)),
         }
     }
 
-    /// If the focus of `current` is immutable, return a repo refocused on a
-    /// new empty child holding the focus's files (§7.2).
+    /// If the focus of `current` is immutable, return the loaded and current
+    /// repos refocused on a new empty child of it (§7.2). Both are `loaded`
+    /// with that one child added: the snapshot goes into neither the focus
+    /// nor, through a rebase, its descendants. The child holds the focus's
+    /// stored files in the loaded repo and the snapshot in the current one,
+    /// so a dirty `j id` differs from the loaded value and records the child
+    /// (§1.2 step 8).
     fn focus_if_immutable(
         &self,
         interp: &mut Interp,
         cfg: &Config,
+        loaded: &Value,
         current: &Value,
-    ) -> Result<Option<Value>, OpenError> {
+    ) -> Result<Option<(Value, Value)>, OpenError> {
         // Evaluate the config to compute the immutable set. This uses the
         // interpreter the run will go on to use, rather than a throwaway one,
         // so that the `immutable` (and the `trunk` inside it) computed here is
@@ -443,43 +458,43 @@ impl JjBackend {
         if !immutable.contains(&focus_id) {
             return Ok(None);
         }
-        // build: new empty child of the focus with the focus's files, minted id
-        let root = current.field("root").map_err(|c| (1, c.msg))?;
-        let files = root.field("files").map_err(|c| (1, c.msg))?;
-        let child = crate::value::Value::record(&[
-            ("files", files),
-            ("message", crate::value::Value::text("")),
-            ("labels", crate::value::Value::list(vec![])),
-            (
-                "id",
-                crate::value::Value::Id(Rc::new(interp.mint_id())),
-            ),
+        // the focus's location in `loaded`, pre-snapshot; the child is its
+        // last child, so every existing child sits to the left of it
+        let field = |v: &Value, name: &str| v.field(name).map_err(|c| (1, c.msg));
+        let root = field(loaded, "root")?;
+        let frame = Value::record(&[
+            ("left", field(loaded, "children")?),
+            ("parent", root.clone()),
+            ("right", Value::list(vec![])),
         ]);
-        let child_subtree = crate::value::Value::record(&[
-            ("root", child.clone()),
-            ("children", crate::value::Value::list(vec![])),
-        ]);
-        let mut new_children: Vec<Value> = current
-            .field("children")
-            .map_err(|c| (1, c.msg))?
-            .as_list()
-            .map_err(|c| (1, c.msg))?
-            .to_vec();
-        new_children.push(child_subtree);
-        let parent = crate::value::Value::record(&[
-            ("children", crate::value::Value::list(new_children)),
-            ("context", current.field("context").map_err(|c| (1, c.msg))?),
-            ("root", root),
-        ]);
-        // refocus onto the child (it is the last child)
-        let child_id = match child.field("id").map_err(|c| (1, c.msg))? {
-            Value::Id(i) => i.to_string(),
-            _ => unreachable!(),
+        let mut frames = vec![frame];
+        frames.extend_from_slice(field(loaded, "context")?.as_list().map_err(|c| (1, c.msg))?);
+        let context = Value::list(frames);
+        let id = Value::Id(Rc::new(interp.mint_id()));
+        let at_child = |files: Value| {
+            Value::record(&[
+                ("children", Value::list(vec![])),
+                ("context", context.clone()),
+                (
+                    "root",
+                    Value::record(&[
+                        ("files", files),
+                        ("id", id.clone()),
+                        ("labels", Value::list(vec![])),
+                        ("message", Value::text("")),
+                    ]),
+                ),
+            ])
         };
-        crate::repo::by_id(&parent, &child_id)
-            .map_err(|c| (1, c.msg))?
-            .ok_or_else(|| (1, "internal: cannot refocus".to_string()))
-            .map(Some)
+        let current_at_child = at_child(field(&field(current, "root")?, "files")?);
+        // with nothing snapshotted `current` is `loaded` itself: share one
+        // value, so a run that changes nothing is a no-op without comparing
+        // the whole repository
+        let loaded_at_child = match (loaded, current) {
+            (Value::Record(a), Value::Record(b)) if Rc::ptr_eq(a, b) => current_at_child.clone(),
+            _ => at_child(field(&root, "files")?),
+        };
+        Ok(Some((loaded_at_child, current_at_child)))
     }
 
     /// Snapshot the working copy into the wc commit; returns the repo at the
@@ -559,6 +574,7 @@ impl JjBackend {
             pre_repo: self.current_repo(),
             new_wc_id: new_wc.id().clone(),
             tree: new_wc.tree().clone(),
+            fold_into_wc: true,
         };
         Ok((new_repo, Some(pending)))
     }
@@ -607,7 +623,7 @@ impl JjBackend {
         // walk below compares against its output, so the snapshot change and
         // the expression's edits become one rewrite
         let mut snapshot_wc: Option<Commit> = None;
-        if let Some(p) = &pending {
+        if let Some(p) = pending.as_ref().filter(|p| p.fold_into_wc) {
             let wc_commit = block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?;
             let c = block_on(
                 tx.repo_mut()
@@ -781,14 +797,24 @@ impl JjBackend {
         // §7.4/§7.5 step 7: check out the focus to the working directory
         let focus_commit = block_on(store.get_commit_async(&focus_jj))
             .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
-        block_on(self.checkout(&focus_commit, snapshot_wc.as_ref(), op_id))?;
+        // the working directory holds the snapshot's tree; when it was not
+        // folded (an immutable wc commit, §7.2) the snapshot's own unpublished
+        // commit carries that tree
+        let on_disk = match (&snapshot_wc, &pending) {
+            (None, Some(p)) => Some(
+                block_on(store.get_commit_async(&p.new_wc_id))
+                    .map_err(|e| Crash::new(format!("cannot read the snapshot commit: {}", e)))?,
+            ),
+            _ => snapshot_wc.clone(),
+        };
+        block_on(self.checkout(&focus_commit, on_disk.as_ref(), op_id))?;
 
         Ok(())
     }
 
     /// Check `commit` out and record `op_id` as the operation the working
-    /// copy is at. `snapshot` is the folded snapshot commit of a persisting
-    /// run (§7.4), whose tree is what the working directory holds.
+    /// copy is at. `snapshot` is a commit carrying a persisting run's
+    /// snapshot (§7.4), whose tree is what the working directory holds.
     async fn checkout(
         &self,
         commit: &Commit,

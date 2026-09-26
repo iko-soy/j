@@ -264,6 +264,94 @@ fn undo_push_restores_labels() {
 }
 
 #[test]
+fn dirty_immutable_focus_snapshots_into_a_new_child() {
+    // §7.2: when the working-copy commit is immutable (here: just pushed as
+    // master), the snapshot cannot go into it; it goes into a new child, the
+    // immutable commit keeps its stored files and hash, and `j id` records
+    // the child (§1.2 step 8) so undo is not refused forever (§7.7)
+    let env = setup();
+    let dest = uniq("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "two\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    env.j(&dest, &["push (label \"master\" here)"]).ok();
+    let pushed = git(&dest, &["rev-parse", "refs/remotes/origin/master"]).trim().to_string();
+    let trunk_hash = || {
+        env.j(&dest, &["\\r -> (meta (head (trunk r))).hash"]).ok().stdout.trim().to_string()
+    };
+    let trunk_text = || {
+        env.j(&dest, &["\\r -> map (\\e -> text e.content) (commitAt (head (trunk r)) r).files"])
+            .ok()
+            .stdout
+    };
+    assert_eq!(trunk_hash(), pushed);
+
+    // a printing run sees the edit in the focus, not in the pushed commit
+    std::fs::write(dest.join("a.txt"), "modified\n").unwrap();
+    assert_eq!(trunk_hash(), pushed, "a printing run reported the snapshot's rewrite");
+    assert!(trunk_text().contains("two"), "{}", trunk_text());
+    let status = env.j(&dest, &["status"]).ok().stdout;
+    assert!(status.contains("a.txt"), "the focus does not hold the edit:\n{}", status);
+
+    // a persisting run records the edit in the child
+    env.j(&dest, &["describe \"wip\""]).ok();
+    assert_eq!(trunk_hash(), pushed, "the pushed commit was rewritten");
+    assert!(trunk_text().contains("two"), "{}", trunk_text());
+    let status = env.j(&dest, &["status"]).ok().stdout;
+    assert!(status.contains("a.txt") && status.contains("wip"), "{}", status);
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "modified\n");
+
+    // back onto the pushed commit, dirty again: `j id` records the edit
+    env.j(&dest, &["undo"]).ok();
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "two\n");
+    std::fs::write(dest.join("a.txt"), "again\n").unwrap();
+    env.j(&dest, &["id"]).ok();
+    let ops = env.j(&dest, &["ops"]).ok().stdout;
+    assert!(ops.lines().next().unwrap_or("").ends_with(" id"), "`j id` recorded nothing:\n{}", ops);
+    assert_eq!(trunk_hash(), pushed, "`j id` rewrote the pushed commit");
+    let status = env.j(&dest, &["status"]).ok().stdout;
+    assert!(status.contains("a.txt"), "{}", status);
+    // the working copy is clean now, so undo and redo go through
+    env.j(&dest, &["undo"]).ok();
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "two\n");
+    env.j(&dest, &["redo"]).ok();
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "again\n");
+    assert_eq!(git(&env.remote, &["rev-parse", "master"]).trim(), pushed);
+}
+
+#[test]
+fn dirty_immutable_focus_leaves_its_descendants_alone() {
+    // §7.2: the snapshot of an immutable working-copy commit goes into a new
+    // child, so it does not rebase the commits above it either — here the
+    // remote's master, fetched on top of the working-copy commit
+    let env = setup();
+    let dest = uniq("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "two\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    env.j(&dest, &["push (label \"master\" here)"]).ok();
+    let other = uniq("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::write(other.join("c.txt"), "top\n").unwrap();
+    git(&other, &["add", "c.txt"]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "top"]);
+    git(&other, &["push", "-q", "origin", "master"]);
+    let _ = std::fs::remove_dir_all(&other);
+    env.j(&dest, &["fetch"]).ok();
+    let top = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    let trunk_hash = || {
+        env.j(&dest, &["\\r -> (meta (head (trunk r))).hash"]).ok().stdout.trim().to_string()
+    };
+    assert_eq!(trunk_hash(), top);
+    std::fs::write(dest.join("a.txt"), "dirty\n").unwrap();
+    assert_eq!(trunk_hash(), top, "a printing run reported a rebase of master");
+    env.j(&dest, &["id"]).ok();
+    assert_eq!(trunk_hash(), top, "`j id` rebased master onto the snapshot");
+    let status = env.j(&dest, &["status"]).ok().stdout;
+    assert!(status.contains("a.txt"), "{}", status);
+}
+
+#[test]
 fn clone_default_dir_name() {
     let env = setup();
     // clone URL without DIR: last path component minus .git
