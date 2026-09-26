@@ -327,6 +327,28 @@ fn no_item_between_signature_and_definition() {
     .expect("builtin signatures may be followed by any item");
 }
 
+/// Load and evaluate a config over an empty backend.
+fn eval_cfg(src: &str) -> Result<Interp, String> {
+    let cfg = config::load_config(src).map_err(|e| e.message())?;
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).map_err(|c| c.msg)?;
+    Ok(i)
+}
+
+#[test]
+fn label_literal_depends_on_labelled() {
+    // §4.11: `%main` is `labelled "main"`, so a definition using it outside a
+    // lambda is evaluated after `labelled` (§4.1). A name sorting before
+    // `labelled` used to be evaluated first and fail the whole config with
+    // "`labelled` is not defined".
+    for def in ["base = %main", "choices = [%main %master]", "zbase = %main"] {
+        let i = eval_cfg(&format!("{}\n{}\n", MINIMAL, def))
+            .unwrap_or_else(|e| panic!("{}: {}", def, e));
+        let name = def.split(' ').next().unwrap();
+        assert!(i.globals.lookup(name).is_some(), "{}", def);
+    }
+}
+
 #[test]
 fn user_must_be_wellformed() {
     let cfg = config::load_config("user = { name = \"\", email = \"a\" }\nimmutable = \\_ -> []\ntree = \\_ -> \"\"\nlabelled = \\_ _ -> []\n").unwrap();

@@ -261,6 +261,10 @@ fn load_deps(e: &Expr, out: &mut BTreeSet<String>) {
                 load_deps(e, out);
             }
         }
+        // `%main` is `labelled "main"` (§4.11), evaluated where it stands
+        Expr::LabelLit(_) => {
+            out.insert("labelled".to_string());
+        }
         _ => {}
     }
 }
