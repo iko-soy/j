@@ -1272,7 +1272,9 @@ impl JjBackend {
         Ok(())
     }
 
-    pub fn cmd_ops(&self) -> Result<(), OpenError> {
+    /// The operation log for `ops` (§7.7), one line per operation, newest
+    /// first; the caller writes it to stdout.
+    pub fn cmd_ops(&self) -> Result<String, OpenError> {
         let base = self.head_repo()?;
         let loader = self.repo_loader();
         let head = base.operation().clone();
@@ -1309,8 +1311,7 @@ impl JjBackend {
                 None => None,
             };
         }
-        print!("{}", out);
-        Ok(())
+        Ok(out)
     }
 }
 

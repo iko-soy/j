@@ -23,6 +23,20 @@ fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
     status
 }
 
+/// Write a run's output to stdout (§1.2.9, `ops`). A reader that stops early
+/// (`j tree | head`) closes the pipe; that is not a failure (§1.4), so the
+/// rest is dropped and the run still succeeds. Any other write failure is an
+/// error line. `print!` would panic on either.
+fn print_output(s: &str) -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => err(1, format!("cannot write output: {}", e)),
+    }
+}
+
 fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
     eprintln!("j: crash: {}", c.msg);
     match (&c.def, expr_text) {
@@ -243,7 +257,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             }
             let backend = or_exit(open_repo_noconfig());
             match backend.cmd_ops() {
-                Ok(()) => ExitCode::SUCCESS,
+                Ok(log) => print_output(&log),
                 Err(e) => err(e.0, e.1),
             }
         }
@@ -360,10 +374,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         // §1.2.9: display
         let color = j::render::color_enabled("auto");
         match j::render::display(&mut interp, &v, color) {
-            Ok(s) => {
-                print!("{}", s);
-                ExitCode::SUCCESS
-            }
+            Ok(s) => print_output(&s),
             Err(c) => crash_err(&c, Some(text)),
         }
     }

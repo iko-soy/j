@@ -100,6 +100,31 @@ impl Repo {
         }
     }
 
+    /// Run `j` with stdout sent to `stdout` instead of captured.
+    fn j_to(&self, stdout: impl Into<Stdio>, args: &[&str]) -> Out {
+        let out = Command::new(j_bin())
+            .args(args)
+            .current_dir(&self.dir)
+            .env("XDG_CONFIG_HOME", &self.cfg)
+            .env("NO_COLOR", "1")
+            .stdout(stdout)
+            .output()
+            .unwrap();
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    }
+
+    /// Run `j` with stdout on a pipe whose reader has already exited, as in
+    /// `j tree | head` once `head` has read all it wants.
+    fn j_closed_stdout(&self, args: &[&str]) -> Out {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        self.j_to(writer, args)
+    }
+
     fn write(&self, path: &str, content: &str) {
         std::fs::write(self.dir.join(path), content).unwrap();
     }
@@ -381,6 +406,43 @@ fn text_result_prints_raw() {
     assert_eq!(out.stdout, "literal text\n");
     let out = r.j(&["show [1 \"two\"]"]).ok();
     assert!(out.stdout.contains("[1 \"two\"]"), "{}", out.stdout);
+}
+
+#[test]
+fn closed_stdout_ends_the_display_quietly() {
+    // §1.4: a reader that stops early (`j tree | head`) is not a failure;
+    // writing into its closed pipe used to panic and exit 101
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"shown\""]).ok();
+    for expr in ["1 + 1", "tree", "range 0 200000"] {
+        let out = r.j_closed_stdout(&[expr]);
+        assert_eq!(out.code, 0, "{}: {}", expr, out.stderr);
+        assert_eq!(out.stderr, "", "{}", expr);
+    }
+    // the reserved command that prints writes the same way
+    let out = r.j_closed_stdout(&["ops"]);
+    assert_eq!(out.code, 0, "ops: {}", out.stderr);
+    assert_eq!(out.stderr, "");
+    // and the lock was released
+    assert!(r.j(&["ops"]).ok().stdout.contains("describe \"shown\""));
+}
+
+#[test]
+fn unwritable_stdout_is_a_one_line_error() {
+    // §1.4: any other write failure is an error line, not a panic
+    let full = std::path::Path::new("/dev/full");
+    if !full.exists() {
+        return;
+    }
+    let r = setup();
+    for args in [["1 + 1"], ["ops"]] {
+        let dev = std::fs::OpenOptions::new().write(true).open(full).unwrap();
+        let out = r.j_to(dev, &args);
+        assert_eq!(out.code, 1, "{:?}: {}", args, out.stderr);
+        assert!(out.stderr.starts_with("j: "), "{:?}: {}", args, out.stderr);
+        assert_eq!(out.stderr.lines().count(), 1, "{:?}: {}", args, out.stderr);
+    }
 }
 
 #[test]
