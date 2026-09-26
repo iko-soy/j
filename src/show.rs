@@ -63,12 +63,16 @@ fn render(interp: &Interp, v: &Value) -> String {
 fn render_fun(interp: &Interp, f: &FunVal) -> String {
     match f {
         FunVal::Builtin { name, args, .. } => {
+            // a selector `.name` carries its field as a baked-in first
+            // argument (builtins::make_selector) and renders as the selector
+            // atom itself (§3.4), not as an application to that field
+            if name.starts_with('.') && name.len() > 1 {
+                return name.clone();
+            }
             // operator builtins render parenthesised when bare
             if args.is_empty() {
                 if is_operator_name(name) {
                     format!("({})", name)
-                } else if name.starts_with('.') && name.len() > 1 {
-                    name.clone() // selector .name
                 } else if name == "(.)" {
                     "(.)".into()
                 } else {
@@ -83,7 +87,7 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
                 } else {
                     name.clone()
                 };
-                // args may contain a baked-in value (compose, selectors)
+                // args may contain a baked-in value (compose)
                 match name.as_str() {
                     "(.)" if args.len() == 2 => {
                         format!(

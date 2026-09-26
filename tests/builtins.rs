@@ -214,6 +214,20 @@ fn show_renders_literals() {
 }
 
 #[test]
+fn show_renders_selectors() {
+    // a selector is the SELECTOR atom `.name` (§3.4), not the accessor
+    // applied to the field name it carries internally (§5.2)
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "show (.id)", Value::text(".id"));
+    check!(i, cfg, "show [(.id)]", Value::text("[(.id)]"));
+    check!(i, cfg, "show (map (.id))", Value::text("map (.id)"));
+    // and the rendering evaluates back to the same selector
+    let shown = ok(&mut i, &cfg, "show (map (.id))");
+    let src = format!("({}) [{{ id = 5 }}]", shown.as_text().unwrap());
+    check!(i, cfg, &src, ints(&[5]));
+}
+
+#[test]
 fn extract_everywhere() {
     let (mut i, cfg) = make_interp();
     // ints anywhere

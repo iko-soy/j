@@ -649,6 +649,7 @@ truncates.
 | resolved `Blob` | `blob "…"` |
 | unresolved `Blob` | `{- unresolved -} blob "…"` with the conflict-marker rendering |
 | builtin | its declared name, operators parenthesised: `map`, `(++)` |
+| selector | the selector itself: `.id` |
 | top-level definition | its name |
 | revset from a label literal | `%name` |
 | shape | its type name: `Commit`, `Id` |
