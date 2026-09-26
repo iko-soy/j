@@ -496,13 +496,13 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
     for (name, expr) in &cfg.defs {
         *interp.current_def.borrow_mut() = Some(name.clone());
         let v = interp.eval(expr, &genv)?;
-        // value-level contract for non-function definitions
+        // the value itself, one level deep, against the whole signature
+        // (§4.13): under a function type, including an alias of one, it must
+        // be a function, however it was built (`conflicts : Revset` is a
+        // partial application, `myEdit : Edit` with `myEdit = 5` is refused)
         if let Some(ty) = cfg.sigs.get(name) {
-            let c = compile_contract(&interp.shapes, ty);
-            if c.params.is_empty() {
-                if let Err(msg) = crate::shape::check(&interp.shapes, &c.result, &v) {
-                    return Err(Crash::new(format!("contract: {}: {}", name, msg)));
-                }
+            if let Err(msg) = crate::shape::check(&interp.shapes, ty, &v) {
+                return Err(Crash::new(format!("contract: {}: {}", name, msg)));
             }
         }
         cell.borrow_mut().push((name.clone(), v.clone()));

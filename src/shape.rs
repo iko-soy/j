@@ -368,6 +368,19 @@ impl ContractExpr {
         }
     }
 
+    /// The 0-based position of the next argument among those the signature
+    /// lists, when known. Messages number arguments by the signature (§4.13:
+    /// "describe expected Text as argument 1"), not by what the function
+    /// value already holds: `tree`, which is `treeWith` applied to its
+    /// options, takes its argument 1, and so does `squash`, a composition.
+    pub fn position(&self) -> Option<usize> {
+        match self {
+            ContractExpr::Known { at, .. } => Some(*at),
+            ContractExpr::Compose(_, g) => g.position(),
+            _ => None,
+        }
+    }
+
     /// Check an argument to this function. The outer ApplyFirst layer (if
     /// any) accounts for the argument currently being consumed.
     pub fn check_arg(&self, shapes: &Shapes, fname: &str, v: &Value) -> Result<(), Crash2> {

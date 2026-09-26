@@ -517,7 +517,27 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 f: *f,
                 pending,
             })),
-            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => v.clone(),
+            // `f or g` and `%name` have nowhere to hold a contract, so the
+            // definition becomes `\x -> v x` under its name, which the
+            // closure machinery checks at every argument the signature lists
+            // and at the result. The check is around the lifted `or` as a
+            // whole (§4.6): a result that violates the signature is a crash,
+            // not a reason to try the other side.
+            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => {
+                let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
+                Value::Fun(Rc::new(FunVal::Closure {
+                    name: Some(name.to_string()),
+                    params: vec![Pattern::Var("x".to_string())],
+                    applied: 0,
+                    applied_args: Vec::new(),
+                    deferred: false,
+                    body: Rc::new(Expr::App(var("f"), var("x"))),
+                    env: Env::empty().extend(vec![("f".to_string(), v.clone())]),
+                    // a named closure renders as its name (§5.2)
+                    src: crate::ast::Source::new(Rc::from(""), 0, 0),
+                    pending,
+                }))
+            }
         },
         _ => v.clone(),
     }

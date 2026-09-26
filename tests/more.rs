@@ -99,6 +99,118 @@ fn alias_contracts_unfold() {
     assert!(m.contains("at"), "{}", m);
 }
 
+/// The reference config with `extra` appended, loaded and evaluated.
+fn make_interp_with(extra: &str) -> (Interp, config::Config) {
+    let src = format!("{}\n{}", CONFIG, extra);
+    let cfg = config::load_config(&src).expect("config must load");
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).expect("config must evaluate");
+    (i, cfg)
+}
+
+fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
+    let got = ev(i, cfg, src).unwrap_or_else(|m| panic!("{} crashed: {}", src, m));
+    assert!(
+        value_eq(&got, &want).unwrap(),
+        "{} gave {}",
+        src,
+        j::show::show(i, &got)
+    );
+}
+
+#[test]
+fn signatures_hold_whatever_the_definition_is_built_from() {
+    // §4.13: a signature is checked at every application of the definition,
+    // whether its value is a lambda, a composition, an `or`, or a label.
+    let (mut i, cfg) = make_interp_with(
+        r#"
+inc : Int -> Int
+inc = \x -> x + 1
+
+twice : Int -> Text
+twice = inc . inc
+
+safeNew : Edit
+safeNew = new or id
+
+keep : Int -> Text
+keep = (\x -> x) or show
+
+choose : Int -> Int -> Int
+choose = (\a b -> a) or (\a b -> b)
+
+mainCount : Repo -> Int
+mainCount = %main
+"#,
+    );
+    // a signed composition checks its argument and its result
+    let m = crash_msg(&mut i, &cfg, "twice 1");
+    assert!(m.contains("twice: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "twice \"x\"");
+    assert!(m.contains("twice expected Int as argument 1, got Text"), "{}", m);
+    // a signed `or` checks its argument before either side runs, and its
+    // result after the fallback, not inside either side (§4.6)
+    let m = crash_msg(&mut i, &cfg, "safeNew 5");
+    assert!(m.contains("safeNew expected Repo (record) as argument 1, got Int"), "{}", m);
+    assert_value(&mut i, &cfg, "safeNew 5 or 7", Value::int(7));
+    let m = crash_msg(&mut i, &cfg, "keep 1");
+    assert!(m.contains("keep: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "keep \"x\"");
+    assert!(m.contains("keep expected Int as argument 1, got Text"), "{}", m);
+    // ... through every argument the signature lists
+    assert_value(&mut i, &cfg, "choose 1 2", Value::int(1));
+    let m = crash_msg(&mut i, &cfg, "choose 1 \"x\"");
+    assert!(m.contains("choose expected Int as argument 2, got Text"), "{}", m);
+    // a signed label literal
+    let m = crash_msg(&mut i, &cfg, "mainCount 5");
+    assert!(m.contains("mainCount expected Repo (record) as argument 1, got Int"), "{}", m);
+    let m = crash_msg(
+        &mut i,
+        &cfg,
+        "mainCount ({ root = { files = [], message = \"\", labels = [], id = @ }, children = [], context = [] })",
+    );
+    assert!(m.contains("mainCount: result expected Int, got list"), "{}", m);
+}
+
+#[test]
+fn arguments_are_numbered_by_the_signature() {
+    // §4.13 ("describe expected Text as argument 1"): a definition that is a
+    // partial application or a composition counted the arguments baked into
+    // it, so `tree 5` said argument 2 and `squash 5` argument 3
+    let (mut i, cfg) = make_interp();
+    for (src, name) in [
+        ("tree 5", "tree"),
+        ("treeCompact 5", "treeCompact"),
+        ("trunk 5", "trunk"),
+        ("squash 5", "squash"),
+    ] {
+        let m = crash_msg(&mut i, &cfg, src);
+        assert!(
+            m.contains(&format!("{} expected Repo (record) as argument 1, got Int", name)),
+            "{}: {}",
+            src,
+            m
+        );
+    }
+}
+
+#[test]
+fn function_signature_on_a_non_function_value_fails_at_load() {
+    // §4.13: a definition that is not a lambda is checked against its
+    // signature at load; for a function type that means being a function
+    let src = format!("{}\nmyEdit : Edit\nmyEdit = 5\n", CONFIG);
+    let cfg = config::load_config(&src).unwrap();
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    match config::eval_config(&mut i, &cfg) {
+        Ok(_) => panic!("a non-function Edit should not load"),
+        Err(c) => assert!(
+            c.msg.contains("contract: myEdit: expected a function, got Int"),
+            "{}",
+            c.msg
+        ),
+    }
+}
+
 // ------------------------------------------------------------------
 // display shapes (§5.1)
 // ------------------------------------------------------------------

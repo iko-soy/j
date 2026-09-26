@@ -847,7 +847,10 @@ impl Interp {
                     let skip_check = name == "(.)" && matches!(arg, Value::Fun(_));
                     if let Some(c) = &cexpr {
                         if !skip_check {
-                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, args.len(), &arg) {
+                            // numbered by the signature, not by the arguments
+                            // baked into a partial application (§4.13)
+                            let at = c.position().unwrap_or(args.len());
+                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
                                 return Run::Crash(cr);
                             }
                         }
@@ -858,10 +861,14 @@ impl Interp {
                     if all.len() == *arity {
                         match bf(self, &all) {
                             Ok(r) => {
-                                // compose applications check results
-                                // incrementally as the composition runs
+                                // a composition's contract derived from its
+                                // operands leaves results to theirs, checked
+                                // as the composition runs; a signature
+                                // attached to it is checked like any other
                                 if let Some(c) = &advanced {
-                                    if name != "(.)" {
+                                    if name != "(.)"
+                                        || matches!(**c, crate::shape::ContractExpr::Known { .. })
+                                    {
                                         if let Err(cr) =
                                             c.check_result(&self.shapes, &cname, &r)
                                         {
@@ -912,7 +919,8 @@ impl Interp {
                             None => (name.clone().unwrap_or_default(), None),
                         };
                         if let Some(c) = &cexpr {
-                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, applied_args.len(), &arg) {
+                            let at = c.position().unwrap_or(applied_args.len());
+                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
                                 return Run::Crash(cr);
                             }
                         }
@@ -990,7 +998,8 @@ impl Interp {
                     }
                     if let Some(c) = &cexpr {
                         let fname = cname.clone().unwrap_or_default();
-                        if let Err(cr) = c.check_arg_at(&self.shapes, &fname, applied_args.len(), &arg) {
+                        let at = c.position().unwrap_or(applied_args.len());
+                        if let Err(cr) = c.check_arg_at(&self.shapes, &fname, at, &arg) {
                             return Run::Crash(cr);
                         }
                     }
