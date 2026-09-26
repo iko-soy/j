@@ -1953,20 +1953,19 @@ async fn jj_replay(
     let onto_tree = build_tree(store, &Value::list(onto.to_vec())).await?;
     let from_tree = build_tree(store, &Value::list(from.to_vec())).await?;
     let to_tree = build_tree(store, &Value::list(to.to_vec())).await?;
-    let merge = Merge::from_removes_adds(
-        vec![from_tree.tree_ids().as_resolved().cloned().unwrap()],
-        vec![
-            onto_tree.tree_ids().as_resolved().cloned().unwrap(),
-            to_tree.tree_ids().as_resolved().cloned().unwrap(),
-        ],
-    );
-    // tree_merge::merge_trees resolves file contents line-level and keeps
-    // unresolvable paths as conflicts (tree_merge.rs:78)
-    let merged = jj_lib::tree_merge::merge_trees(store, merge)
-        .await
-        .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+    // any of the three may itself be conflicted (a snapshot with unresolved
+    // blobs, §7.3), so merge the trees the way jj's rebase does:
+    // MergedTree::merge flattens conflicted inputs into one merge, simplifies
+    // it, and resolves file contents line-level with tree_merge::merge_trees,
+    // keeping unresolvable paths as conflicts. Empty labels leave the result
+    // unlabeled; the labels would not survive tree_to_files anyway.
+    let merged = MergedTree::merge(Merge::from_removes_adds(
+        vec![(from_tree, String::new())],
+        vec![(onto_tree, String::new()), (to_tree, String::new())],
+    ))
+    .await
+    .map_err(|e| Crash::new(format!("replay: {}", e)))?;
     // conflicts stay as unresolved blobs (§7.3)
-    let merged = MergedTree::new(store.clone(), merged, jj_lib::conflict_labels::ConflictLabels::unlabeled());
     tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
 }
 

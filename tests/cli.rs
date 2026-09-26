@@ -771,3 +771,52 @@ fn replacing_a_file_with_a_directory_survives_persistence() {
     r.j(&["prev"]).ok();
     assert_eq!(r.read("a"), "hi\n");
 }
+
+#[test]
+fn replay_carries_conflicts_through() {
+    // replay unwrapped each input tree's ids as resolved, so every rebase,
+    // squash or abandon that replayed a snapshot holding a conflict panicked
+    // (exit 101, uncatchable by `or`) instead of keeping the conflict (§7.3,
+    // §8); the in-memory backend handled it, so only a real repo showed it
+    let r = setup();
+    r.write("a.txt", "base\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "left\n");
+    r.j(&["describe \"left\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a.txt", "right\n");
+    r.j(&["describe \"right\""]).ok();
+    // all three inputs are still resolved here; the result is not
+    r.j(&["rebase siblings"]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+    // the §8 laws, with a conflicted snapshot in each position
+    for law in [
+        "\\r -> replay (files r) ({ from = files r, to = files r }) == files r",
+        "\\r -> replay (files r) ({ from = [], to = [] }) == files r",
+        "\\r -> replay [] ({ from = [], to = files r }) == files r",
+        "\\r -> replay (files r) ({ from = files r, to = files (up r) }) == files (up r)",
+    ] {
+        assert_eq!(r.j(&[law]).ok().stdout.trim(), "true", "{}", law);
+    }
+    // rebase parents r = r: nothing to record
+    let ops = r.j(&["ops"]).ok().stdout;
+    r.j(&["rebase parents"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+    // squashing into the conflicted commit keeps its conflict
+    r.j(&["new"]).ok();
+    r.write("b.txt", "bee\n");
+    r.j(&["squash"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+    assert_eq!(r.read("b.txt"), "bee\n");
+    assert!(r.read("a.txt").contains("<<<<<<<"), "{}", r.read("a.txt"));
+    // abandoning the side the conflict came from replays the child onto
+    // base, where jj's merge resolves it to the child's own side
+    let named = |m: &str| format!("(matching (\\c -> c.message == \"{}\") all)", m);
+    r.j(&[&format!("abandon . goto {}", named("left"))]).ok();
+    assert_eq!(r.j(&["\\r -> show (conflicts r)"]).ok().stdout.trim(), "[]");
+    let files = format!("\\r -> show (map (\\i -> (commitAt i r).files) ({} r))", named("right"));
+    let files = r.j(&[&files]).ok().stdout;
+    assert!(files.contains("blob \"right\\n\"") && files.contains("blob \"bee\\n\""), "{}", files);
+}

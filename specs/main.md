@@ -769,7 +769,10 @@ an expression can make agrees with the eager value.
   `from` as the common ancestor, replaying the change from `from` to `to` on
   top of `onto`. Conflicts are kept as unresolved blobs, and resolved where
   jj's merge would resolve them (identical changes, changes from the current
-  content, non-overlapping line-level hunks). It never crashes on content. It
+  content, non-overlapping line-level hunks). A path unresolved in any of the
+  three takes part with all its sides, as when jj rebases a conflicted commit,
+  so sides that cancel drop out and a replay can resolve a conflict as well
+  as keep one. It never crashes on content. It
   crashes if any of the three is not a well-formed snapshot (a list of `Entry`
   records with unique paths, none of them the root `./`, and none both a file
   and a directory as `./a` beside `./a/b` would be).
