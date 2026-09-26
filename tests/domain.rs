@@ -1,7 +1,7 @@
 //! In-memory backend and replay (§7.3, §10) plus repo zipper/validation (§7.5).
 
 use j::domain::{simple_replay, MemBackend, ROOT_ID};
-use j::value::{value_eq, BlobVal, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, Value};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -114,6 +114,35 @@ fn replay_conflict_kept_unresolved() {
     // the conflict renders with markers containing all three sides
     let text = blob_text(&content_at(&out, "a").unwrap());
     assert!(text.contains("1") && text.contains("2") && text.contains("3"), "{}", text);
+}
+
+#[test]
+fn replay_conflict_sides_keep_absence_and_file_type() {
+    // each side was kept as bare bytes, so a side the path is absent on
+    // equalled an empty file and a side's file type was dropped (§7.3)
+    let from = snap(vec![entry("a", "1")]);
+    let onto = snap(vec![entry("a", "2")]);
+    let deleted = simple_replay(&onto, &from, &snap(vec![])).unwrap();
+    let emptied = simple_replay(&onto, &from, &snap(vec![entry("a", "")])).unwrap();
+    assert!(unresolved_at(&deleted, "a") && unresolved_at(&emptied, "a"));
+    let (d, e) = (content_at(&deleted, "a").unwrap(), content_at(&emptied, "a").unwrap());
+    assert!(!value_eq(&d, &e).unwrap(), "a deletion conflict equals an emptying one");
+    let exec_entry = |content: &str| {
+        Value::record(&[
+            (
+                "content",
+                Value::Blob(Rc::new(BlobVal {
+                    kind: BlobKind::Executable,
+                    content: BlobContent::Resolved(Rc::new(content.as_bytes().to_vec())),
+                })),
+            ),
+            ("path", Value::list(vec![Value::text("a")])),
+        ])
+    };
+    let exec = simple_replay(&[exec_entry("2")], &[exec_entry("1")], &[exec_entry("3")]).unwrap();
+    let plain = simple_replay(&onto, &from, &snap(vec![entry("a", "3")])).unwrap();
+    let (x, p) = (content_at(&exec, "a").unwrap(), content_at(&plain, "a").unwrap());
+    assert!(!value_eq(&x, &p).unwrap(), "executable sides equal regular ones");
 }
 
 #[test]

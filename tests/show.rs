@@ -5,7 +5,7 @@ use j::domain::MemBackend;
 use j::eval::Interp;
 use j::parse::parse_expr;
 use j::show::{show, text_literal, unified_diff};
-use j::value::{value_eq, BlobContent, BlobKind, BlobVal, Env, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Env, Value};
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
@@ -121,9 +121,9 @@ fn show_unresolved_blob() {
     let v = Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
         content: BlobContent::Conflict(vec![
-            Rc::new(b"ours".to_vec()),
-            Rc::new(b"base".to_vec()),
-            Rc::new(b"theirs".to_vec()),
+            Some(ConflictSide::regular(b"ours")),
+            Some(ConflictSide::regular(b"base")),
+            Some(ConflictSide::regular(b"theirs")),
         ]),
     }));
     let s = show(&i, &v);
@@ -255,9 +255,9 @@ fn conflict_blob_markers() {
     let v = Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
         content: BlobContent::Conflict(vec![
-            Rc::new(b"ours\n".to_vec()),
-            Rc::new(b"base\n".to_vec()),
-            Rc::new(b"theirs\n".to_vec()),
+            Some(ConflictSide::regular(b"ours\n")),
+            Some(ConflictSide::regular(b"base\n")),
+            Some(ConflictSide::regular(b"theirs\n")),
         ]),
     }));
     let Value::Blob(b) = &v else { panic!() };
@@ -276,7 +276,7 @@ fn blob_sizes() {
     assert_eq!(b.size(), 5);
     let c = Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
-        content: BlobContent::Conflict(vec![Rc::new(b"ab".to_vec())]),
+        content: BlobContent::Conflict(vec![Some(ConflictSide::regular(b"ab"))]),
     }));
     let Value::Blob(b) = &c else { panic!() };
     assert!(b.is_unresolved());

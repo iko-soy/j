@@ -763,7 +763,9 @@ an expression can make agrees with the eager value.
   content and type (regular, executable, symlink) and, for conflicted paths,
   jj's conflict value for that path.
 - A path that is deleted and resolved has no entry. A path that is in a
-  deletion conflict has an entry whose blob is unresolved.
+  deletion conflict has an entry whose blob is unresolved. Each side of a
+  conflict is either absent or content with its own file type, so a side
+  that deleted the path is not an empty file.
 - `replay onto { from, to }` is jj's tree merge: for each path present in
   any of the three snapshots, the three-way merge of that path's values with
   `from` as the common ancestor, replaying the change from `from` to `to` on

@@ -135,8 +135,26 @@ pub enum BlobContent {
     Lazy(Rc<LazyBlob>),
     /// Conflict sides, jj order: alternating adds and removes, starting and
     /// ending with an add: [add, (remove, add)*]. For the in-memory backend:
-    /// [to, from, onto]-style three sides as [add, remove, add].
-    Conflict(Vec<Rc<Vec<u8>>>),
+    /// [to, from, onto]-style three sides as [add, remove, add]. `None` is a
+    /// side on which the path is absent (a deletion conflict, §7.3).
+    Conflict(Vec<Option<ConflictSide>>),
+}
+
+/// One present side of a conflict: its content and its own file type, which
+/// jj keeps per side (§7.3)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictSide {
+    pub kind: BlobKind,
+    pub bytes: Rc<Vec<u8>>,
+}
+
+impl ConflictSide {
+    pub fn regular(bytes: &[u8]) -> ConflictSide {
+        ConflictSide {
+            kind: BlobKind::Regular,
+            bytes: Rc::new(bytes.to_vec()),
+        }
+    }
 }
 
 /// A blob whose bytes are read from the store only on first use (§7.2):
@@ -220,7 +238,7 @@ impl BlobVal {
         match &self.content {
             BlobContent::Resolved(b) => b.len(),
             BlobContent::Lazy(l) => l.force().map(|b| b.len()).unwrap_or(0),
-            BlobContent::Conflict(sides) => sides.iter().map(|s| s.len()).sum(),
+            BlobContent::Conflict(sides) => sides.iter().flatten().map(|s| s.bytes.len()).sum(),
         }
     }
     /// content as bytes, forcing a lazy blob; conflicts render with jj-style
@@ -264,20 +282,22 @@ impl BlobVal {
     }
 }
 
-/// Render a conflict with jj-style markers.
-pub fn render_conflict(sides: &[Rc<Vec<u8>>]) -> Vec<u8> {
+/// Render a conflict with jj-style markers; a side the path is absent on
+/// renders as empty content, as jj materialises it.
+pub fn render_conflict(sides: &[Option<ConflictSide>]) -> Vec<u8> {
     // sides: [add0, remove0, add1, remove1, ... addN]
     let mut out = Vec::new();
     out.extend_from_slice(b"<<<<<<<\n");
     let mut i = 0;
     while i < sides.len() {
+        let bytes: &[u8] = sides[i].as_ref().map_or(&[], |s| &s.bytes);
         if i % 2 == 0 {
             out.extend_from_slice(b"+++++++\n");
-            out.extend_from_slice(&sides[i]);
+            out.extend_from_slice(bytes);
             ensure_newline(&mut out);
         } else {
             out.extend_from_slice(b"%%%%%%%\n");
-            out.extend_from_slice(&sides[i]);
+            out.extend_from_slice(bytes);
             ensure_newline(&mut out);
         }
         i += 1;

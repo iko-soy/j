@@ -254,9 +254,9 @@ fn conflicts_table() {
             Value::Blob(Rc::new(j::value::BlobVal {
                 kind: j::value::BlobKind::Regular,
                 content: j::value::BlobContent::Conflict(vec![
-                    Rc::new(b"ours\n".to_vec()),
-                    Rc::new(b"base\n".to_vec()),
-                    Rc::new(b"theirs\n".to_vec()),
+                    Some(j::value::ConflictSide::regular(b"ours\n")),
+                    Some(j::value::ConflictSide::regular(b"base\n")),
+                    Some(j::value::ConflictSide::regular(b"theirs\n")),
                 ]),
             })),
         ),

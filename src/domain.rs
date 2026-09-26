@@ -2,7 +2,7 @@
 //! (§7, §10). Two implementations: an in-memory backend for tests, and the
 //! jj-lib backend.
 
-use crate::value::{BlobContent, BlobKind, BlobVal, Crash, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -178,7 +178,7 @@ fn empty_blob() -> Value {
     }))
 }
 
-fn conflict_blob(sides: Vec<Rc<Vec<u8>>>) -> Value {
+fn conflict_blob(sides: Vec<Option<ConflictSide>>) -> Value {
     Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
         content: BlobContent::Conflict(sides),
@@ -233,22 +233,26 @@ pub fn simple_replay(
                 } else if !t_present && !o_present {
                     // both deleted
                 } else {
-                    // conflict: sides [to, from, onto] (add, remove, add)
-                    let get_bytes = |v: &Value, present: bool| -> Result<Rc<Vec<u8>>, Crash> {
+                    // conflict: sides [to, from, onto] (add, remove, add),
+                    // each absent or with its own file type (§7.3)
+                    let side = |v: &Value, present: bool| -> Result<Option<ConflictSide>, Crash> {
                         if !present {
-                            return Ok(Rc::new(Vec::new()));
+                            return Ok(None);
                         }
                         match v {
-                            Value::Blob(b) => Ok(Rc::new(b.bytes()?)),
-                            _ => Ok(Rc::new(Vec::new())),
+                            Value::Blob(b) => Ok(Some(ConflictSide {
+                                kind: b.kind.clone(),
+                                bytes: Rc::new(b.bytes()?),
+                            })),
+                            _ => Ok(Some(ConflictSide::regular(&[]))),
                         }
                     };
                     out.insert(
                         p,
                         conflict_blob(vec![
-                            get_bytes(&t, t_present)?,
-                            get_bytes(&f, f_present)?,
-                            get_bytes(&o, o_present)?,
+                            side(&t, t_present)?,
+                            side(&f, f_present)?,
+                            side(&o, o_present)?,
                         ]),
                     );
                 }

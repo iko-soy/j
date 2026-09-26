@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, Crash, LazyBlob, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, Value};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -2046,19 +2046,35 @@ async fn blob_to_tree_value(store: &Arc<Store>, content: &Value) -> Result<Merge
                 return Err(Crash::new("persistence: malformed conflict blob"));
             }
             // jj order: [add, (remove, add)*] → Merge with interleaved adds
-            // and removes
+            // and removes; each side keeps its absence or its own file type
+            // (§7.3), so the tree written is the one the conflict was read from
             let mut values: Vec<Option<TreeValue>> = Vec::new();
             for side in sides {
-                let mut slice: &[u8] = side.as_ref();
-                let id = store
-                    .write_file(&RepoPathBuf::root(), &mut slice)
-                    .await
-                    .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
-                values.push(Some(TreeValue::File {
-                    id,
-                    executable: b.kind == BlobKind::Executable,
-                    copy_id: CopyId::placeholder(),
-                }));
+                let Some(side) = side else {
+                    values.push(None);
+                    continue;
+                };
+                let value = if side.kind == BlobKind::Symlink {
+                    let target = std::str::from_utf8(&side.bytes)
+                        .map_err(|_| Crash::new("persistence: symlink target is not UTF-8"))?;
+                    let id = store
+                        .write_symlink(&RepoPathBuf::root(), target)
+                        .await
+                        .map_err(|e| Crash::new(format!("cannot write a symlink: {}", e)))?;
+                    TreeValue::Symlink(id)
+                } else {
+                    let mut slice: &[u8] = side.bytes.as_ref();
+                    let id = store
+                        .write_file(&RepoPathBuf::root(), &mut slice)
+                        .await
+                        .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
+                    TreeValue::File {
+                        id,
+                        executable: side.kind == BlobKind::Executable,
+                        copy_id: CopyId::placeholder(),
+                    }
+                };
+                values.push(Some(value));
             }
             let mut adds = Vec::new();
             let mut removes = Vec::new();
@@ -2143,20 +2159,39 @@ async fn read_file_bytes(
     Ok(buf)
 }
 
-async fn side_to_bytes(
+/// one side of a conflict as jj stores it: absent (`None`, a deletion
+/// conflict), or content with that side's own file type (§7.3)
+async fn conflict_side(
     store: &Arc<Store>,
     path: &RepoPath,
     v: &Option<TreeValue>,
     cache: &BlobCache,
-) -> Result<Rc<Vec<u8>>, Crash> {
+) -> Result<Option<ConflictSide>, Crash> {
     match v {
-        Some(TreeValue::File { id, .. }) => read_file_bytes(store, path, id, cache).await,
-        Some(TreeValue::Symlink(id)) => store
-            .read_symlink(path, id)
-            .await
-            .map(|s| Rc::new(s.into_bytes()))
-            .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e))),
-        _ => Ok(Rc::new(Vec::new())),
+        None => Ok(None),
+        Some(TreeValue::File { id, executable, .. }) => Ok(Some(ConflictSide {
+            kind: if *executable {
+                BlobKind::Executable
+            } else {
+                BlobKind::Regular
+            },
+            bytes: read_file_bytes(store, path, id, cache).await?,
+        })),
+        Some(TreeValue::Symlink(id)) => {
+            let target = store
+                .read_symlink(path, id)
+                .await
+                .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e)))?;
+            Ok(Some(ConflictSide {
+                kind: BlobKind::Symlink,
+                bytes: Rc::new(target.into_bytes()),
+            }))
+        }
+        // a directory or submodule side reads as an empty file, as a
+        // resolved one does in tree_value_to_blob (§12)
+        Some(TreeValue::Tree(_) | TreeValue::GitSubmodule(_)) => {
+            Ok(Some(ConflictSide::regular(&[])))
+        }
     }
 }
 
@@ -2176,11 +2211,11 @@ async fn merged_value_to_blob(
         };
     }
     // conflict sides, jj order: [add, (remove, add)*] (§7.3)
-    let mut sides: Vec<Rc<Vec<u8>>> = Vec::new();
+    let mut sides: Vec<Option<ConflictSide>> = Vec::new();
     for (i, add) in value.adds().enumerate() {
-        sides.push(side_to_bytes(store, path, add, cache).await?);
+        sides.push(conflict_side(store, path, add, cache).await?);
         if let Some(remove) = value.get_remove(i) {
-            sides.push(side_to_bytes(store, path, remove, cache).await?);
+            sides.push(conflict_side(store, path, remove, cache).await?);
         }
     }
     Ok(Value::Blob(Rc::new(BlobVal {

@@ -178,9 +178,9 @@ fn tree_conflict_and_empty_glyphs() {
                 Value::Blob(Rc::new(j::value::BlobVal {
                     kind: j::value::BlobKind::Regular,
                     content: j::value::BlobContent::Conflict(vec![
-                        Rc::new(b"a".to_vec()),
-                        Rc::new(b"b".to_vec()),
-                        Rc::new(b"c".to_vec()),
+                        Some(j::value::ConflictSide::regular(b"a")),
+                        Some(j::value::ConflictSide::regular(b"b")),
+                        Some(j::value::ConflictSide::regular(b"c")),
                     ]),
                 })),
             ),
@@ -371,9 +371,9 @@ fn conflict_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
                 Value::Blob(Rc::new(j::value::BlobVal {
                     kind: j::value::BlobKind::Regular,
                     content: j::value::BlobContent::Conflict(vec![
-                        Rc::new(b"a".to_vec()),
-                        Rc::new(b"b".to_vec()),
-                        Rc::new(b"c".to_vec()),
+                        Some(j::value::ConflictSide::regular(b"a")),
+                        Some(j::value::ConflictSide::regular(b"b")),
+                        Some(j::value::ConflictSide::regular(b"c")),
                     ]),
                 })),
             ),

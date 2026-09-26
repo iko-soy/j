@@ -820,3 +820,54 @@ fn replay_carries_conflicts_through() {
     let files = r.j(&[&files]).ok().stdout;
     assert!(files.contains("blob \"right\\n\"") && files.contains("blob \"bee\\n\""), "{}", files);
 }
+
+#[cfg(unix)]
+#[test]
+fn conflict_sides_keep_absence_and_file_type() {
+    // a conflict blob kept each side as bare bytes: a side the path was
+    // deleted on came back as an empty file, and every side lost its
+    // executable bit or symlink type (§7.3). The conflicted checkout of an
+    // executable file was not executable, and rebasing a conflicted commit
+    // back where it came from, whose sides must cancel, left an empty file
+    // for its deletion, dropped +x, and kept a symlink conflict.
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let r = setup();
+    let exec = |p: &str| {
+        let mode = std::fs::metadata(r.dir.join(p)).unwrap().permissions().mode();
+        mode & 0o111 != 0
+    };
+    let relink = |target: &str| {
+        let _ = std::fs::remove_file(r.dir.join("l"));
+        symlink(target, r.dir.join("l")).unwrap();
+    };
+    r.write("f.txt", "base\n");
+    r.write("g.sh", "x\n");
+    std::fs::set_permissions(r.dir.join("g.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    relink("a");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("f.txt", "mod\n");
+    r.write("g.sh", "y\n");
+    relink("b");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("f.txt")).unwrap();
+    r.write("g.sh", "z\n");
+    relink("c");
+    r.j(&["describe \"C\""]).ok();
+    assert!(exec("g.sh"));
+    // C onto A: a modify/delete conflict, and executable and symlink sides
+    r.j(&["rebase (parents . prev)"]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"f.txt\"] [\"g.sh\"] [\"l\"]]");
+    // every side of g.sh is executable, so its materialised conflict is
+    assert!(exec("g.sh"), "the conflicted checkout of g.sh lost +x");
+    // C back onto B: B's sides cancel, leaving C's own change
+    r.j(&["rebase siblings"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    let paths = r.j(&["\\r -> show (map (.path) (files r))"]).ok().stdout;
+    assert_eq!(paths.trim(), "[[\"g.sh\"] [\"l\"]]");
+    assert_eq!(r.read("g.sh"), "z\n");
+    assert!(exec("g.sh"), "g.sh lost +x");
+    assert_eq!(std::fs::read_link(r.dir.join("l")).unwrap(), PathBuf::from("c"));
+}
