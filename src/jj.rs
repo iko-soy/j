@@ -416,27 +416,29 @@ async fn put_back(
     for (path, before) in paths {
         builder.set_or_remove(path, before);
     }
-    let (tree_ids, labels) = builder
-        .write_tree()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_tree_ids_and_labels();
-    // a checkout reads only the commit's tree; this one is never written
-    let target = Commit::new(
-        on_disk.store().clone(),
-        on_disk.id().clone(),
-        Arc::new(jj_lib::backend::Commit {
-            root_tree: tree_ids,
-            conflict_labels: labels.into_merge(),
-            ..on_disk.store_commit().as_ref().clone()
-        }),
-    );
+    let target = with_tree(on_disk, builder.write_tree().await.map_err(|e| e.to_string())?);
     let stats = wc.check_out(&target).await.map_err(|e| e.to_string())?;
     match stats.skipped_files {
         0 => Ok(()),
         1 => Err("something is in the way of 1 path".to_string()),
         n => Err(format!("something is in the way of {} paths", n)),
     }
+}
+
+/// `commit` with `tree` in place of its own, for the working copy to read:
+/// a checkout, a reset and `put_back` read only a commit's tree. It is
+/// never written.
+fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
+    let (tree_ids, labels) = tree.into_tree_ids_and_labels();
+    Commit::new(
+        commit.store().clone(),
+        commit.id().clone(),
+        Arc::new(jj_lib::backend::Commit {
+            root_tree: tree_ids,
+            conflict_labels: labels.into_merge(),
+            ..commit.store_commit().as_ref().clone()
+        }),
+    )
 }
 
 /// Remove the directories of `dirs` (`Footprint::new_dirs`) that are
@@ -974,13 +976,29 @@ impl JjBackend {
             .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
         // the working directory holds the snapshot's tree; when it was not
         // folded (an immutable wc commit, §7.2) the snapshot's own unpublished
-        // commit carries that tree, and with no snapshot it holds the focus
-        // as loaded
+        // commit carries that tree. With no snapshot it holds the tree the
+        // working-copy state records, as `snapshot_repo` just found: the
+        // focus as loaded, unless jj moved the working-copy commit without
+        // updating the directory (`--ignore-working-copy`, a command in
+        // another workspace). The checkout then starts from that stale tree
+        // and writes the focus. Taking the directory to hold the focus, it
+        // would find it did not, describe the focus without writing it (a
+        // reset), and the next run would record the stale files into the
+        // focus (§7.4).
         let on_disk = match (snapshot_wc, &pending) {
             (Some(c), _) => c,
             (None, Some(p)) => block_on(store.get_commit_async(&p.new_wc_id))
                 .map_err(|e| Crash::new(format!("cannot read the snapshot commit: {}", e)))?,
-            (None, None) => block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?,
+            (None, None) => {
+                let wc = block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?;
+                let state = self.inner.workspace.lock().unwrap().working_copy().tree().cloned();
+                match state {
+                    Ok(tree) if tree.tree_ids() != wc.tree().tree_ids() => with_tree(&wc, tree),
+                    // a state that cannot be read fails the checkout,
+                    // which reads it again when it locks
+                    _ => wc,
+                }
+            }
         };
         block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished)))?;
 
@@ -990,12 +1008,13 @@ impl JjBackend {
     /// Check `commit` out, then publish `op` and record it as the operation
     /// the working copy is at; with no `op` it stays at the head. `on_disk`
     /// is the commit whose tree the working directory holds: a persisting
-    /// run's snapshot (§7.4), or the focus a run starts from. A checkout
-    /// that fails publishes nothing (§7.5 step 7, §7.7), and leaves the
-    /// saved state as it was, so the next run snapshots the directory into
-    /// the commit it came from; what the checkout had already written is
-    /// put back first (`put_back`), when the directory held exactly
-    /// `on_disk`.
+    /// run's snapshot (§7.4), the tree the working-copy state records when
+    /// the run snapshotted nothing, or the focus `undo`/`redo` start from.
+    /// A checkout that fails publishes nothing (§7.5 step 7, §7.7), and
+    /// leaves the saved state as it was, so the next run snapshots the
+    /// directory into the commit it came from; what the checkout had
+    /// already written is put back first (`put_back`), when the directory
+    /// held exactly `on_disk`.
     async fn checkout(
         &self,
         commit: &Commit,

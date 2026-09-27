@@ -1919,6 +1919,96 @@ fn a_directory_that_cannot_be_scanned_mid_run_does_not_fail_the_checkout() {
     );
 }
 
+/// A repository whose working copy is stale, as jj leaves it when it moves
+/// the working-copy commit without updating the working directory (a
+/// command run with `--ignore-working-copy`, or in another workspace): the
+/// focus is B, while the directory and the working-copy state hold its
+/// parent A. `a` is 1 in A and 2 in B, `b` is only in A, `z` only in B.
+fn stale_working_copy() -> Repo {
+    let r = setup();
+    r.write("a", "1\n");
+    r.write("b", "b\n");
+    r.j(&["describe \"A\""]).ok();
+    let saved: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(r.dir.join(".jj/working_copy"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+        .collect();
+    r.j(&["new"]).ok();
+    r.write("a", "2\n");
+    std::fs::remove_file(r.dir.join("b")).unwrap();
+    r.write("z", "z\n");
+    r.j(&["describe \"B\""]).ok();
+    for (path, bytes) in saved {
+        std::fs::write(path, bytes).unwrap();
+    }
+    r.write("a", "1\n");
+    r.write("b", "b\n");
+    std::fs::remove_file(r.dir.join("z")).unwrap();
+    r
+}
+
+/// Each commit's message and paths, top-down
+const PATHS_BY_COMMIT: &str =
+    "\\r -> show (map (\\c -> [c.message (map (\\e -> e.path) c.files)]) (commits (top r)))";
+
+#[test]
+fn a_run_over_a_stale_working_copy_writes_the_focus() {
+    // §7.4: with nothing snapshotted, persist's checkout took the directory
+    // to hold the focus as loaded. Its rescan found otherwise, so it reset
+    // the state to B, whose tree the focus shares: the checkout wrote
+    // nothing, and the state was saved claiming B's files over A's. The
+    // next run recorded A's files into the focus, a silent revert of B.
+    let r = stale_working_copy();
+    r.j(&["describe \"B2\""]).ok();
+    assert_eq!(r.read("a"), "2\n");
+    assert!(!r.dir.join("b").exists());
+    assert_eq!(r.read("z"), "z\n");
+    // the directory now holds the focus, so there is nothing to record
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["A" (blob "1\n")] ["B2" (blob "2\n")]]"#);
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B2" [["a"] ["z"]]]]"#);
+}
+
+#[test]
+fn a_failed_checkout_over_a_stale_working_copy_is_put_back() {
+    // §7.5 step 7: the rescan did not find the focus as loaded, so a
+    // checkout that failed over a stale working copy was not put back: the
+    // crash said the directory had changed while the program ran, and the
+    // directories made for the deep path stayed. The directory holds what
+    // the working-copy state records, and is put back to that. (Checked out
+    // from there without a put-back, it would keep `a` written and `b`
+    // removed, and the next run would record B with `z`, not reached, as A
+    // holds it.)
+    let r = stale_working_copy();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // written in path order: `a`, `b` (removed), then the path under `m`
+    // fails before `z` is reached
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = c.files ++ [{{ path = [{}], content = blob \"deep\" }}] }})",
+        too_deep("m")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("a"), "1\n");
+    assert_eq!(r.read("b"), "b\n");
+    assert!(!r.dir.join("z").exists());
+    assert!(!r.dir.join("m").exists());
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B" [["a"] ["z"]]]]"#);
+}
+
 #[test]
 fn replay_carries_conflicts_through() {
     // replay unwrapped each input tree's ids as resolved, so every rebase,
