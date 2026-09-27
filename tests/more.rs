@@ -330,9 +330,10 @@ fn display_commit_block() {
     assert!(out.contains("Ann Author"), "{}", out);
     assert!(out.contains("2h"), "{}", out);
     assert!(out.contains("1 files"), "{}", out);
-    // no repository in context, so no parent to compare against: every
-    // file it has is added (§5.1)
-    assert!(out.contains("  + a/b.rs"), "{}", out);
+    // no repository in context, so no parent to compare against: what it
+    // changes is not known, and its files are listed unmarked (§5.1)
+    assert!(out.contains("\n\n    a/b.rs\n"), "{}", out);
+    assert!(!out.contains('+'), "{}", out);
     // id renders with the unique prefix
     assert!(out.contains("kqqq"), "{}", out);
 }

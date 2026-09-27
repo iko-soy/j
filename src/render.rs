@@ -827,45 +827,59 @@ fn display_commit_block(
         Value::Id(i) => i.to_string(),
         _ => String::new(),
     };
+    let own = snapshot_map_of(&c.field("files")?)?;
     // the paths it changes against its parent in the given repository; with
-    // no parent there — the top of the history, or a commit the expression
-    // made — against no files, as `changeOf` does at the top
-    let from = match loaded.parents.get(&id) {
-        Some(parent) => snapshot_map_of(&parent.field("files")?)?,
-        None => SnapMap::new(),
+    // no parent there — the root, or a commit the expression made, whose
+    // parent the value does not record — what it changes is not known
+    let touched = match loaded.parents.get(&id) {
+        Some(parent) => Some(touched_in_maps(
+            &snapshot_map_of(&parent.field("files")?)?,
+            &own,
+        )?),
+        None => None,
     };
-    let touched = touched_in_maps(&from, &snapshot_map_of(&c.field("files")?)?)?;
     // the line `tree` draws for it (§5.1: "a `tree` line without rails")
     let standing = Standing {
         focus: id == loaded.focus,
         ancestor: loaded.ancestors.contains(&id),
         immutable: loaded.immutable.contains(&id),
-        empty: touched.is_empty(),
+        empty: touched.as_ref().is_some_and(|t| t.is_empty()),
     };
     out.push_str(&pad);
     out.push_str(&commit_line(interp, c, pal, &standing)?);
     out.push('\n');
     // author · age · n files — from metadata by id (§5.1)
+    let n = touched.as_ref().map_or(own.len(), |t| t.len());
     if let Ok(meta) = interp.backend.meta(&id) {
         let age = render_age(meta.time);
         out.push_str(&pad);
-        out.push_str(&format!(
-            "  {} · {} · {} files\n",
-            meta.author,
-            age,
-            touched.len()
-        ));
+        out.push_str(&format!("  {} · {} · {} files\n", meta.author, age, n));
     }
-    if !touched.is_empty() {
+    if n > 0 {
         out.push('\n');
     }
-    for (path, mark, _) in &touched {
-        out.push_str(&pad);
-        out.push_str(&format!(
-            "  {} {}\n",
-            colored_mark(*mark, pal),
-            path.join("/")
-        ));
+    match &touched {
+        Some(touched) => {
+            for (path, mark, _) in touched {
+                out.push_str(&pad);
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    colored_mark(*mark, pal),
+                    path.join("/")
+                ));
+            }
+        }
+        // its files, unmarked but for `✖`
+        None => {
+            for (path, content) in &own {
+                out.push_str(&pad);
+                if matches!(content, Value::Blob(b) if b.is_unresolved()) {
+                    out.push_str(&format!("  {} {}\n", pal.red("✖"), path.join("/")));
+                } else {
+                    out.push_str(&format!("    {}\n", path.join("/")));
+                }
+            }
+        }
     }
     Ok(())
 }

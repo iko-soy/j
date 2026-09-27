@@ -4,7 +4,9 @@ use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
 use j::eval::Interp;
 use j::parse::parse_expr;
-use j::value::{BlobContent, BlobKind, BlobVal, Crash, Env, LazyBlob, ThunkVal, Value};
+use j::value::{
+    BlobContent, BlobKind, BlobVal, ConflictSide, Crash, Env, LazyBlob, ThunkVal, Value,
+};
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
@@ -450,6 +452,54 @@ fn commit_block_marks_deletions_and_draws_the_tree_glyph() {
     // a list holding commits among other values prints each one's block
     let both = eval_and_display(&mut i, &cfg, "\\r -> [(up r).root r.root 1]", repo);
     assert_eq!(both, format!("{}\n{}\n1\n", b, c));
+}
+
+/// The line under key `key` of a displayed record, without the key.
+fn field_line<'a>(out: &'a str, key: &str) -> &'a str {
+    out.lines()
+        .find_map(|l| l.strip_prefix(key).filter(|rest| rest.starts_with(' ')))
+        .unwrap_or_else(|| panic!("no field {:?} in:\n{}", key, out))
+        .trim_start()
+}
+
+#[test]
+fn a_commit_the_expression_made_lists_its_files_unmarked() {
+    // its parent is not in the repository the expression was given, and the
+    // block diffed it against no files: `focus . new` said the new commit adds
+    // every file, where `changeOf . new` and `tree . new` say it changes
+    // nothing. What it changes is unknown there, so its block lists its files
+    // unmarked and its glyph claims no `◌` (§5.1).
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "focus . new", repo.clone());
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("○ ") && !lines[0].contains("wqzt"), "{}", out);
+    assert_eq!(lines[1..], ["", "    src/lexer.rs", "    src/parser.rs"], "{}", out);
+    let rec = eval_and_display(&mut i, &cfg, "\\r -> { c = (new r).root }", repo.clone());
+    assert!(field_line(&rec, "c").starts_with("○ "), "{}", rec);
+    // an unresolved file keeps its mark
+    let conflicted = Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Regular,
+        content: BlobContent::Conflict(vec![
+            Some(ConflictSide::regular(b"a\n")),
+            None,
+            Some(ConflictSide::regular(b"b\n")),
+        ]),
+    }));
+    let made = Value::record(&[
+        (
+            "files",
+            Value::list(vec![Value::record(&[
+                ("content", conflicted),
+                ("path", Value::list(vec![Value::text("x.txt")])),
+            ])]),
+        ),
+        ("id", Value::Id(Rc::new("kpqxnnnn".to_string()))),
+        ("labels", Value::list(vec![])),
+        ("message", Value::text("made")),
+    ]);
+    let out = j::render::display(&mut i, &made, false).unwrap();
+    assert_eq!(out, "⊗ kpqxnnnn  made\n\n  ✖ x.txt\n");
 }
 
 // ----------------------------------------------------------------------
