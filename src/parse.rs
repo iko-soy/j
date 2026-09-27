@@ -35,7 +35,8 @@ pub struct Parser {
     src: Rc<str>,
     toks: Vec<SpTok>,
     pos: usize,
-    /// Names in scope (top-level + builtins) for the no-shadowing rule.
+    /// Names in scope (top-level + builtins) for the no-shadowing rule;
+    /// in config.j the builtins alone (§4.2).
     outer_names: Rc<BTreeSet<String>>,
     /// Names bound by the lambdas and `let` blocks around the current
     /// position, for the same rule (§4.2). Since shadowing is refused, no

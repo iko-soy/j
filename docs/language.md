@@ -280,6 +280,12 @@ This is an error, not silent shadowing:
 let x = 1 in let f = \x -> x in f 2     -- parse error: `x` is already bound
 ```
 
+The one exception is inside `config.j`: a binder there may reuse the name of
+one of the config's own top-level definitions, as the reference config's
+`newCommit = \files -> …` does, and within that binder's scope the name means
+the binder. Builtin names and names bound by an enclosing lambda or `let` are
+still refused there.
+
 ### Lexical scope
 
 Names resolve lexically: innermost `let` bindings, then lambda parameters,

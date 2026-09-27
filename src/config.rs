@@ -53,6 +53,8 @@ pub fn reserved_set() -> BTreeSet<String> {
 
 /// Parse and validate config.j (§6.2). Id literals are resolved separately.
 pub fn load_config(src: &str) -> Result<Config, ConfigError> {
+    // the builtins only: config.j's binders may reuse its own top-level
+    // names (§4.2), as the reference config's `\files ->` does
     let outer = Rc::new(reserved_set());
     let items = parse_config(src, outer).map_err(ConfigError::Parse)?;
     validate_items(items)
