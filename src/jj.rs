@@ -2007,7 +2007,9 @@ fn parse_push_records(
 /// bookmark left on `origin` after the push reaches that target; and refuse
 /// to send commits with unresolved files or empty descriptions. Returns
 /// whether such a delete is allowed only because a record's new target
-/// reaches it, so the deletes must wait for the updates (push_to_origin)
+/// reaches it, so the deletes must wait for the updates (push_to_origin),
+/// and refuses a push whose deletes would wait for a bookmark git cannot
+/// create while one of them is still there
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
     repo: &Arc<ReadonlyRepo>,
@@ -2022,7 +2024,8 @@ fn check_push_records(
     // those no record names, where they are as of the last fetch or push;
     // computed for the first delete that needs them
     let mut unnamed: Option<Vec<CommitId>> = None;
-    let mut deletes_wait = false;
+    // the deletes that only records' new targets keep reached
+    let mut waiting: Vec<&str> = Vec::new();
     for (name, target) in records {
         let Some(current) = repo
             .view()
@@ -2079,7 +2082,7 @@ fn check_push_records(
                             ),
                         ));
                     }
-                    deletes_wait = true;
+                    waiting.push(name);
                 }
             }
             Some(new) => {
@@ -2091,6 +2094,29 @@ fn check_push_records(
                         format!(
                             "push: `{}` is on the immutable commit `@{}` and can only move to a descendant of it",
                             name, change_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // git cannot hold a bookmark and one under its name at once (`master`
+    // and `master/legacy`), so while the deletes wait, a first push that
+    // creates a name nesting with a deleted one is rejected and the deletes
+    // are never sent. With a bookmark no record names on the waiting
+    // delete's commit, nothing waits and it is one git push (§7.6)
+    let deletes_wait = !waiting.is_empty();
+    if deletes_wait {
+        let nests = |a: &str, b: &str| b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'));
+        for (deleted, _) in records.iter().filter(|(_, t)| t.is_none()) {
+            for (set, _) in records.iter().filter(|(_, t)| t.is_some()) {
+                if nests(deleted, set) || nests(set, deleted) {
+                    let keep = if waiting.contains(&deleted.as_str()) { deleted.as_str() } else { waiting[0] };
+                    let literal = crate::show::text_literal(keep);
+                    return Err((
+                        1,
+                        format!(
+                            "push: `{deleted}` must stay on origin until `{set}` is accepted, and git cannot create `{set}` while `{deleted}` is there; first push a temporary label on `{keep}`'s commit, `push (label \"tmp\" (labelled {literal}))`, then this push, then `push (unlabel \"tmp\")`"
                         ),
                     ));
                 }

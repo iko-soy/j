@@ -1032,7 +1032,10 @@ language: `fetch` and `push` are the only things that change them.
     record would move it to a commit that does not descend from it, or delete
     it while no bookmark left on `origin` after the push reaches that target
     (those left are the bookmarks no record names, where they are as of the
-    last `fetch` or `push`, and the records' new targets).
+    last `fetch` or `push`, and the records' new targets);
+  - the deletes would wait (below) and a bookmark it sets and one it deletes
+    are a name and a name under it, such as `master` and `master/legacy`:
+    git cannot hold both, so the first git push could not succeed.
 
   Targets and descent are commits as the remote has them: a target rewritten
   here since the last `fetch` or `push` is hidden, and not in the immutable
@@ -1047,9 +1050,13 @@ language: `fetch` and `push` are the only things that change them.
   when only records' new targets reach the commit, as when
   `rename "master" "main"` renames trunk's only bookmark, the deletes wait:
   the other updates are sent first, and the deletes in a second git push
-  only once the remote has accepted every one of them. After a successful
-  push the labels reflect the new positions. It records one operation, even
-  when it sends two git pushes. An empty list sends nothing to the remote.
+  only once the remote has accepted every one of them. To rename trunk's
+  only bookmark to a name under it, push a temporary label on its commit
+  first, `push (label "tmp" (labelled "master"))`: with it on `origin`
+  nothing waits, and `rename "master" "master/legacy"` goes as one git
+  push; then `push (unlabel "tmp")`. After a successful push the labels
+  reflect the new positions. It records one operation, even when it sends
+  two git pushes. An empty list sends nothing to the remote.
   If the remote accepts some of the updates and rejects others, that
   operation records the accepted ones, whose labels move, and `push` exits 1
   naming the rejected bookmarks and any deletes it did not send.
