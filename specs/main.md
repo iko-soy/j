@@ -470,6 +470,7 @@ as in §4.13.
 | `blob t` | a resolved regular-file blob with content `t` |
 | `text b` | the content of a blob as text; for an unresolved blob, its conflict-marker rendering |
 | `by i repo` | the repo refocused on the commit with id `i`; crashes if absent. Backed by the change-id index; its reference definition is in §10 |
+| `subtreeCommits t` | every commit of the tree `t` (anything with `root` and `children`) in preorder, in time linear in its size: the value of `t.root :: (concat (map subtreeCommits t.children) or [])`. So it crashes only if `t` has no `root`, and a node whose `children` is not a list of values that have a `root` contributes only its own. The reference `commits` is this builtin (§9) |
 | `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no header lines, three lines of context, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
 | `difft p a b` | the output of difftastic comparing `a` to `b` as the file `p`; §7.10. Crashes if `difft` is not on `PATH` |
 | `treeWith o r` | the history rendered as a tree with options record `o`; §7.11 |
@@ -1392,6 +1393,8 @@ unresolved : Blob -> Bool
 blob       : Text -> Blob                  -- a resolved regular file
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
+subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one
+                                           -- pass: what `commits` (below) is
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
                                            -- crash for a commit not yet persisted
 validate   : Repo -> Repo                  -- the repo unchanged, or the crash persisting
@@ -1439,8 +1442,11 @@ top = \repo -> top (up repo) or repo
 
 -- Every commit of a subtree (or of the focused subtree of a Repo), in preorder.
 -- Takes anything with `root` and `children`, so the signature is left open.
+-- The builtin is  \t -> t.root :: (concat (map commits t.children) or [])
+-- in one pass; written that way it copies the list below every commit, and
+-- so takes time quadratic in the length of the history.
 commits : a -> [Commit]
-commits = \t -> t.root :: (concat (map commits t.children) or [])
+commits = subtreeCommits
 
 
 ------------------------------------------------------------------------------
@@ -1532,7 +1538,7 @@ descendants : Revset                                            -- includes the 
 descendants = \repo -> map (.id) (commits repo)
 
 ancestors : Revset                                              -- includes the focus
-ancestors = \repo -> repo.root.id :: ((let p = up repo in ancestors p) or [])
+ancestors = \repo -> repo.root.id :: map (\f -> f.parent.id) repo.context
 
 siblings : Revset
 siblings = \repo -> filter (\i -> i /= repo.root.id) (kids (up repo)) or []

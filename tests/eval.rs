@@ -805,7 +805,7 @@ fn on_stack(mb: usize, f: impl FnOnce() + Send + 'static) {
 
 #[test]
 fn deep_linear_history_takes_no_native_stack_per_commit() {
-    // `commits` recurses through `map` once per level of history, and
+    // `commits` recursed through `map` once per level of history, and
     // `labelled`, `trunk` and `immutable` walk the history with it. The
     // binary evaluates `immutable` on every run (§7.2), so a long linear
     // history made every command overflow the stack and abort (§4.1). The
@@ -828,6 +828,88 @@ fn deep_linear_history_takes_no_native_stack_per_commit() {
             Value::list(vec![Value::int(n), Value::int(1), Value::int(n)])
         );
     });
+}
+
+#[test]
+fn history_walks_take_time_linear_in_the_length_of_history() {
+    // `commits` was `\t -> t.root :: (concat (map commits t.children) or [])`
+    // and `ancestors` consed the focus onto the ancestors of `up repo`. `::`
+    // and `concat` build a new list, so every level copied the whole list
+    // below it and both were quadratic in the depth of the history. The
+    // binary evaluates `immutable` on every run (§7.2), which walks the
+    // history with both through `labelled`, `trunk` and `ancestorsOf`: `j 1`
+    // took a minute on a linear history of 32000 commits. Here the history
+    // is seen from the top, its deepest commit labelled `main`, so
+    // `immutable` walks it with both. In linear time that takes seconds in a
+    // debug build; in quadratic time, many minutes. The stack is the
+    // binary's, since `by` and dropping the chain take native stack per
+    // level.
+    let n = 100_000;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || {
+            let (mut i, cfg) = make_interp();
+            let src = format!(
+                "let commit = \\l -> {{ files = [], message = \"\", labels = l, id = @ }}; \
+                 chain = foldl (\\t k -> {{ root = commit [], children = [t] }}) \
+                               ({{ root = commit [\"main\"], children = [] }}) (range 0 {n}); \
+                 repo = {{ root = chain.root, children = chain.children, context = [] }} \
+                 in [(length (commits repo)) (length (immutable repo))]"
+            );
+            let got = ev(&mut i, &cfg, &src).map(|v| j::show::show(&i, &v).unwrap());
+            let _ = tx.send(got);
+        })
+        .unwrap();
+    let limit = std::time::Duration::from_secs(60);
+    match rx.recv_timeout(limit) {
+        Ok(got) => assert_eq!(got, Ok(format!("[{m} {m}]", m = n + 1))),
+        Err(_) => panic!("walking {} commits took more than {:?}", n, limit),
+    }
+}
+
+#[test]
+fn commits_gives_what_its_recursive_definition_gave_on_any_tree() {
+    // `commits` is the builtin `subtreeCommits`, which must give what the
+    // recursive definition it replaced gives (§4.9), on malformed trees too.
+    // That definition's `or []` catches a crash anywhere under a node: only
+    // a top without `root` crashes, and a node whose `children` is not a
+    // list of values with a `root` contributes its own root alone.
+    let (mut i, cfg) = make_interp();
+    let old = "let old = \\t -> t.root :: (concat (map old t.children) or []) in";
+    let ints = |xs: &[i64]| Value::list(xs.iter().map(|&x| Value::int(x)).collect());
+    for (t, want) in [
+        ("({ root = 1, children = [] })", ints(&[1])),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ root = 3, children = [] })] }) \
+                                     ({ root = 4, children = [] })] })",
+            ints(&[1, 2, 3, 4]),
+        ),
+        ("({ root = 1, children = [], context = [] })", ints(&[1])),
+        ("({ root = 1, children = 5 })", ints(&[1])),
+        ("({ root = 1 })", ints(&[1])),
+        ("({ root = 1, children = [({ root = 2, children = [] }) 7] })", ints(&[1])),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ root = 3 })] }) \
+                                     ({ root = 4, children = [5] })] })",
+            ints(&[1, 2, 3, 4]),
+        ),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ children = [] })] }) \
+                                     ({ root = 4, children = [({ root = 5, children = \"x\" })] })] })",
+            ints(&[1, 2, 4, 5]),
+        ),
+    ] {
+        check!(i, cfg, &format!("commits {}", t), want);
+        check!(i, cfg, &format!("{} old {}", old, t), want);
+    }
+    for (t, msg) in [
+        ("5", "crash: cannot select field `root` from a Int"),
+        ("({ children = [] })", "crash: record has no field `root`"),
+    ] {
+        assert_eq!(crash(&mut i, &cfg, &format!("commits {}", t)), msg);
+        assert_eq!(crash(&mut i, &cfg, &format!("{} old {}", old, t)), msg);
+    }
 }
 
 #[test]

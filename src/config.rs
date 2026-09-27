@@ -40,7 +40,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
     "replay", "unresolved", "blob", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
-    "extract", "touchedPaths",
+    "extract", "touchedPaths", "subtreeCommits",
 ];
 
 pub fn is_reserved_builtin(name: &str) -> bool {
