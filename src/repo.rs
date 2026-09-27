@@ -460,15 +460,17 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
 
 /// The longest name a filesystem holds (NAME_MAX), in bytes: 255 on ext4,
 /// xfs, btrfs and tmpfs; the others allow 255 characters or UTF-16 units,
-/// which 255 bytes of UTF-8 never exceed.
+/// which 255 bytes of UTF-8 never exceed. One with a lower limit (encfs,
+/// eCryptfs) refuses the rest at checkout, which then records nothing
+/// (§7.5 step 7).
 const NAME_MAX: usize = 255;
 
 /// Whether a checkout cannot create the path component `comp` (§7.5 step
 /// 1). jj stores any name that is not empty and has no `/`, but its
 /// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
-/// over `NAME_MAX`, after the operation is recorded; a git tree cannot hold
-/// a NUL. Where the filesystem folds case, `.GIT` is the file `.git`, which
-/// the checkout refuses by its file identity.
+/// over `NAME_MAX`, part way through writing the focus; a git tree cannot
+/// hold a NUL. Where the filesystem folds case, `.GIT` is the file `.git`,
+/// which the checkout refuses by its file identity.
 pub fn checkout_refuses(comp: &str, folds_case: bool) -> bool {
     matches!(comp, "" | "." | ".." | ".git" | ".jj")
         || comp.contains(['/', '\0'])

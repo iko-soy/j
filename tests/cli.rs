@@ -599,6 +599,80 @@ const CONTENT_OF_A: &str =
     "\\r -> show (map (\\c -> [c.message (contentAt [\"a\"] c.files)]) (commits (top r)))";
 
 #[test]
+fn a_checkout_that_fails_records_nothing() {
+    // §7.5 step 7, §7.7: the operation was published before the checkout,
+    // so a checkout the filesystem refused (a path longer than PATH_MAX
+    // here; a name longer than a smaller NAME_MAX, a full disk) crashed
+    // with the operation recorded and the working directory half written.
+    // The working copy was never advanced, so the next run snapshotted
+    // the uncommitted edit, now overwritten on disk, into the new focus.
+    let r = setup();
+    r.write("a", "p\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "x1\n");
+    r.j(&["describe \"X\""]).ok();
+    r.write("a", "x2\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // every component is a name a checkout can create (§7.5 step 1)
+    let deep = vec![format!("\"{}\"", "d".repeat(250)); 20].join(" ");
+    let edit = format!(
+        "\\r -> mapRoot (\\c -> c {{ files = c.files ++ [{{ path = [{}], content = blob \"deep\" }}] }}) (prev r)",
+        deep
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops, "the failed checkout was recorded");
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    // the checkout wrote P's `a` before it failed; the edit is put back
+    assert_eq!(r.read("a"), "x2\n");
+    // and recorded where it was made
+    r.j(&["id"]).ok();
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["P" (blob "p\n")] ["X" (blob "x2\n")]]"#);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn undo_whose_checkout_fails_records_nothing() {
+    // §7.7: `undo` and `redo` published their operation before checking the
+    // restored focus out, and so recorded it when that failed
+    let r = setup();
+    r.write("a", "one\n");
+    // a file as deep as this workspace can hold (PATH_MAX, 4096 bytes with
+    // the NUL), and no deeper
+    let root = r.dir.canonicalize().unwrap();
+    let n = (4095 - root.as_os_str().len() - "/f".len()) / 251;
+    let deep: PathBuf = (0..n).map(|_| "d".repeat(250)).collect();
+    std::fs::create_dir_all(r.dir.join(&deep)).unwrap();
+    std::fs::write(r.dir.join(&deep).join("f"), "deep\n").unwrap();
+    r.j(&["describe \"deep\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_dir_all(r.dir.join("d".repeat(250))).unwrap();
+    r.write("a", "two\n");
+    r.j(&["id"]).ok();
+    // 300 bytes further down, the workspace can no longer hold it
+    let aside = r.dir.with_extension("aside");
+    std::fs::rename(&r.dir, &aside).unwrap();
+    let moved = r.dir.join("m".repeat(150)).join("m".repeat(150));
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&aside, &moved).unwrap();
+    let r = Repo { dir: moved, cfg: r.cfg.clone() };
+    let ops = r.j(&["ops"]).ok().stdout;
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout, ops, "the failed undo was recorded");
+    // the checkout wrote `a` before it failed; it is put back, so the
+    // working directory still equals the focus and there is nothing to record
+    assert_eq!(r.read("a"), "two\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+}
+
+#[test]
 fn reserved_names_in_another_case_refused_where_the_filesystem_folds_case() {
     // on a case-folding filesystem (macOS, Windows) `.GIT` is `.git`, which
     // jj's checkout refuses after the operation is recorded; elsewhere it is

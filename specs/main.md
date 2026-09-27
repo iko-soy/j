@@ -919,12 +919,14 @@ Within it:
    and none both a file and a directory (§7.3); every path component of the
    focus, and of every other commit that is not in `old` or whose files
    differ from its files there (§7.3), is a name a checkout can create: not
-   empty, `.`, `..`, `.git` or `.jj`, at most 255 bytes long, and without `/`
-   or NUL; where the working directory's filesystem folds case, `.git` and
-   `.jj` are refused in any letter case. (Any other commit that keeps its
-   files is neither checked out nor written with a name jj has not already
-   stored, and a fetched branch can hold any name git can.) Violations crash
-   with a message naming the rule.
+   empty, `.`, `..`, `.git` or `.jj`, at most 255 bytes long (the limit of
+   common filesystems; where a filesystem's is lower, or a whole path
+   outgrows the system's limit, the checkout of step 7 refuses it instead),
+   and without `/` or NUL; where the working directory's filesystem folds
+   case, `.git` and `.jj` are refused in any letter case. (Any other commit
+   that keeps its files is neither checked out nor written with a name jj
+   has not already stored, and a fetched branch can hold any name git can.)
+   Violations crash with a message naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.
@@ -957,7 +959,11 @@ Within it:
    `new.root.id`. (`abandon` and `squash` end with `new` for this reason, so
    they are safe on a commit directly above `main`; navigation onto `main`
    is written `new . goto trunk`.)
-7. Commit the operation, then perform the checkout of §7.4.
+7. Perform the checkout of §7.4, then commit the operation. A checkout
+   that fails (a path the filesystem cannot hold, a full disk) crashes
+   without committing it, so nothing is recorded, and puts back what it had
+   written, as far as it can, unless the working directory changed while
+   the program ran.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
@@ -1042,7 +1048,9 @@ discarded, marked as a redo. Otherwise exit 1 with `j: nothing to redo`.
 
 Both refuse, before doing anything, if the working directory differs from the
 focused commit's files: `j: working copy has changes not in @; run \`j id\`
-to record them or discard them`. Both check out the restored focus afterwards.
+to record them or discard them`. Both check out the restored focus before
+recording their operation, and record nothing if that checkout fails
+(§7.5 step 7).
 Undoing a `push` restores the recorded labels and leaves the remote untouched.
 
 **`ops`** prints the operation log, newest first, one line each: relative
