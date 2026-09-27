@@ -292,6 +292,18 @@ constS = const inc
 
 plus : Int -> Int -> Int
 plus = (+)
+
+dd : Path -> a
+dd = difft
+
+k3 : (Int -> Int -> Int) -> b
+k3 = foldl
+
+ff : a
+ff = foldl
+
+k4 : a
+k4 = foldl (+)
 "#,
     );
     for (src, want) in [
@@ -310,6 +322,20 @@ plus = (+)
         ("show tree", "tree"),
         ("show squash", "squash"),
         ("show everything", "everything"),
+        // a builtin that takes more arguments than a signature ending in a
+        // type variable lists shows all it is given after the definition's
+        // name: the signature stops counting at its end, and `k3 (+) 0`
+        // showed as `k3 0`, which pasted back passes k3 `0` where it wants
+        // a function
+        ("show (dd ./a)", "dd [\"a\"]"),
+        ("show (dd ./a (blob \"x\"))", "dd [\"a\"] (blob \"x\")"),
+        ("show (k3 (+))", "k3 ((+))"),
+        ("show (k3 (+) 0)", "k3 ((+)) 0"),
+        ("show ff", "ff"),
+        ("show (ff (+))", "ff ((+))"),
+        ("show (ff (+) 0)", "ff ((+)) 0"),
+        ("show k4", "k4"),
+        ("show (k4 0)", "k4 0"),
         // a builtin, and its partial application, keep theirs
         ("show ((+) 1)", "(+) 1"),
         ("show (const 1)", "const 1"),
@@ -324,10 +350,15 @@ plus = (+)
     assert!(m.contains("addTwo expected Int as argument 2, got Text"), "{}", m);
     let m = crash_msg(&mut i, &cfg, "plus 1 \"x\"");
     assert!(m.contains("plus expected Int as argument 2, got Text"), "{}", m);
+    // what the ones past their signature show as pastes back to the same
+    // function
+    assert_value(&mut i, &cfg, "k3 ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "ff ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "k4 0 [1 2 3]", Value::int(6));
     // and a function displays as it shows (§5.1)
-    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2 }").unwrap();
+    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2, c = k3 (+) 0 }").unwrap();
     let out = display(&mut i, &v);
-    assert_eq!(out, "a  tree\nb  addTwo 2\n");
+    assert_eq!(out, "a  tree\nb  addTwo 2\nc  k3 ((+)) 0\n");
 }
 
 #[test]
