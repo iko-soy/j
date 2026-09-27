@@ -304,9 +304,16 @@ Notes:
   Records keep commas.
 - Lambda, `if`, `let`, and `or` extend as far right as possible.
 - Patterns are variables and `_` only. No literal, list, or record patterns.
-- Nesting is bounded: input nested deeper than the parser allows (thousands
-  of levels of brackets, `\`/`if`/`let` bodies, or right-associative operator
-  chains) is a parse error, never a stack overflow.
+- Nesting is bounded: an expression more than 40,000 levels deep is a parse
+  error (§1.4), never a stack overflow. A name, literal, `(op)` or `.name`
+  accessor is one level; a parenthesis or section, and the braces of a record
+  or update, are two levels above what they enclose; every other construct
+  is one level above its highest part. A chain `a + b + c …`, `f x y …` or
+  `r.a.b …` is thus one level deeper per link, as are right-associative
+  operators, `or`, and `\`/`if`/`let` bodies. Lists nest 40,000 deep,
+  parentheses and records about 20,000, and a `Subtree` as `show` renders it
+  (§5.2) about 8,000. A type in `config.j` is bounded the same way: one
+  level, plus one for each bracket, parenthesis, field or `->` around it.
 
 ---
 
@@ -660,9 +667,10 @@ j: crash: expected one revision, got 0
 ### 5.2 `show`
 
 `show v` renders `v` as an expression in the language, such that for every
-value except closures and unresolved blobs, `show v` parses and evaluates to a
-value equal to `v` under the same `config.j`. It never uses colour and never
-truncates.
+value except closures, unresolved blobs, and values nested past the parser's
+bound (§3.4: a list 40,000 deep, a record about 20,000), `show v` parses and
+evaluates to a value equal to `v` under the same `config.j`. It never uses
+colour and never truncates.
 
 | kind | rendering |
 |---|---|

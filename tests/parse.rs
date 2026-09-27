@@ -463,3 +463,87 @@ fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
         cfg(&format!("f : {}Int{}\n", "[".repeat(m), "]".repeat(m)));
     });
 }
+
+#[test]
+fn long_left_chains_are_bounded_like_nesting() {
+    // §3.4: the parser builds a left-associative chain in a loop, not by
+    // recursion, but its tree is as tall as the chain is long, and every
+    // pass over the tree after the parse (and dropping it) recurses on that
+    // height. So a chain past the bound is a parse error too, and so is one
+    // that reaches past it only together with the chains it is nested in.
+    on_worker_stack(|| {
+        let n = 1_000_000;
+        let (k, m) = (100, 10_000);
+        let mut chains = "1".to_string();
+        for _ in 0..k {
+            chains = format!("({}{})", chains, " + 1".repeat(m));
+        }
+        for src in [
+            format!("1{}", " + 1".repeat(n)),
+            format!("f{}", " x".repeat(n)),
+            format!("x{}", ".a".repeat(n)),
+            format!("x{}", " { a = 1 }".repeat(n)),
+            chains,
+        ] {
+            let msg = perr(&src);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &src[..20], msg);
+        }
+        for src in [format!("f = 1{}\n", " + 1".repeat(n)), format!("f = g{}\n", " x".repeat(n))] {
+            match parse_config(&src, outer()) {
+                Ok(_) => panic!("a chain {} long parsed in config.j", n),
+                Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+            }
+        }
+        // chains far longer than anything written by hand still parse
+        p(&format!("1{}", " + 1".repeat(m)));
+        p(&format!("f{}", " x".repeat(m)));
+        p(&format!("x{}", ".a".repeat(m)));
+        p(&format!("x{}", " { a = 1 }".repeat(m)));
+    });
+}
+
+#[test]
+fn nesting_bound_counts_levels_as_the_spec_says() {
+    // §3.4: an expression is at most 40,000 levels deep. A leaf is one
+    // level, a parenthesis or the braces of a record or update two more than
+    // what is inside, and any other construct one more than its highest
+    // part. Each case is (source nested k deep, the deepest k that parses).
+    on_worker_stack(|| {
+        const MAX: usize = 40_000;
+        let lambdas = |k: usize| (0..k).map(|i| format!("\\x{} -> ", i)).collect::<String>();
+        let subtree = |k: usize| {
+            // as `show` renders a `Subtree`: 1 + 2 + 2 levels each
+            (0..k).fold("[]".to_string(), |s, _| format!("[({{ children = {}, root = 1 }})]", s))
+        };
+        let chained = |k: usize| format!("(1{}){}", " + 1".repeat(20_000), " + 1".repeat(k));
+        let cases: Vec<(Box<dyn Fn(usize) -> String>, usize)> = vec![
+            (Box::new(|k| format!("{}{}", "[".repeat(k), "]".repeat(k))), MAX),
+            (Box::new(|k| format!("{}1{}", "(".repeat(k), ")".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("{}1{}", "(+ ".repeat(k), ")".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("{}1{}", "{ a = ".repeat(k), " }".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("x{}", " { a = 1 }".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("1{}", " + 1".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("f{}", " x".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("x{}", ".a".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("{}[]", "1 :: ".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("{}1", "if true then 1 else ".repeat(k))), MAX - 1),
+            (Box::new(move |k| format!("{}1", lambdas(k))), MAX - 1),
+            (Box::new(subtree), (MAX - 1) / 5),
+            // a chain around a parenthesised chain: 20,001 + 2 + k
+            (Box::new(chained), MAX - 20_003),
+        ];
+        for (src, k) in cases {
+            p(&src(k));
+            let deeper = src(k + 1);
+            let msg = perr(&deeper);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &deeper[..20], msg);
+        }
+        // a type in config.j: one level, and one more for each bracket
+        let ty = |k: usize| format!("f : {}Int{}\n", "[".repeat(k), "]".repeat(k));
+        cfg(&ty(MAX - 1));
+        match parse_config(&ty(MAX), outer()) {
+            Ok(_) => panic!("a type {} deep parsed", MAX + 1),
+            Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+        }
+    });
+}

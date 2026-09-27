@@ -116,6 +116,34 @@ fn show_nested_list_atoms() {
 }
 
 #[test]
+fn show_roundtrips_values_nested_up_to_the_parsers_bound() {
+    // §5.2 exempts only values whose rendering nests past §3.4's bound of
+    // 40,000 levels, where a list is one level and a record's braces two. A
+    // bound of half that refused to read back a record nested 10,000 deep.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024) // the binary's worker stack (main.rs)
+        .spawn(|| {
+            let (mut i, cfg) = make_interp();
+            // `k` records around an Int: 2k + 1 levels; `k` lists: k levels
+            let records = |k: usize| (0..k).fold(Value::int(1), |v, _| Value::record(&[("a", v)]));
+            let lists = |k: usize| (1..k).fold(Value::list(vec![]), |v, _| Value::list(vec![v]));
+            roundtrip(&mut i, &cfg, &records(19_999));
+            roundtrip(&mut i, &cfg, &lists(40_000));
+            // one level deeper is a parse error, never a stack overflow
+            let outer = Rc::new(cfg.global_names.clone());
+            for v in [records(20_000), lists(40_001)] {
+                match parse_expr(&show(&i, &v), outer.clone()) {
+                    Ok(_) => panic!("a value nested past the bound read back"),
+                    Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn show_unresolved_blob() {
     let (i, _cfg) = make_interp();
     let v = Value::Blob(Rc::new(BlobVal {
