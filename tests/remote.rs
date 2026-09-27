@@ -405,8 +405,8 @@ fn failed_clone_removes_only_the_directories_it_created() {
     // The clone went into it, and when it failed its cleanup removed
     // everything there. A failed clone into `a/b/c` left `a/b`. A DIR that
     // exists only once its parents are created is now refused, and a failed
-    // clone removes the directories it created, DIR's missing parents
-    // included, and nothing else.
+    // clone removes the DIR it created and each missing parent it created
+    // that is then empty, and nothing else.
     let env = setup();
     let work = env.dir.join("work");
     std::fs::create_dir_all(work.join("keep")).unwrap();
@@ -446,6 +446,40 @@ fn failed_clone_removes_only_the_directories_it_created() {
         let out = env.j(&work, &["clone", missing.to_str().unwrap(), dest]);
         assert_eq!(out.code, 1, "clone into {}: {}", dest, out.stderr);
         assert_eq!(listing(&work), before, "clone into {}", dest);
+    }
+    // A parent it created keeps what something else put there while the
+    // clone ran: removing each one whole deleted a sibling clone, made in
+    // parallel into the same new `vendor/`, when this one failed. Here the
+    // `git` that fetches writes into the parent, then fails
+    use std::os::unix::fs::PermissionsExt;
+    let wrapper = env.dir.join("git-fetch-fails");
+    for (keep, left) in [
+        ("a/keep.txt", &["a", "a/keep.txt"][..]),
+        ("a/b/keep.txt", &["a", "a/b", "a/b/keep.txt"][..]),
+    ] {
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in *\" fetch \"*) echo k > '{}'; exit 1;; esac\nexec git \"$@\"\n",
+            work.join(keep).display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new(j_bin())
+            .args(["clone", env.remote.to_str().unwrap(), "a/b/c"])
+            .current_dir(&work)
+            .env("XDG_CONFIG_HOME", &env.cfg)
+            .env("NO_COLOR", "1")
+            .env("J_GIT", &wrapper)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr);
+        assert!(stderr.contains("fetch failed"), "{}", stderr);
+        let mut expected = before.clone();
+        expected.extend(left.iter().map(|p| p.to_string()));
+        expected.sort();
+        assert_eq!(listing(&work), expected, "{} written during the clone", keep);
+        assert_eq!(std::fs::read_to_string(work.join(keep)).unwrap(), "k\n");
+        std::fs::remove_dir_all(work.join("a")).unwrap();
     }
     env.j(&work, &["clone", env.remote.to_str().unwrap(), "new/../fresh"]).ok();
     assert_eq!(std::fs::read_to_string(work.join("fresh/a.txt")).unwrap(), "one\n");

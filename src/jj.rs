@@ -1781,7 +1781,8 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     }
     let existed = dir_path.is_dir();
     // the directories this run creates, in order: a clone that fails
-    // removes these, or an existing DIR's entries, and nothing else (§7.8).
+    // removes DIR and those of its parents left empty, or an existing DIR's
+    // entries, and nothing else (§7.8).
     // Each is made by `create_dir`, whose success proves it new. The checks
     // above read DIR as written, before its missing parents exist; once
     // they do, `new/..` or `new/../keep` names a directory that was there,
@@ -1820,8 +1821,15 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
         // working-copy commit would claim files the checkout never wrote,
         // and a later clone would refuse the directory (§7.8)
         if !existed {
-            for p in created.iter().rev() {
-                let _ = std::fs::remove_dir_all(p);
+            // DIR, the last one created, goes whole; a parent holds nothing
+            // of the clone's but DIR, so it goes only if left empty: what
+            // else was put there meanwhile, a sibling clone say, stays
+            for (i, p) in created.iter().enumerate().rev() {
+                let _ = if i + 1 == created.len() {
+                    std::fs::remove_dir_all(p)
+                } else {
+                    std::fs::remove_dir(p)
+                };
             }
         } else if let Ok(entries) = std::fs::read_dir(&dir_path) {
             for entry in entries.flatten() {

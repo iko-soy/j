@@ -1154,8 +1154,9 @@ that state, §7.2 applies.
   default bookmark target (or of the root commit if the remote has none),
   holding that target's files (see below), and checks it out. The default
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
-  checkout included, records nothing and removes the directories it created,
-  or empties the `DIR` it found empty, and nothing else. It requires `user`.
+  checkout included, records nothing and removes the `DIR` it created and each
+  parent it created that is then empty, or empties the `DIR` it found empty,
+  and nothing else. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
