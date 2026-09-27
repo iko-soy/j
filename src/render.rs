@@ -754,11 +754,22 @@ fn colored_mark(mark: char, pal: &Palette) -> String {
     }
 }
 
-/// The loaded repository (§1.2), indexed for displaying `Commit` values. A
-/// commit value records neither its parent nor where it stands, so its block
-/// reads both from the commit with the same id there, as it reads author and
-/// age (§5.1). Indexed once per displayed value, not once per commit: a list
-/// of commits would otherwise walk the history once for each.
+/// The repository the expression was given (§1.2 step 4, after the
+/// snapshot), or, where only the loaded one is set (the interpreter tests),
+/// that one.
+fn given_repo(interp: &Interp) -> Option<Value> {
+    let given = interp.given_repo.borrow().clone();
+    given.or_else(|| interp.old_repo.borrow().clone())
+}
+
+/// The repository the expression was given (`given_repo`), indexed for
+/// displaying `Commit` values. A commit value records neither its parent nor
+/// where it stands, so its block reads both from the commit with the same id
+/// there, as it reads author and age (§5.1). Not the repository as loaded:
+/// the snapshot has rebased every descendant of the focus since, and the
+/// values displayed come from after it. Indexed once per displayed value, not
+/// once per commit: a list of commits would otherwise walk the history once
+/// for each.
 struct Loaded {
     /// the parent of every commit that has one
     parents: BTreeMap<String, Value>,
@@ -776,8 +787,7 @@ impl Loaded {
             ancestors: BTreeSet::new(),
             immutable: BTreeSet::new(),
         };
-        let old = interp.old_repo.borrow().clone();
-        let Some(repo) = old else {
+        let Some(repo) = given_repo(interp) else {
             return Ok(loaded);
         };
         if let Value::Id(i) = repo.field("root")?.field("id")? {
@@ -817,7 +827,7 @@ fn display_commit_block(
         Value::Id(i) => i.to_string(),
         _ => String::new(),
     };
-    // the paths it changes against its parent in the loaded repository; with
+    // the paths it changes against its parent in the given repository; with
     // no parent there — the top of the history, or a commit the expression
     // made — against no files, as `changeOf` does at the top
     let from = match loaded.parents.get(&id) {
@@ -899,10 +909,10 @@ pub fn render_date(time: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// the repo value in context (the loaded repo), for resolving ids to commits
+/// the repo value in context (the one the expression was given), for
+/// resolving ids to commits
 fn top_of(interp: &Interp, _x: &Value) -> Result<Value, Crash> {
-    let old = interp.old_repo.borrow().clone();
-    old.ok_or_else(|| Crash::new("display: no repository in context"))
+    given_repo(interp).ok_or_else(|| Crash::new("display: no repository in context"))
 }
 
 fn display_list_block(
@@ -1052,7 +1062,7 @@ fn display_list_block(
         return Ok(());
     }
     // one block per item, separated by a blank line; the commits among them
-    // share one index of the loaded repository
+    // share one index of the given repository
     let mut loaded: Option<Loaded> = None;
     for (i, x) in xs.iter().enumerate() {
         if i > 0 {

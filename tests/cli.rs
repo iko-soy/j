@@ -1099,6 +1099,60 @@ fn focus_lists_the_paths_the_commit_changes() {
 }
 
 #[test]
+fn a_commit_is_shown_where_it_stands_after_the_snapshot() {
+    // a commit's block read its parent from the repository as loaded, before
+    // the snapshot, while the commit came from the repository the expression
+    // was given, where the snapshot has rebased every descendant of the
+    // focus: a dirty focus's edits showed as its child's own changes, and an
+    // empty grandchild was drawn `○` with a path it does not change (§5.1)
+    let r = setup();
+    r.write("a.txt", "one\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("c.txt", "c\n");
+    r.j(&["describe \"C\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"E\""]).ok();
+    r.j(&["prev"]).ok();
+    r.j(&["prev"]).ok();
+    r.write("a.txt", "one\ntwo\n");
+    let out = r.j(&["focus . next"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("○ ") && lines[0].ends_with("  C"), "{}", out);
+    assert!(lines[1].ends_with(" · 1 files"), "{}", out);
+    assert_eq!(lines[2..], ["", "  + c.txt"], "{}", out);
+    let tree = r.j(&["tree"]).ok().stdout;
+    assert!(tree_row(&tree, "E").contains('◌'), "{}", tree);
+    let out = r.j(&["focus . next . next"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("◌ ") && lines[0].ends_with("  E"), "{}", out);
+    assert!(lines[1].ends_with(" · 0 files"), "{}", out);
+    assert_eq!(lines.len(), 2, "{}", out);
+}
+
+#[test]
+fn a_commit_table_reads_its_commits_after_the_snapshot() {
+    // a list of ids looked its commits up in the repository as loaded, before
+    // the snapshot rebased the focus's descendants: a child that the working
+    // directory's edit puts in conflict was drawn `○` where `tree` and the
+    // child's own line draw `⊗` (§5.1)
+    let r = setup();
+    r.write("a.txt", "one\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "C\n");
+    r.j(&["describe \"C\""]).ok();
+    r.j(&["prev"]).ok();
+    r.write("a.txt", "zero\n");
+    let tree = r.j(&["tree"]).ok().stdout;
+    assert!(tree_row(&tree, "C").contains('⊗'), "{}", tree);
+    let out = r.j(&["\\r -> [(next r).root.id]"]).ok().stdout;
+    assert!(out.starts_with("⊗ ") && out.ends_with("  C\n"), "{}", out);
+    let out = r.j(&["\\r -> { c = (next r).root }"]).ok().stdout;
+    assert!(out.starts_with("c  ⊗ ") && out.ends_with("  C\n"), "{}", out);
+}
+
+#[test]
 fn redo_twice_in_a_row() {
     // the second redo followed the redo marker to the undo it reversed and
     // restored *that* view, instead of looking outward for an undo that had

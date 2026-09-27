@@ -349,6 +349,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         return err(3, format!("config.j: {}", c.msg));
     }
     *interp.old_repo.borrow_mut() = Some(loaded_repo.clone());
+    *interp.given_repo.borrow_mut() = Some(current_repo.clone());
     let env = interp.global_env();
     let expr_rc = Rc::new(expr);
     let mut v = match interp.eval(&expr_rc, &env) {

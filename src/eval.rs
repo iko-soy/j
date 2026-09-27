@@ -22,6 +22,10 @@ pub struct Interp {
     pub current_def: RefCell<Option<String>>,
     /// the repository as loaded, before snapshotting (for `validate`)
     pub old_repo: RefCell<Option<Value>>,
+    /// the repository the expression was given (§1.2 step 4, after the
+    /// snapshot), where displaying a `Commit` reads where it stands (§5.1);
+    /// `old_repo` when unset
+    pub given_repo: RefCell<Option<Value>>,
     /// Results of applying a config revset the binary itself calls (`trunk`,
     /// `immutable`), keyed by the identity of the Repo record they were
     /// applied to. Both are pure and both are asked for more than once per
@@ -320,6 +324,7 @@ impl Interp {
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
+            given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
         }
@@ -378,6 +383,7 @@ impl Interp {
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
+            given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
         }

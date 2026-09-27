@@ -599,11 +599,12 @@ An empty list of any kind prints `none` (dim) in block form and `0 …` in
 line form. Author and age in a `Commit` block are read from jj's commit
 metadata by id;
 they are not fields of the value. Nor is where it stands, which is read by id
-from the repository as loaded (§1.2): its paths are those it changes against
-its parent's files there, or against no files where it has no parent there
-(the top of the history, or a commit the expression made), and its glyph is
-the one `tree` draws for it there, with `⊗` and `◌` judged by the value's own
-files. A list of `[Text]` prints as paths because
+from `r`, the repository the expression was given (§1.2 step 4, after the
+snapshot): its paths are those it changes against its parent's files there,
+or against no files where it has no parent there (the top of the history, or
+a commit the expression made), and its glyph is the one `tree` draws for it
+there, with `⊗` and `◌` judged by the value's own files. A list of `[Text]`
+prints as paths because
 that is what such a list is in every base function; `show` is available
 when the literal is wanted. Alignment in tables and columns uses display
 width (East Asian wide characters count two cells, combining marks zero), not
