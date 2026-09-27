@@ -283,6 +283,22 @@ pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
     parent_rc(k).map(|r| (**r).clone())
 }
 
+/// Drop `k`, a continuation a crash abandons, one frame at a time. A frame
+/// drops its parent with it, so dropping a chain as long as the recursion a
+/// crash ended took native stack per frame, and a crash at the bottom of a
+/// deep recursion aborted the process instead of being reported or caught
+/// (§4.1, §4.7). The walk stops at a frame another chain still holds.
+fn drop_chain(k: Cont) {
+    let mut parent = parent_rc(&k).cloned();
+    drop(k);
+    while let Some(rc) = parent {
+        parent = match Rc::try_unwrap(rc) {
+            Ok(frame) => parent_rc(&frame).cloned(),
+            Err(_) => None,
+        };
+    }
+}
+
 /// The innermost definition whose application `k` continues (§1.4): a
 /// signed definition's application runs under the `CheckExpr` of its result,
 /// the body of a definition's lambda under an `InDef` naming it unless that
@@ -302,6 +318,27 @@ fn innermost_def(k: &Cont) -> Option<String> {
             _ => {}
         }
         k = parent_rc(k)?;
+    }
+}
+
+/// True when `k` starts with the frames a body of the signed definition
+/// `name` pushes when `cexpr` is what remains of its signature: the check of
+/// its value and, while `cexpr` lists further arguments, the naming of that
+/// value as the definition's partial application. A body applied under them
+/// is a call in tail position of the same definition (`shortS (n - 1)` in
+/// `shortS`'s body), and its own frames would check the same value against
+/// the same contract under the same name once more and name it afresh, only
+/// for the outer naming to replace that name (NamePartial). The outer frames
+/// serve for both, so a signed tail recursion keeps its continuation
+/// constant in size, as an unsigned one does (§4.1, §4.13).
+fn checks_already(k: &Cont, name: &str, cexpr: &crate::shape::ContractExpr) -> bool {
+    match k {
+        Cont::CheckExpr { name: n, cexpr: c, cont } if n == name && c.same_as(cexpr) => {
+            cexpr.is_exhausted()
+                || matches!(&**cont, Cont::NamePartial { name: m, cexpr: d, .. }
+                    if m == name && d.same_as(cexpr))
+        }
+        _ => false,
     }
 }
 
@@ -618,13 +655,18 @@ impl Interp {
                             None => break None,
                         }
                     };
+                    // the frames up to the Try, or all of them, are abandoned
                     match caught {
-                        Some(next) => st = next,
+                        Some(next) => {
+                            drop_chain(active);
+                            st = next
+                        }
                         None => {
                             let mut c = c;
                             if c.def.is_none() {
                                 c.def = innermost_def(&active);
                             }
+                            drop_chain(active);
                             return Err(c);
                         }
                     }
@@ -1056,6 +1098,10 @@ impl Interp {
                 args,
                 cont,
             } => {
+                // a value the same definition named already, by a recursive
+                // call that was no tail call (`let r = f (n - 1) in r`), is
+                // named afresh rather than wrapped once more per call
+                let v = crate::value::named_inner(&v, &name, &cexpr).unwrap_or(v);
                 let named = crate::value::named_apply(v, args, &name, cexpr);
                 Run::Step(State::Ret(named, (*cont).clone()))
             }
@@ -1342,6 +1388,9 @@ impl Interp {
                         // when a body runs, or whether an `or` around the
                         // application catches its crash (§4.6, §4.13)
                         let k = match (cname, advanced) {
+                            // a tail call of the signed definition whose
+                            // body `k` continues: its frames serve this one
+                            (Some(n), Some(c)) if checks_already(&k, &n, &c) => k,
                             (Some(n), Some(c)) => {
                                 // a lambda that runs out of parameters before
                                 // its signature (`describe = \m -> mapRoot …`)

@@ -373,6 +373,20 @@ impl ContractExpr {
         }
     }
 
+    /// True when both are the same signature at the same position, so that
+    /// checking against one after the other repeats every check: the same
+    /// definition's contract, advanced as far. Only a known signature is
+    /// compared; any other is never the same.
+    pub fn same_as(&self, other: &ContractExpr) -> bool {
+        match (self, other) {
+            (
+                ContractExpr::Known { contract: a, at: i },
+                ContractExpr::Known { contract: b, at: j },
+            ) => Rc2::ptr_eq(a, b) && i == j,
+            _ => false,
+        }
+    }
+
     /// Check an argument to this function. The outer ApplyFirst layer (if
     /// any) accounts for the argument currently being consumed.
     pub fn check_arg(&self, shapes: &Shapes, fname: &str, v: &Value) -> Result<(), Crash2> {

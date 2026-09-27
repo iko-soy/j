@@ -657,6 +657,75 @@ fn unsigned_tail_recursion_keeps_its_continuation_constant() {
     });
 }
 
+/// Signed recursions whose lambdas take fewer parameters than their
+/// signatures, or as many, for the space they take (§4.1, §4.13).
+const SIGNED_TAIL: &str = r#"
+shortS : Int -> Int -> Int
+shortS = \n -> if n == 0 then (\a -> a) else shortS (n - 1)
+
+countS : Int -> Edit
+countS = \n -> if n == 0 then id else countS (n - 1)
+
+endS : Int -> Int
+endS = \n -> if n == 0 then crash "end" else endS (n - 1)
+
+endShortS : Int -> Int -> Int
+endShortS = \n -> if n == 0 then crash "end" else endShortS (n - 1)
+
+letS : Int -> Int -> Int
+letS = \n -> if n == 0 then (\a -> a) else (let r = letS (n - 1) in r)
+
+evenS : Int -> Int -> Int
+evenS = \n -> if n == 0 then (\a -> a) else oddS (n - 1)
+
+oddS : Int -> Int -> Int
+oddS = \n -> if n == 0 then (\a -> a) else evenS (n - 1)
+
+endEvenS : Int -> Int -> Int
+endEvenS = \n -> if n == 0 then crash "end" else endOddS (n - 1)
+
+endOddS : Int -> Int -> Int
+endOddS = \n -> if n == 0 then crash "end" else endEvenS (n - 1)
+"#;
+
+#[test]
+fn signed_tail_recursion_keeps_its_continuation_constant() {
+    // §4.1, §4.13: a signature only adds checks, so a signed tail recursion
+    // takes the space of its unsigned twin. Every call of `shortS` pushed
+    // its own check and naming under the caller's, and the value came back
+    // as `\x -> f x` wrapped once per call: holding it took a gigabyte at a
+    // million calls, and dropping it recursed once per wrapper on the
+    // native stack and aborted the process. A crash at the end of such a
+    // chain dropped the continuation at once, the same way. A recursion
+    // that is not a tail call, or goes through another signed definition,
+    // still returns through every call, but its value drops as any other,
+    // and so does its continuation when a crash abandons it.
+    on_stack(4, || {
+        let (mut i, cfg) = make_interp_with(SIGNED_TAIL);
+        let n = 50000;
+        check!(i, cfg, &format!("let f = shortS {n} in 1"), Value::int(1));
+        check!(i, cfg, &format!("let e = countS {n} in 1"), Value::int(1));
+        check!(i, cfg, &format!("show (shortS {n})"), Value::text(format!("shortS {n}")));
+        check!(i, cfg, &format!("shortS {n} 7"), Value::int(7));
+        for f in ["endS", "endShortS"] {
+            let (msg, def) = crash_in(&mut i, &cfg, &format!("{f} {n}"));
+            assert_eq!((msg.as_str(), def.as_deref()), ("end", Some(f)));
+        }
+        for f in ["letS", "evenS"] {
+            check!(i, cfg, &format!("let g = {f} {n} in 1"), Value::int(1));
+            check!(i, cfg, &format!("{f} {n} 7"), Value::int(7));
+        }
+        let (msg, def) = crash_in(&mut i, &cfg, &format!("endEvenS {n}"));
+        assert_eq!((msg.as_str(), def.as_deref()), ("end", Some("endEvenS")));
+        check!(i, cfg, &format!("endEvenS {n} or 5"), Value::int(5));
+        // the checks the frames stood for still hold
+        let m = crash(&mut i, &cfg, &format!("shortS {n} \"x\""));
+        assert!(m.contains("contract: shortS expected Int as argument 2, got Text"), "{}", m);
+        let m = crash(&mut i, &cfg, &format!("countS {n} 5"));
+        assert!(m.contains("contract: countS expected Repo (record) as argument 2"), "{}", m);
+    });
+}
+
 #[test]
 fn new_id_mints_distinct_ids() {
     let (mut i, cfg) = make_interp();
