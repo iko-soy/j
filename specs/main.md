@@ -730,7 +730,7 @@ use: `show` writes no stand-in for the part.
 | unresolved `Blob` | `{- unresolved -} blob "…"` with the conflict-marker rendering |
 | builtin | its declared name, operators parenthesised: `map`, `(++)` |
 | selector | the selector itself: `.id` |
-| top-level definition | its name |
+| top-level definition with a signature whose value is a function | its name |
 | revset from a label literal | `%name` |
 | shape | its type name: `Commit`, `Id` |
 | lambda closure | its source text, exactly as written |
@@ -740,10 +740,13 @@ A lambda's source text runs from its `\` to the last token of its body,
 comments within it included, and a section's is the section itself, which
 unlike a lambda is an atom: `map (+ 1)`, `(\x y -> x + y) 1`.
 
-A top-level definition renders as its name whatever its value is built from,
-and its partial application as its name followed by the arguments it was
-given, never by those its value holds: `prev`, not `prev (parents)` (with
-`prev = goto parents`), `tree`, not `treeWith ({ … })`, and `addT 1` (§4.13).
+A top-level definition with a signature whose value is a function renders as
+its name whatever that function is built from, and its partial application
+as its name followed by the arguments it was given, never by those its value
+holds: `prev`, not `prev (parents)` (with `prev = goto parents`), `tree`, not
+`treeWith ({ … })`, and `addT 1` (§4.13). Any other definition renders as its
+value: `user` as its record, and without signatures `inc = \x -> x + 1` as
+`\x -> x + 1` and `incAll = map inc` as `map (\x -> x + 1)`.
 
 Line breaking: one line if it fits in 80 columns (display width, as in §5.1);
 otherwise the outermost list or record breaks one element per line, two-space
@@ -890,24 +893,31 @@ some other value in its place.
   would be).
 - A path that is a file in one of the three snapshots and a directory in
   another is merged as one value, as jj does, the directory with everything
-  below it: when at most one of `onto` and `to` changed it from `from`, or
-  both made the same change, that value is taken whole, and otherwise the
-  result is a conflict at the path, its directory sides kept whole. `replay`
-  crashes, naming the path, when that conflict would have a file on one side
-  and on another a directory that `onto` or `to` holds, as replaying the
-  addition of `./a/b` onto a file `./a` would: one entry cannot list the
-  directory's entries. It does not crash where one of the three already
-  holds a conflict at that path (an unresolved blob there, not one below
-  it): the sides came in with that conflict and are carried like any others,
-  so a child that resolves such a conflict can be squashed into it. The
-  in-memory backend of §10 merges such a path file by file, like any other,
-  keeps no directory as a side, and crashes when its result would hold both
-  `./a` and `./a/b`. So here, as where jj merges lines, the two backends may
-  differ: it resolves some merges that jj keeps as a conflict or refuses (a
-  change from a file `./a` to `./a/b` replayed onto a snapshot without
-  `./a` gives `./a/b`; the deletion of `./a/z` replayed onto a snapshot
-  where `./a` is a file gives that file), and it may crash where jj carries
-  a conflict that one of the three held at `./a`.
+  below it. When at most one of `onto` and `to` changed it from `from`, that
+  value is taken whole. When both did and none of the three holds a
+  conflict at or below the path, the result is their value taken whole if
+  they made the same change, and otherwise a conflict at the path, its
+  directory sides kept whole. A conflict one of the three holds there takes
+  part with all its sides, as above, so the result is a conflict at the path
+  unless sides cancel, even where both made the same change: a child that
+  resolves a conflict at `./a` into `./a/b`, replayed with `from` that
+  conflict onto the same resolution, keeps a conflict at `./a`. `replay`
+  crashes, naming the path, when its result would be a conflict at the path
+  with a file on one side and on another a directory that `onto` or `to`
+  holds, as replaying the addition of `./a/b` onto a file `./a` would: one
+  entry cannot list the directory's entries. It does not crash where one of
+  the three already holds a conflict at that path (an unresolved blob there,
+  not one below it): the sides came in with that conflict and are carried
+  like any others, so a child that resolves such a conflict can be squashed
+  into it. The in-memory backend of §10 merges such a path file by file,
+  like any other, keeps no directory as a side, and crashes when its result
+  would hold both `./a` and `./a/b`. So here, as where jj merges lines, the
+  two backends may differ: it resolves some merges that jj keeps as a
+  conflict or refuses (a change from a file `./a` to `./a/b` replayed onto a
+  snapshot without `./a` gives `./a/b`, and so does one from a conflict at
+  `./a` to `./a/b` replayed onto `./a/b`; the deletion of `./a/z` replayed
+  onto a snapshot where `./a` is a file gives that file), and it may crash
+  where jj carries a conflict that one of the three held at `./a`.
 - `unresolved`, `blob`, and `text` are as in §4.9. `blob` produces a regular
   file. File type (executable, symlink) travels with a `Blob` but cannot be
   changed in the language. `text` of a symlink is its target; `text` of a
@@ -1041,7 +1051,10 @@ language: `fetch` and `push` are the only things that change them.
     record would move it to a commit that does not descend from it, or delete
     it while no bookmark left on `origin` after the push reaches that target
     (those left are the bookmarks no record names, where they are as of the
-    last `fetch` or `push`, and the records' new targets).
+    last `fetch` or `push`, and the records' new targets);
+  - the deletes would wait (below) and a bookmark it sets and one it deletes
+    are a name and a name under it, such as `master` and `master/legacy`:
+    git cannot hold both, so the first git push could not succeed.
 
   Targets and descent are commits as the remote has them: a target rewritten
   here since the last `fetch` or `push` is hidden, and not in the immutable
@@ -1056,9 +1069,13 @@ language: `fetch` and `push` are the only things that change them.
   when only records' new targets reach the commit, as when
   `rename "master" "main"` renames trunk's only bookmark, the deletes wait:
   the other updates are sent first, and the deletes in a second git push
-  only once the remote has accepted every one of them. After a successful
-  push the labels reflect the new positions. It records one operation, even
-  when it sends two git pushes. An empty list sends nothing to the remote.
+  only once the remote has accepted every one of them. To rename trunk's
+  only bookmark to a name under it, push a temporary label on its commit
+  first, `push (label "tmp" (labelled "master"))`: with it on `origin`
+  nothing waits, and `rename "master" "master/legacy"` goes as one git
+  push; then `push (unlabel "tmp")`. After a successful push the labels
+  reflect the new positions. It records one operation, even when it sends
+  two git pushes. An empty list sends nothing to the remote.
   If the remote accepts some of the updates and rejects others, that
   operation records the accepted ones, whose labels move, and `push` exits 1
   naming the rejected bookmarks and any deletes it did not send.

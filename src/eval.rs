@@ -1230,9 +1230,9 @@ impl Interp {
                     pending,
                 } => {
                     let mut all = args.clone();
-                    let (cname, cexpr) = match pending {
-                        Some((n, c)) => (n.clone(), Some(c.clone())),
-                        None => (name.clone(), None),
+                    let (cname, cexpr, named_at) = match pending {
+                        Some((n, c, at)) => (n.clone(), Some(c.clone()), *at),
+                        None => (name.clone(), None, 0),
                     };
                     if let Some(c) = &cexpr {
                         // numbered by the signature, not by the arguments
@@ -1268,11 +1268,10 @@ impl Interp {
                             {
                                 // the arguments the definition was given, not
                                 // those baked into its value
-                                let own = c.position().unwrap_or(0).min(all.len());
                                 Cont::NamePartial {
                                     name: cname.clone(),
                                     cexpr: c.clone(),
-                                    args: all[all.len() - own..].to_vec(),
+                                    args: all[named_at.min(all.len())..].to_vec(),
                                     cont: Rc::new(k),
                                 }
                             }
@@ -1316,7 +1315,7 @@ impl Interp {
                                 arity: *arity,
                                 args: all,
                                 f: *bf,
-                                pending: advanced.map(|c| (cname, c)),
+                                pending: advanced.map(|c| (cname, c, named_at)),
                             })),
                             k,
                         ))

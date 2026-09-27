@@ -234,7 +234,10 @@ fn replay_refuses_a_path_both_a_file_and_a_directory() {
     assert!(unresolved_at(&conflicted, "a"));
     let e = simple_replay(&conflicted, &[], &dir).unwrap_err();
     assert!(e.msg.contains("`a` would be a file"), "{}", e.msg);
-    // a child resolving that conflict into `a/b`, squashed into it, as on jj
+    // a child resolving that conflict into `a/b`, replayed with `from` the
+    // conflict onto the same resolution, as contract replays the child when
+    // squashing it: this gives `a/b`, where jj keeps a conflict at `a`. Only
+    // the squash as a whole agrees, as abandon then drops that replayed child
     let out = simple_replay(&dir, &conflicted, &dir).unwrap();
     assert_eq!(paths_of(&out), vec!["a/b"]);
 }

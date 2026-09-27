@@ -135,6 +135,8 @@ pub fn compose_values(i: &mut Interp, f: Value, g: Value) -> BResult {
                 Box::new((*cf).clone()),
                 Box::new((*cg).clone()),
             )),
+            // named holding `f` and `g`
+            2,
         )),
         _ => None,
     };
@@ -163,8 +165,9 @@ pub fn pending_of(v: &Value) -> Option<(String, Rc<crate::shape::ContractExpr>)>
                 ..
             } => Some((n.clone(), Rc::new(crate::shape::ContractExpr::Unknown))),
             crate::value::FunVal::Builtin {
-                pending: Some(p), ..
-            } => Some(p.clone()),
+                pending: Some((n, c, _)),
+                ..
+            } => Some((n.clone(), c.clone())),
             crate::value::FunVal::Builtin {
                 name, pending: None, ..
             } => Some((name.clone(), Rc::new(crate::shape::ContractExpr::Unknown))),

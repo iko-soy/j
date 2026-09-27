@@ -264,8 +264,9 @@ constT = const (\y -> y)
 
 #[test]
 fn a_signed_definition_shows_as_its_name_and_its_own_arguments() {
-    // §5.2: a top-level definition renders as its name, and a partial
-    // application as the function followed by the arguments it was given.
+    // §5.2: a top-level definition with a signature whose value is a
+    // function renders as its name, and its partial application as its name
+    // followed by the arguments it was given; any other renders as its value.
     // A signed definition bound to a lambda's partial application showed
     // the arguments baked into its value as its own: `show prev` was
     // `prev (parents)`, and `show (addTwo 2)` was `addTwo 1 2`, which is an
@@ -292,6 +293,22 @@ constS = const inc
 
 plus : Int -> Int -> Int
 plus = (+)
+
+dd : Path -> a
+dd = difft
+
+k3 : (Int -> Int -> Int) -> b
+k3 = foldl
+
+ff : a
+ff = foldl
+
+k4 : a
+k4 = foldl (+)
+
+incU = \x -> x + 1
+
+incAll = map incU
 "#,
     );
     for (src, want) in [
@@ -310,13 +327,39 @@ plus = (+)
         ("show tree", "tree"),
         ("show squash", "squash"),
         ("show everything", "everything"),
+        // a builtin that takes more arguments than a signature ending in a
+        // type variable lists shows all it is given after the definition's
+        // name: the signature stops counting at its end, and `k3 (+) 0`
+        // showed as `k3 0`, which pasted back passes k3 `0` where it wants
+        // a function
+        ("show (dd ./a)", "dd [\"a\"]"),
+        ("show (dd ./a (blob \"x\"))", "dd [\"a\"] (blob \"x\")"),
+        ("show (k3 (+))", "k3 ((+))"),
+        ("show (k3 (+) 0)", "k3 ((+)) 0"),
+        ("show ff", "ff"),
+        ("show (ff (+))", "ff ((+))"),
+        ("show (ff (+) 0)", "ff ((+)) 0"),
+        ("show k4", "k4"),
+        ("show (k4 0)", "k4 0"),
         // a builtin, and its partial application, keep theirs
         ("show ((+) 1)", "(+) 1"),
         ("show (const 1)", "const 1"),
         ("show map", "map"),
+        // and any other definition renders as its value
+        ("show sum3", "\\a b -> \\c -> a + b + c"),
+        ("show (sum3 1)", "(\\a b -> \\c -> a + b + c) 1"),
+        ("show incU", "\\x -> x + 1"),
+        ("show incAll", "map (\\x -> x + 1)"),
     ] {
         assert_value(&mut i, &cfg, src, Value::text(want));
     }
+    // `user` too, as it is not a function, though it has a signature
+    assert_value(
+        &mut i,
+        &cfg,
+        "show user == show ({ name = user.name, email = user.email })",
+        Value::bool(true),
+    );
     // the arguments are still numbered by the signature, and applied
     assert_value(&mut i, &cfg, "addTwo 2 3", Value::int(6));
     assert_value(&mut i, &cfg, "plus 1 2", Value::int(3));
@@ -324,10 +367,15 @@ plus = (+)
     assert!(m.contains("addTwo expected Int as argument 2, got Text"), "{}", m);
     let m = crash_msg(&mut i, &cfg, "plus 1 \"x\"");
     assert!(m.contains("plus expected Int as argument 2, got Text"), "{}", m);
+    // what the ones past their signature show as pastes back to the same
+    // function
+    assert_value(&mut i, &cfg, "k3 ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "ff ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "k4 0 [1 2 3]", Value::int(6));
     // and a function displays as it shows (§5.1)
-    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2 }").unwrap();
+    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2, c = k3 (+) 0 }").unwrap();
     let out = display(&mut i, &v);
-    assert_eq!(out, "a  tree\nb  addTwo 2\n");
+    assert_eq!(out, "a  tree\nb  addTwo 2\nc  k3 ((+)) 0\n");
 }
 
 #[test]

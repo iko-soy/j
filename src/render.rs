@@ -439,21 +439,20 @@ const SIZE_BAR_TOP: usize = 1000;
 /// A line diff costs the product of the file's length and the size of the
 /// change, so a plain one of a rewritten or reordered long file takes
 /// seconds. The search here stops at the cap rather than at a clock, so the
-/// same two versions always give the same count, but that only bounds its
-/// cost by the product of the file's length and the cap: at most one pass
-/// over the lines for each of the `2 × cap + 1` diagonals it reaches
-/// (`edit_distance`). Every step before it keeps the count exact: the common
-/// prefix and suffix are equal lines of some shortest diff, and the
-/// difference in length is a lower bound. A small change is then settled by
-/// a short search over the lines as they are. Otherwise a line that does not
-/// occur on the other side at all cannot be part of any common subsequence,
-/// so, as git's xdiff does, it counts as changed up front, and the rest is
-/// searched unless `reorder_bound` already puts it past the cap. On most
-/// content a diagonal soon stops at a line that differs; a long file of a
-/// few lines repeating pays a pass for many of them when the bounds cannot
-/// settle the change: one just under the cap, or one that leaves how many
-/// times each line occurs as it was. A million lines of two alternating,
-/// with 480 pairs of neighbours swapped, take some 5 × 10⁸ comparisons.
+/// same two versions always give the same count. Every step before it keeps
+/// the count exact: the common prefix and suffix are equal lines of some
+/// shortest diff, and the difference in length is a lower bound. A small
+/// change is then settled by a short search over the lines as they are.
+/// Otherwise a line that does not occur on the other side at all cannot be
+/// part of any common subsequence, so, as git's xdiff does, it counts as
+/// changed up front, and the rest is searched unless `reorder_bound` already
+/// puts it past the cap. That search (`line_distance`) takes at most about
+/// twice `cap / 64 + 2` steps per line, whatever the lines are: Myers' search
+/// soon stops on most content, but on a long file of a few lines repeating
+/// it can make a pass over the lines for each of the `2 × cap + 1` diagonals
+/// it reaches, so once it has taken half those steps a bit-parallel search
+/// counts instead. A million lines of two alternating, with 480 pairs of
+/// neighbours swapped, took Myers' search alone some 5 × 10⁸ comparisons.
 fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
     use std::collections::HashMap;
     // the rounds of the first, short search
@@ -471,10 +470,11 @@ fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result
     if a.len().abs_diff(b.len()) >= cap {
         return Ok(cap);
     }
+    // the short search's few rounds bound what it costs, so no step limit
     let quick = cap.min(QUICK);
-    let d = edit_distance(a, b, quick);
-    if d < quick || quick == cap {
-        return Ok(d);
+    match edit_distance(a, b, quick, usize::MAX, &mut 0) {
+        Some(d) if d < quick || quick == cap => return Ok(d),
+        _ => {}
     }
     // number each distinct line, so the rest compares numbers; the lines
     // numbered while reading `a` are those that occur in it
@@ -506,7 +506,7 @@ fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result
     if reorder_bound(a, b, ids.len()) >= max {
         return Ok(cap);
     }
-    Ok(unmatched + edit_distance(a, b, max))
+    Ok(unmatched + line_distance(a, b, ids.len(), max, &mut 0))
 }
 
 /// `a` and `b` without the lines they start and end with in common.
@@ -522,8 +522,16 @@ fn trim_common<'s, T: PartialEq>(a: &'s [T], b: &'s [T]) -> (&'s [T], &'s [T]) {
 /// reaches the end on round `d` exactly when the shortest diff has `d` steps,
 /// run for `max` rounds at most. A round extends each of its diagonals along
 /// equal lines from where the round before left off, so the work is at most
-/// `max` squared steps plus one pass over the lines per diagonal.
-fn edit_distance<T: PartialEq>(a: &[T], b: &[T], max: usize) -> usize {
+/// `max` squared steps plus one pass over the lines per diagonal. Each
+/// diagonal reached and each pair of lines compared along it adds a step to
+/// `steps`; `None` once they pass `limit`.
+fn edit_distance<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    max: usize,
+    limit: usize,
+    steps: &mut usize,
+) -> Option<usize> {
     let (n, m) = (a.len() as isize, b.len() as isize);
     // the furthest `x` reached on diagonal `k = x - y`, at `v[k + max]`;
     // round `d` writes diagonals `-d..=d` from those round `d - 1` wrote, and
@@ -534,23 +542,149 @@ fn edit_distance<T: PartialEq>(a: &[T], b: &[T], max: usize) -> usize {
         for k in (-d..=d).step_by(2) {
             // from diagonal `k + 1` by inserting a line of `b`, or from
             // `k - 1` by deleting one of `a`, whichever gets further
-            let mut x = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+            let from = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
                 v[at(k + 1)]
             } else {
                 v[at(k - 1)] + 1
             };
-            let mut y = x - k;
+            let (mut x, mut y) = (from, from - k);
             while x < n && y < m && a[x as usize] == b[y as usize] {
                 x += 1;
                 y += 1;
             }
+            *steps += 1 + (x - from) as usize;
+            if *steps > limit {
+                return None;
+            }
             v[at(k)] = x;
             if x >= n && y >= m {
-                return d as usize;
+                return Some(d as usize);
             }
         }
     }
-    max
+    Some(max)
+}
+
+/// `edit_distance` of lines numbered below `ids`, in at most twice the steps
+/// `banded_distance` takes and one run along a diagonal, whatever the lines
+/// are. Myers' search soon stops on most content, but on a long file of a
+/// few lines repeating it runs along equal lines on many diagonals, a pass
+/// over the file for each, so it may take only as many steps as
+/// `banded_distance` takes at most, and that counts instead if it has not
+/// finished by then. Both find the same count; `steps` adds up the steps of
+/// both.
+fn line_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut usize) -> usize {
+    let limit = *steps + banded_steps(a.len(), b.len(), max);
+    match edit_distance(a, b, max, limit, steps) {
+        Some(d) => d,
+        None => banded_distance(a, b, ids, max, steps),
+    }
+}
+
+/// The diagonals `x - y` from `-ins` to `del` that a diff of `n` lines to
+/// `m` stays on, keeping line `x` of the one with line `y` of the other, when
+/// it deletes plus inserts fewer than `max` lines, or `None` if none does:
+/// it deletes `n - m` more lines than it inserts, so at most `del` and
+/// inserts at most `ins`.
+fn band(n: usize, m: usize, max: usize) -> Option<(usize, usize)> {
+    (n.abs_diff(m) < max).then(|| ((max - 1 + n - m) / 2, (max - 1 + m - n) / 2))
+}
+
+/// The most steps `banded_distance` takes on `n` lines and `m` under `max`:
+/// one per line of the first, to find where its lines are, and one per word
+/// of it the band crosses, at most `(del + ins) / 64 + 2`, per line of the
+/// second.
+fn banded_steps(n: usize, m: usize, max: usize) -> usize {
+    match band(n, m, max) {
+        Some((del, ins)) if n > 0 && m > 0 => n + m * ((del + ins) / 64 + 2),
+        _ => 0,
+    }
+}
+
+/// `edit_distance` of lines numbered below `ids`, found a machine word of `a`
+/// at a time for each line of `b` (Hyyrö's bit-parallel longest common
+/// subsequence), over only the band of diagonals a diff counting less than
+/// `max` stays on, as Ukkonen bounds the search. Its steps, which it adds to
+/// `steps`, are one per line of `a` and one per word of `a` the band crosses
+/// per line of `b`, whatever the lines are.
+///
+/// After each line of `b`, the zero bits of `a`'s words up to a place in
+/// `a` count a longest common subsequence of `a` up to there and `b` so far.
+/// Only the words the band crosses change: one above the band keeps what it
+/// last had, and one below it still has the ones it started with, as if the
+/// length grew no further down. Neither counts more than a common
+/// subsequence has, and inside the band the counts are exact whenever a diff
+/// of fewer than `max` lines exists, since such a diff keeps inside the band;
+/// otherwise the count is `max` whatever they are.
+fn banded_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut usize) -> usize {
+    let (n, m) = (a.len(), b.len());
+    let Some((del, ins)) = band(n, m, max) else {
+        return max;
+    };
+    if n == 0 || m == 0 {
+        return n + m;
+    }
+    *steps += n;
+    // per line, from `start[l]` to `start[l + 1]`: the words of `a` it occurs
+    // in, in order, with a bit where it occurs in each
+    let mut start = vec![0usize; ids + 1];
+    let mut last = vec![usize::MAX; ids];
+    for (i, l) in a.iter().enumerate() {
+        if last[*l] != i / 64 {
+            last[*l] = i / 64;
+            start[*l + 1] += 1;
+        }
+    }
+    drop(last);
+    for l in 0..ids {
+        start[l + 1] += start[l];
+    }
+    let (mut word, mut bits) = (vec![0usize; start[ids]], vec![0u64; start[ids]]);
+    let mut next = start[..ids].to_vec();
+    for (i, l) in a.iter().enumerate() {
+        let e = next[*l];
+        if e == start[*l] || word[e - 1] != i / 64 {
+            word[e] = i / 64;
+            next[*l] += 1;
+        }
+        bits[next[*l] - 1] |= 1 << (i % 64);
+    }
+    // before any line of `b` nothing is common; from here on `next[l]` is the
+    // first word line `l` occurs in that is not above the band
+    let mut v = vec![u64::MAX; n.div_ceil(64)];
+    next.copy_from_slice(&start[..ids]);
+    // as slices, which a debug build indexes without a call
+    let (v, next) = (&mut v[..], &mut next[..]);
+    let (start, word, bits) = (&start[..], &word[..], &bits[..]);
+    for (j, l) in b.iter().enumerate() {
+        // line `j` of `b` can only be kept with lines `j - ins` to `j + del`
+        // of `a`
+        let (lo, hi) = (j.saturating_sub(ins) / 64, (j + del).min(n - 1) / 64);
+        *steps += hi + 1 - lo;
+        let end = start[*l + 1];
+        let mut e = next[*l];
+        while e < end && word[e] < lo {
+            e += 1;
+        }
+        next[*l] = e;
+        // the words above the band do not change, so nothing carries in
+        let mut carry = false;
+        for (w, v) in v[lo..=hi].iter_mut().enumerate() {
+            let here = if e < end && word[e] == lo + w {
+                e += 1;
+                bits[e - 1]
+            } else {
+                0
+            };
+            let x = *v;
+            let (sum, c1) = x.overflowing_add(x & here);
+            let (sum, c2) = sum.overflowing_add(carry as u64);
+            carry = c1 || c2;
+            *v = sum | (x & !here);
+        }
+    }
+    let common: usize = v.iter().map(|w| w.count_zeros() as usize).sum();
+    (n + m - 2 * common).min(max)
 }
 
 /// A lower bound on the lines deleted plus inserted by any diff of `a` to
@@ -3001,18 +3135,22 @@ mod tests {
         // the size bar is drawn from this count (§7.11 column 5), and no
         // shortcut may change it, whatever the machine or the content.
         // A few lines repeating, disjoint adjacent pairs of them swapped, or
-        // one of each pair replaced by the other (two lines each): no line
-        // occurs once on either side, and every diagonal the period divides
-        // runs along equal lines from one change to the next. Replacing
-        // changes how many times each line occurs; swapping does not
+        // lines a whole number of periods apart each replaced by the line
+        // after it (two lines each): no line occurs once on either side, and
+        // every diagonal the period divides runs along equal lines from one
+        // change to the next. Swapping leaves how many times each line
+        // occurs as it was; replacing always turns the same line into the
+        // same other one, so the counts alone bound it by its size
         for period in [2, 3] {
             let lines: Vec<String> = (0..3000).map(|i| format!("l{}\n", i % period)).collect();
             for changes in [1, 33, 499, 501] {
                 let (mut swapped, mut replaced) = (lines.clone(), lines.clone());
                 let step = 2990 / changes;
+                let periods = step / period * period;
                 for k in 0..changes {
                     let at = 3 + step * k;
                     swapped.swap(at, at + 1);
+                    let at = 3 + periods * k;
                     replaced[at] = lines[at + 1].clone();
                 }
                 check(&lines, &swapped, None);
@@ -3064,5 +3202,109 @@ mod tests {
             }
             check(&a, &b, Some(1 + rng.below(SIZE_BAR_TOP)));
         }
+    }
+
+    #[test]
+    fn banded_distance_is_exact_under_its_max() {
+        // the search `line_distance` falls back on, checked on its own,
+        // since `changed_lines` only reaches it where Myers' search would
+        // take long. Under the exact count plus one the band has no room to
+        // spare, so a word wrongly updated or left alone at its edges
+        // overcounts there. Files of a few words, random or repeating a few
+        // lines, with a band narrower than them under most caps
+        let text = |ls: &[usize]| -> Vec<String> {
+            ls.iter().map(|l| format!("{}\n", l)).collect()
+        };
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..200 {
+            let distinct = [1, 2, 3, 50][rng.below(4)];
+            let most = [70, 300, 700][rng.below(3)];
+            let len = rng.below(most);
+            let periodic = rng.below(2) == 0;
+            let a: Vec<usize> = (0..len)
+                .map(|i| if periodic { i % distinct } else { rng.below(distinct) })
+                .collect();
+            let mut b = a.clone();
+            for _ in 0..rng.below(60) {
+                let at = rng.below(b.len() + 1);
+                match rng.below(5) {
+                    0 => b.insert(at, rng.below(distinct)),
+                    1 if at < b.len() => {
+                        b.remove(at);
+                    }
+                    2 if at < b.len() => b[at] = rng.below(distinct),
+                    3 if at + 1 < b.len() => b.swap(at, at + 1),
+                    _ => {
+                        let end = (at + rng.below(40)).min(b.len());
+                        let block: Vec<usize> = b.drain(at..end).collect();
+                        let to = rng.below(b.len() + 1);
+                        b.splice(to..to, block);
+                    }
+                }
+            }
+            let want = exact(&text(&a), &text(&b));
+            for max in [1, 2, want + 1, want + 2, 64, 65, SIZE_BAR_TOP, 1 + rng.below(want + 2)] {
+                for (x, y) in [(&a, &b), (&b, &a)] {
+                    let mut steps = 0;
+                    let got = banded_distance(x, y, distinct, max, &mut steps);
+                    assert_eq!(got, want.min(max), "max {}, {:?} and {:?}", max, x, y);
+                    assert!(steps <= banded_steps(x.len(), y.len(), max));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_distance_takes_steps_by_the_band_not_by_the_file() {
+        // two lines alternating, 480 pairs of neighbours swapped: 960 lines.
+        // Myers' search runs along equal lines on every other diagonal from
+        // one swap to the next, a pass over the file for each of about 500
+        // diagonals, and on such a file of a million lines drawing the size
+        // bar took seconds. `line_distance` gives it up once it has taken as
+        // many steps as the bit-parallel search takes at most, 18 per line
+        // under the size bar's cap, so it takes at most twice that and one
+        // run along a diagonal, whatever the lines are
+        let a: Vec<usize> = (0..100_000).map(|i| i % 2).collect();
+        let mut b = a.clone();
+        for k in 0..480 {
+            b.swap(1000 + 200 * k, 1001 + 200 * k);
+        }
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(960));
+        assert_eq!(line_distance(&a, &b, 2, SIZE_BAR_TOP, &mut steps), 960);
+        let most = banded_steps(a.len(), b.len(), SIZE_BAR_TOP);
+        assert!(most <= 18 * a.len(), "{} steps at most", most);
+        assert!(steps <= 2 * most + a.len(), "{} steps", steps);
+        assert!(plain > 400 * a.len(), "{} steps", plain);
+    }
+
+    #[test]
+    fn reorder_bound_keeps_no_line_more_often_than_either_side_has_it() {
+        // the bound only spares `changed_lines` a search: the exact counts
+        // above hold with any lower bound, however loose, so only this pins
+        // how tight it is. Lines that occur once on each side keep at most a
+        // longest sequence of them in the same order on both: ten reversed
+        // keep one
+        let distinct: Vec<usize> = (0..10).collect();
+        let reversed: Vec<usize> = (0..10).rev().collect();
+        assert_eq!(reorder_bound(&distinct, &reversed, 10), 18);
+        // any other line is kept at most as many times as the side with
+        // fewer of it has it: two lines alternating with 501 of the 1500
+        // `0`s turned into `1`s keep 999 `0`s and 1500 `1`s. Counting them
+        // only up to the shorter side kept all 3000, a bound of 0, and the
+        // search ran over the whole file
+        let alternating: Vec<usize> = (0..3000).map(|i| i % 2).collect();
+        let mut replaced = alternating.clone();
+        for k in 0..501 {
+            replaced[2 * k] = 1;
+        }
+        assert_eq!(reorder_bound(&alternating, &replaced, 2), 1002);
+        assert_eq!(reorder_bound(&replaced, &alternating, 2), 1002);
+        // the two kinds side by side add up
+        let then = |once: &[usize], others: &[usize]| -> Vec<usize> {
+            once.iter().copied().chain(others.iter().map(|l| l + 10)).collect()
+        };
+        let (a, b) = (then(&distinct, &alternating), then(&reversed, &replaced));
+        assert_eq!(reorder_bound(&a, &b, 12), 1020);
     }
 }

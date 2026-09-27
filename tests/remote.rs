@@ -927,6 +927,7 @@ fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
     env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
     let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
     let top_op = || env.j(&dest, &["ops"]).ok().stdout.lines().next().unwrap_or("").to_string();
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
     let labelled = |label: &str| {
         let tree = env.j(&dest, &["tree"]).ok().stdout;
         tree.lines().any(|l| l.contains('◆') && l.contains("one") && l.contains(label))
@@ -936,13 +937,13 @@ fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
 
     // the update is rejected: the delete is not sent, and nothing is recorded
     reject("main");
-    let before = top_op();
+    let before = ops();
     let out = env.j(&dest, &["push (rename \"master\" \"main\")"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("refs/heads/main"), "{}", out.stderr);
     assert!(out.stderr.contains("not sent: refs/heads/master"), "{}", out.stderr);
     assert_eq!(refs(), format!("refs/heads/master {}\n", one));
-    assert_eq!(top_op(), before);
+    assert_eq!(ops(), before);
     assert!(labelled("master"), "trunk's commit is no longer immutable");
 
     // one update of two is accepted: it is recorded, the delete still waits
@@ -963,6 +964,72 @@ fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
     assert_eq!(refs(), format!("refs/heads/main {one}\nrefs/heads/master {one}\n"));
     assert!(top_op().contains("rename \"master\" \"main\""), "{}", top_op());
     assert!(labelled("main") && labelled("master"));
+}
+
+#[test]
+fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
+    // §7.6: git cannot hold a bookmark and one under its name at once, so
+    // when the deletes wait, a bookmark the push creates under the name of
+    // one it deletes, or the reverse, is rejected by the first git push and
+    // the deletes are never sent. `push (rename "master" "master/legacy")`
+    // sent that push and exited 1 naming only the rejected ref, and renaming
+    // trunk's only bookmark under itself could never succeed; it is refused
+    // before anything is sent, saying how to do it instead
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup();
+    let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    // every git push that reaches the remote is logged
+    let log = env.dir.join("pushes.log");
+    let hook = env.remote.join("hooks/pre-receive");
+    std::fs::write(&hook, format!("#!/bin/sh\ncat >> '{}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sent = || {
+        let pushes = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        pushes
+    };
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    // a bookmark that does not reach trunk's commit
+    env.j(&dest, &["new . top"]).ok();
+    std::fs::write(dest.join("f.txt"), "feat\n").unwrap();
+    env.j(&dest, &["describe \"feat\""]).ok();
+    env.j(&dest, &["push (label \"feature/x\" here)"]).ok();
+    let feat = git(&env.remote, &["rev-parse", "feature/x"]).trim().to_string();
+    let before_refs = refs();
+    // the remote's default branch is elsewhere, so git lets master be deleted
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+    assert!(sent().contains("refs/heads/feature/x"), "the hook logged no push");
+
+    let before = ops();
+    let out = env.j(&dest, &["push (rename \"master\" \"master/legacy\")"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("`master` must stay on origin until `master/legacy`"), "{}", out.stderr);
+    assert!(out.stderr.contains("push (label \"tmp\" (labelled \"master\"))"), "{}", out.stderr);
+    assert_eq!(sent(), "", "a git push was sent");
+    assert_eq!(refs(), before_refs);
+    assert_eq!(ops(), before);
+
+    // every delete waits with master's, and a deleted bookmark nests with
+    // one set at the name it is under as well (`feature/x` and `feature`)
+    let out = env.j(&dest, &["push (\\r -> rename \"master\" \"main\" r ++ rename \"feature/x\" \"feature\" r)"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("`feature/x` must stay on origin until `feature`"), "{}", out.stderr);
+    assert!(out.stderr.contains("(labelled \"master\")"), "{}", out.stderr);
+    assert_eq!(sent(), "", "a git push was sent");
+    assert_eq!(refs(), before_refs);
+    assert_eq!(ops(), before);
+
+    // the way round it: with the temporary label on origin the delete does
+    // not wait, and the rename is one git push
+    env.j(&dest, &["push (label \"tmp\" (labelled \"master\"))"]).ok();
+    env.j(&dest, &["push (rename \"master\" \"master/legacy\")"]).ok();
+    env.j(&dest, &["push (unlabel \"tmp\")"]).ok();
+    assert_eq!(refs(), format!("refs/heads/feature/x {feat}\nrefs/heads/master/legacy {one}\n"));
+    let tree = env.j(&dest, &["tree"]).ok().stdout;
+    assert!(tree.lines().any(|l| l.contains("one") && l.contains("master/legacy")), "{}", tree);
 }
 
 #[test]

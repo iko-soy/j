@@ -1193,13 +1193,19 @@ fn conflict_between_a_file_and_a_directory_resolved_in_a_child_squashes() {
     resolve_into_directory(&r);
     squashes(&r);
 
-    // a conflict between two files, resolved into a directory
+    // a conflict between two files, resolved into a directory; S, beside L,
+    // makes `a` a directory
     let r = setup();
     r.write("a", "base\n");
     r.j(&["describe \"P\""]).ok();
     r.j(&["new"]).ok();
     r.write("a", "left\n");
     r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/x", "d\n");
+    r.j(&["describe \"S\""]).ok();
     r.j(&["new . goto parents"]).ok();
     r.write("a", "right\n");
     r.j(&["describe \"R\""]).ok();
@@ -1210,6 +1216,12 @@ fn conflict_between_a_file_and_a_directory_resolved_in_a_child_squashes() {
     let e = "\\r -> show (conflicted (replay (files r) \
              ({ from = [], to = [{ path = ./a/b, content = blob \"b\" }] })))";
     assert_eq!(r.j(&[e]).ok().stdout.trim(), "[[\"a\"]]");
+    // R onto S: S's directory is a side of R's conflict beside its file
+    // `right`, and only `to` holds a conflict at `a`, so it is carried too
+    let onto_s = "rebase (matching (\\c -> c.message == \"S\") all)";
+    let e = format!("\\r -> show (conflicted (files ({} r)))", onto_s);
+    assert_eq!(r.j(&[&e]).ok().stdout.trim(), "[[\"a\"]]");
+    r.j(&[&format!("tree . validate . {}", onto_s)]).ok();
     resolve_into_directory(&r);
     squashes(&r);
 

@@ -403,7 +403,11 @@ pub enum FunVal {
         arity: usize,
         args: Vec<Value>,
         f: BuiltinFn,
-        pending: Option<(String, Rc<crate::shape::ContractExpr>)>,
+        /// the name this function is under, its contract as further
+        /// arguments arrive, and how many of `args` it held when it was
+        /// given that name, which are its value's, not the arguments a
+        /// signed definition was given (§5.2)
+        pending: Option<(String, Rc<crate::shape::ContractExpr>, usize)>,
     },
     Closure {
         name: Option<String>, // top-level definition name, if any
@@ -622,7 +626,11 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 arity: *arity,
                 args: args.clone(),
                 f: *f,
-                pending,
+                // the arguments it holds now are its value's, and those
+                // after them the definition's own: `k3 ((+)) 0` with
+                // `k3 = foldl`, past a signature that ends in a type
+                // variable and so stops counting (§5.2)
+                pending: Some((name.to_string(), cexpr, args.len())),
             })),
             // `f or g` and `%name` have nowhere to hold a contract, so the
             // definition becomes `\x -> v x` under its name, which the
