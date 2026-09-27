@@ -251,6 +251,22 @@ fn show_fits_by_display_width() {
 }
 
 #[test]
+fn show_fit_counts_what_follows_an_escape_in_the_data() {
+    // `show` writes no colour codes, so an ESC from the data (a file, a
+    // message) starts none and what follows it still counts toward the 80
+    // columns: an ESC, 60 `x` and no `m` anywhere after it, beside 30 `y`,
+    // is over 90 columns and must break
+    let (mut i, cfg) = make_interp();
+    let v = Value::list(vec![
+        Value::text(format!("\x1b{}", "x".repeat(60))),
+        Value::text("y".repeat(30)),
+    ]);
+    let s = show(&i, &v);
+    assert!(s.contains('\n'), "{:?}", s);
+    roundtrip(&mut i, &cfg, &v);
+}
+
+#[test]
 fn show_partial_application() {
     let (mut i, cfg) = make_interp();
     let outer = Rc::new(cfg.global_names.clone());

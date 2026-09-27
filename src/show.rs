@@ -2,12 +2,16 @@
 
 use crate::eval::Interp;
 use crate::value::{BlobContent, Crash, FunVal, Value};
+use unicode_width::UnicodeWidthChar;
 
 pub fn show(interp: &Interp, v: &Value) -> String {
     let s = render(interp, v);
     // line breaking: one line if it fits in 80 columns, counted in display
-    // cells as everywhere else (§5.1), not code points
-    if crate::render::width(&s) <= 80 {
+    // cells as everywhere else (§5.1), not code points. Not by
+    // `render::width`, which skips colour codes: `show` writes none, and an
+    // ESC from the data would hide everything up to the next `m`
+    let w: usize = s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    if w <= 80 {
         return s;
     }
     render_wide(interp, v, 0)
