@@ -543,7 +543,8 @@ its `root`. Where order matters, `commits (top repo)` is preorder.
 Every application of a function that has a signature — a builtin or a
 definition with a signature — is checked against it: each argument as it is
 supplied, against the corresponding parameter type, and the result once the
-application is complete (yields a non-function), against the result type.
+function's own application completes (its body has run or the builtin has
+all its arguments), against the result type.
 Lambdas without a signature and the command-line expression are unchecked
 except through the functions they call. A signature covers all the arguments
 it lists, however the definition's value is curried: `describe : Text -> Edit`
