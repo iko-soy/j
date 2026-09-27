@@ -359,7 +359,7 @@ fn alias_of_an_undeclared_type_is_not_a_usable_shape() {
 }
 
 /// Signed definitions whose lambda takes fewer parameters than the signature,
-/// so the body is deferred until the contract is exhausted (§5.2).
+/// so the body's value is a function the rest of the signature checks (§4.13).
 const DEFERRED: &str = r#"
 failIf : Int -> Edit
 failIf = \n -> if n > 0 then id else crash "negative"
@@ -433,6 +433,77 @@ fn deferred_body_is_contract_checked() {
     assert!(m.contains("argument 2"), "{}", m);
 }
 
+#[test]
+fn signature_does_not_change_when_a_body_runs() {
+    // §4.1: evaluation is strict and a lambda body is evaluated on each
+    // application; a signature only adds checks (§4.13). A signed definition
+    // whose lambda took fewer parameters than its signature deferred its
+    // body until the signature was used up, so `failIf 0` did not crash,
+    // `failIf 0 or 7` crashed past the `or` (§4.6), and the body ran again
+    // at every later application.
+    let (mut i, cfg) = make_interp_with(&format!(
+        "{}{}",
+        DEFERRED,
+        r#"
+failIfU = \n -> if n > 0 then id else crash "negative"
+
+pick2 : Int -> Int -> Int -> Int
+pick2 = \n -> if n > 0 then (\a b -> a + b) else crash "negative"
+
+notFn : Int -> Edit
+notFn = \n -> n
+
+once : Int -> Int -> Id
+once = \n -> let i = @ in \m -> i
+
+onceU = \n -> let i = @ in \m -> i
+"#
+    ));
+    // the body crashes at the application that binds the lambda's last
+    // parameter, signed or not, and `or` catches it there
+    for f in ["failIf", "failIfU"] {
+        check!(i, cfg, &format!("{} 0 or 7", f), Value::int(7));
+        check!(i, cfg, &format!("show ({} 0 or \"fallback\")", f), Value::text("\"fallback\""));
+        let m = crash(&mut i, &cfg, &format!("let e = {} 0 in 5", f));
+        assert_eq!(m, "crash: negative");
+    }
+    check!(i, cfg, "choose 0 or 7", Value::int(7));
+    check!(i, cfg, "pick2 0 or 5", Value::int(5));
+    check!(i, cfg, "pick2 0 1 or 5", Value::int(5));
+    let m = crash(&mut i, &cfg, "let e = pick2 0 1 in 5");
+    assert_eq!(m, "crash: negative");
+    let (m, def) = crash_in(&mut i, &cfg, "failIf 0");
+    assert_eq!((m.as_str(), def.as_deref()), ("negative", Some("failIf")));
+    // it runs once, not again at every later argument
+    for f in ["once", "onceU"] {
+        check!(i, cfg, &format!("let g = {} 1 in g 1 == g 2", f), Value::Bool(true));
+    }
+    // the body's value must be a function while the signature lists more
+    let (m, def) = crash_in(&mut i, &cfg, "notFn 1");
+    assert_eq!(m, "contract: notFn expected a function, got Int");
+    assert_eq!(def.as_deref(), Some("notFn"));
+    check!(i, cfg, "notFn 1 or 7", Value::int(7));
+    // the application still renders by name (§5.2), and the arguments the
+    // signature lists past the lambda's, and the result, are still checked
+    check!(i, cfg, "show (pick2 1 2)", Value::text("pick2 1 2"));
+    check!(i, cfg, "show (failIf 1)", Value::text("failIf 1"));
+    check!(i, cfg, "show (describe \"wip\")", Value::text("describe \"wip\""));
+    check!(
+        i,
+        cfg,
+        "show (at (parents) (describe \"x\"))",
+        Value::text("at (parents) (describe \"x\")")
+    );
+    check!(i, cfg, "pick2 1 2 3", Value::int(5));
+    check!(i, cfg, "let f = pick2 1 in f 2 3 + f 4 5", Value::int(14));
+    let m = crash(&mut i, &cfg, "pick2 1 \"x\"");
+    assert!(m.contains("contract: pick2 expected Int as argument 2, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "pick2 1 2 \"y\"");
+    assert!(m.contains("contract: pick2 expected Int as argument 3, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "once 1 \"x\"");
+    assert!(m.contains("contract: once expected Int as argument 2, got Text"), "{}", m);
+}
+
 /// Definitions that crash at different depths, for the crash trace (§1.4).
 const NESTED: &str = r#"
 inner : Int -> Int
@@ -496,10 +567,11 @@ fn crash_names_the_innermost_definition_executing() {
         // definition a builtin runs is itself the innermost
         ("viaMap [1]", Some("viaMap")),
         ("mapInner [0]", Some("inner")),
-        // a deferred body runs in its definition too (§5.2)
+        // a body whose lambda is shorter than its signature runs in its
+        // definition too (§4.13)
         ("choose 0 5", Some("choose")),
         // a contract violation is in the definition checked (§4.13),
-        // whether an argument, a deferred argument, or the result
+        // whether an argument, one past the lambda's, or the result
         ("inner \"x\"", Some("inner")),
         ("outer \"x\"", Some("outer")),
         ("bad 1 \"x\"", Some("bad")),

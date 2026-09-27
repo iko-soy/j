@@ -404,15 +404,8 @@ pub enum FunVal {
         name: Option<String>, // top-level definition name, if any
         params: Vec<Pattern>,
         applied: usize,
-        /// the arguments supplied so far, for rendering (§5.2); in a deferred
-        /// closure, those past the first `applied` still wait to be applied
-        /// to the body's value
+        /// the arguments supplied so far, for rendering (§5.2)
         applied_args: Vec<Value>,
-        /// every parameter is bound but the body has not been evaluated yet,
-        /// as the definition's contract is not exhausted: further arguments
-        /// are collected until it is, then the body is evaluated and its
-        /// value applied to them
-        deferred: bool,
         body: Rc<Expr>,
         env: Env,
         /// the lambda's source, which it renders as (§5.2)
@@ -517,17 +510,14 @@ impl Value {
 
 /// Attach a definition name and contract to a function value (§4.13).
 pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract>) -> Value {
-    let pending = Some((
-        name.to_string(),
-        Rc::new(crate::shape::ContractExpr::Known { contract, at: 0 }),
-    ));
+    let cexpr = Rc::new(crate::shape::ContractExpr::Known { contract, at: 0 });
+    let pending = Some((name.to_string(), cexpr.clone()));
     match v {
         Value::Fun(fv) => match fv.as_ref() {
             FunVal::Closure {
                 params,
                 applied,
                 applied_args,
-                deferred,
                 body,
                 env,
                 src,
@@ -537,7 +527,6 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 params: params.clone(),
                 applied: *applied,
                 applied_args: applied_args.clone(),
-                deferred: *deferred,
                 body: body.clone(),
                 env: env.clone(),
                 src: src.clone(),
@@ -563,23 +552,34 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
             // whole (§4.6): a result that violates the signature is a crash,
             // not a reason to try the other side.
             FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => {
-                let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
-                Value::Fun(Rc::new(FunVal::Closure {
-                    name: Some(name.to_string()),
-                    params: vec![Pattern::Var("x".to_string())],
-                    applied: 0,
-                    applied_args: Vec::new(),
-                    deferred: false,
-                    body: Rc::new(Expr::App(var("f"), var("x"))),
-                    env: Env::empty().extend(vec![("f".to_string(), v.clone())]),
-                    // a named closure renders as its name (§5.2)
-                    src: crate::ast::Source::new(Rc::from(""), 0, 0),
-                    pending,
-                }))
+                named_apply(v.clone(), Vec::new(), name, cexpr)
             }
         },
         _ => v.clone(),
     }
+}
+
+/// `\x -> f x` under a definition's name and contract: it renders as the
+/// name followed by `applied_args` (§5.2), and its further arguments and its
+/// result are checked against the contract (§4.13)
+pub fn named_apply(
+    f: Value,
+    applied_args: Vec<Value>,
+    name: &str,
+    cexpr: Rc<crate::shape::ContractExpr>,
+) -> Value {
+    let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
+    Value::Fun(Rc::new(FunVal::Closure {
+        name: Some(name.to_string()),
+        params: vec![Pattern::Var("x".to_string())],
+        applied: 0,
+        applied_args,
+        body: Rc::new(Expr::App(var("f"), var("x"))),
+        env: Env::empty().extend(vec![("f".to_string(), f)]),
+        // a named closure renders by its name, not its source (§5.2)
+        src: crate::ast::Source::new(Rc::from(""), 0, 0),
+        pending: Some((name.to_string(), cexpr)),
+    }))
 }
 
 /// A crash (§4.7).

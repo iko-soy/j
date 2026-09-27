@@ -541,7 +541,11 @@ Lambdas without a signature and the command-line expression are unchecked
 except through the functions they call. A signature covers all the arguments
 it lists, however the definition's lambda is curried: `describe : Text -> Edit`
 is `\m -> mapRoot …`, and the `Repo` that `describe m` is then applied to is
-checked as its second argument, and the result against `Repo`. Arguments are
+checked as its second argument, and the result against `Repo`. A signature
+only adds checks and never changes when a body is evaluated (§4.1):
+`describe m` evaluates `mapRoot …` at once, so an `or` around it catches a
+crash there (§4.6); the value must be a function, since the signature lists
+a further argument, and shows as `describe m` (§5.2). Arguments are
 numbered as the signature lists them, even when the definition's value is a
 partial application or a composition holding arguments of its own (`tree 5`
 is a violation at argument 1); when the value is an `or` of functions (§4.6),
