@@ -280,7 +280,12 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
 // ----------------------------------------------------------------------
 
 pub fn unified_diff(a: &str, b: &str) -> String {
-    let diff = similar::TextDiff::from_lines(a, b);
+    // lines end after each `\n` and nowhere else, as for GNU diff and git:
+    // `similar`'s own line splitting also ends one at a lone `\r`, so a last
+    // line `b\r` counted as terminated and got no marker below
+    let old: Vec<&str> = a.split_inclusive('\n').collect();
+    let new: Vec<&str> = b.split_inclusive('\n').collect();
+    let diff = similar::TextDiff::configure().diff_slices(&old, &new);
     let mut out = String::new();
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         out.push_str(&format!("{}\n", hunk.header()));
@@ -291,19 +296,14 @@ pub fn unified_diff(a: &str, b: &str) -> String {
                 similar::ChangeTag::Equal => " ",
             };
             out.push_str(sign);
-            let text = change.to_string();
-            // similar yields the line with its terminator when present (and
-            // supplies a `\n` for the last line of a text without a trailing
-            // newline); a lone `\r` also ends a line for it, so add a `\n` to
-            // keep the diff line-oriented
-            out.push_str(&text);
+            let text: &str = change.value();
+            out.push_str(text);
+            // a line with no terminator, only ever the last, is ended here
+            // and marked, as GNU diff and git do: otherwise dropping the
+            // final newline shows as the same line removed and re-added,
+            // alike in both directions
             if !text.ends_with('\n') {
                 out.push('\n');
-            }
-            // mark a line that had no terminator, as GNU diff and git do:
-            // otherwise dropping the final newline shows as the same line
-            // removed and re-added, alike in both directions
-            if change.missing_newline() {
                 out.push_str("\\ No newline at end of file\n");
             }
         }

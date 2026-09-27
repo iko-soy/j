@@ -439,6 +439,26 @@ fn unified_diff_marks_missing_newline() {
 }
 
 #[test]
+fn unified_diff_lines_end_at_newline_only() {
+    // as for GNU diff and git, a lone `\r` ends no line: a last line ending
+    // in one has no trailing newline and is marked, so the two directions
+    // differ, and `a\rb` is one line (outputs as `diff -u` gives them)
+    const MARK: &str = "\\ No newline at end of file\n";
+    assert_eq!(
+        unified_diff("a\nb\r", "a\nb\r\n"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\r\n{}+b\r\n", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb\r\n", "a\nb\r"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\r\n+b\r\n{}", MARK)
+    );
+    assert_eq!(unified_diff("a\rb\n", "a\r\nb\n"), "@@ -1 +1,2 @@\n-a\rb\n+a\r\n+b\n");
+    assert_eq!(unified_diff("a\r\nb\n", "a\rb\n"), "@@ -1,2 +1 @@\n-a\r\n-b\n+a\rb\n");
+    // a `\r\n` line is a line with its terminator, and gets no marker
+    assert_eq!(unified_diff("a\r\nb\r\n", "a\r\nc\r\n"), "@@ -1,2 +1,2 @@\n a\r\n-b\r\n+c\r\n");
+}
+
+#[test]
 fn unified_diff_context_radius() {
     // 3 lines of context: a change far from the ends shows 3 before/after
     let a = (1..=10).map(|n| format!("{}\n", n)).collect::<String>();
