@@ -1007,6 +1007,46 @@ fn tree_columns_line_up_on_every_row() {
 }
 
 #[test]
+fn the_margin_is_right_aligned() {
+    // the age and the initials were joined unpadded, so a `13m` among `9m`s
+    // pushed its row's initials and right edge one column right, and a
+    // single initial ended its row one column short
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", "old", &[], vec![("a", "1")]);
+    let b = commit("kbbbbbbb", "thirteen", &[], vec![("b", "1")]);
+    let c = commit("kccccccc", "nine", &[], vec![("c", "1")]);
+    let chain = subtree(a, vec![subtree(b, vec![subtree(c, vec![])])]);
+    let repo = repo_of(root, vec![chain], Some(0));
+    let t = now();
+    let rows = [("@kaaa", "2y", "ss"), ("@kbbb", "13m", "tu"), ("@kccc", "9m", "c")];
+    for data in [false, true] {
+        let (mut i, cfg) = make_interp(backend_with(vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "Sam Smith", t - 2 * 365 * 86400 - 86400),
+            meta("kbbbbbbb", "Test User", t - 13 * 60 - 5),
+            meta("kccccccc", "Cher", t - 9 * 60 - 5),
+        ]));
+        let src = format!(
+            "treeWith ({{ detail = 1, margin = true, elide = false, icons = false, color = \"never\", lanes = 4, author = {d}, date = {d}, files = {d} }})",
+            d = data
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let ctx = format!("data {}\n{}", data, text);
+        // where each row's age and initials end
+        let ends: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|(id, age, init)| {
+                let row = row_of(&text, id);
+                assert!(row.ends_with(init), "{} initials\n{}", id, ctx);
+                let at = row.rfind(age).unwrap_or_else(|| panic!("{} age\n{}", id, ctx));
+                (j::render::width(&row[..at + age.len()]), j::render::width(row))
+            })
+            .collect();
+        assert!(ends.iter().all(|e| *e == ends[0]), "{:?}\n{}", ends, ctx);
+    }
+}
+
+#[test]
 fn a_row_without_a_bar_keeps_the_bar_slot() {
     // specs/tree.md's worked example draws the empty `ptlm` as `@ptlm    docs`
     let (repo, be) = worked_example();

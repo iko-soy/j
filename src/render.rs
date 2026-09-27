@@ -2208,9 +2208,15 @@ fn draw_rows(
             extra_w[k] = extra_w[k].max(width(e));
         }
     }
+    // the margin's age and initials, each as wide as its widest entry, so
+    // that a `13m` among `9m`s or a single initial moves nothing
+    let margin_w = (
+        texts.iter().map(|t| width(&t.age)).max().unwrap_or(0),
+        texts.iter().map(|t| width(&t.initials)).max().unwrap_or(0),
+    );
     let metas: Vec<String> = texts
         .iter()
-        .map(|t| meta_block(t, &extra_w, opts, pal))
+        .map(|t| meta_block(t, &extra_w, margin_w, opts, pal))
         .collect();
     // message truncation to the terminal width (§Step 4): the widest part
     // right of the message column (labels, data, margin) sets the room left
@@ -2686,8 +2692,15 @@ fn pad_to(line: &mut String, col: usize) {
 
 /// A row's metadata block (§Step 4): the data columns (date / files /
 /// author), each padded to its column's width in `extra_w`, then the margin
-/// (age and initials). Empty when the row shows none of them.
-fn meta_block(t: &RowText, extra_w: &[usize], opts: &TreeOptions, pal: &Palette) -> String {
+/// (age and initials), each right-aligned in its width in `margin_w`. Empty
+/// when the row shows none of them.
+fn meta_block(
+    t: &RowText,
+    extra_w: &[usize],
+    margin_w: (usize, usize),
+    opts: &TreeOptions,
+    pal: &Palette,
+) -> String {
     let mut meta: Vec<String> = Vec::new();
     for (e, w) in t.meta_extra.iter().zip(extra_w) {
         let mut s = if e.is_empty() { String::new() } else { pal.grey(4, e) };
@@ -2695,8 +2708,13 @@ fn meta_block(t: &RowText, extra_w: &[usize], opts: &TreeOptions, pal: &Palette)
         meta.push(s);
     }
     if opts.margin && !t.age.is_empty() {
-        meta.push(pal.grey(4, &t.age));
-        meta.push(pal.author(&t.initials_author, &t.initials));
+        let (age_w, init_w) = margin_w;
+        let mut age = " ".repeat(age_w - width(&t.age));
+        age.push_str(&pal.grey(4, &t.age));
+        meta.push(age);
+        let mut init = " ".repeat(init_w - width(&t.initials));
+        init.push_str(&pal.author(&t.initials_author, &t.initials));
+        meta.push(init);
     }
     meta.join("  ").trim_end().to_string()
 }

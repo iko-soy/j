@@ -158,8 +158,9 @@ Columns, left to right, at fixed offsets:
    collapsed node.
 7. **Labels**: right-aligned column, present only if any rendered commit has
    a label; names separated by two spaces.
-8. **Margin** (`margin = true`): age and author initials, right-aligned, as
-   before.
+8. **Margin** (`margin = true`): age and author initials, as before, each
+   right-aligned in its own column (a `9m` ends under a `13m`), so the margin
+   ends at one column on every row.
 9. **Data columns** (off unless enabled): `date` shows the commit's absolute
    date `YYYY-MM-DD`; `files` shows the number of files changed as `n files`;
    `author` shows the full author name. They appear in that order, grey,
