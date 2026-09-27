@@ -137,8 +137,10 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 ------------------------------------------------------------------------------
 
 -- Replay a change onto a snapshot: "onto, with the change from `from` to `to`
--- applied." Total: where the change collides with what is already there, the
--- path's blob is unresolved rather than an error.
+-- applied." Where the change collides with what is already there, the path's
+-- blob is unresolved rather than an error, except that a collision making a
+-- path a file on one side and a directory on another, as adding ./a/b onto a
+-- file ./a would, crashes, naming the path (§7.3).
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
 touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;

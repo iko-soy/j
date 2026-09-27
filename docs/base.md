@@ -415,8 +415,14 @@ replay : Snapshot -> Change -> Snapshot
 ```
 
 `replay onto ch` computes "`onto`, with the change from `ch.from` to `ch.to`
-applied." It is **total**: where the change collides with what is already
-there, the path's blob becomes *unresolved* (a conflict) rather than an error.
+applied." Where the change collides with what is already there, the path's
+blob becomes *unresolved* (a conflict) rather than an error. The one
+exception is a collision that would make a path a file on one side and a
+directory on another, as adding `./a/b` onto a file `./a` would: one entry
+cannot list a directory's entries, so `replay` crashes, naming the path, and
+`or` catches it. A conflict already at the path in `onto`, `ch.from` or
+`ch.to` is carried, directory sides and all, so a child that resolves such a
+conflict can still be squashed into it.
 
 ```
 -- onto has "base", change takes "base" -> "theirs": no collision
