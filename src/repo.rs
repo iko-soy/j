@@ -489,7 +489,9 @@ pub fn checkout_refuses(comp: &str, folds_case: bool, fits: impl FnOnce(&str) ->
 /// focus: persisting at most rewrites it with the tree jj already stored and
 /// never checks it out, and a fetched branch can hold `.jj`, so refusing its
 /// names would stop every persist for a commit the script did not touch.
-/// Immutable commits are such commits (step 3).
+/// Immutable commits are such commits (step 3). One whose files differ,
+/// such as a descendant a snapshot of the focus rebases, is checked only at
+/// the paths it did not hold there: jj stored the others' names already.
 ///
 /// A name longer than `NAME_MAX` is one the filesystem holds if the
 /// working directory holds it, as the focus of `given` (its snapshot, §7.4)
@@ -519,13 +521,20 @@ fn validate_path_names(
         if immutable.contains(&id) {
             continue;
         }
+        // the commit as stored, when its files differ: a path it held there
+        // is not checked again
+        let mut kept = None;
         if id != focus {
             if let Some(o) = stored.get(&id) {
                 if same_files(o, &c)? {
                     continue;
                 }
+                kept = Some(o);
             }
         }
+        // the paths `kept` holds, read on first need: most commits hold no
+        // name a checkout refuses
+        let mut kept_paths: Option<BTreeSet<Vec<String>>> = None;
         let files = c.field("files")?;
         for e in files.as_list()? {
             let path = e.field("path")?;
@@ -538,12 +547,24 @@ fn validate_path_names(
                     });
                 }
                 let on_disk = |c: &str| held.as_ref().is_some_and(|h| h.contains(c));
-                if checkout_refuses(comp, folds_case, |c| on_disk(c) || backend.name_fits(c)) {
-                    return Err(Crash::new(format!(
-                        "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
-                        comp
-                    )));
+                if !checkout_refuses(comp, folds_case, |c| on_disk(c) || backend.name_fits(c)) {
+                    continue;
                 }
+                if let Some(o) = kept {
+                    if kept_paths.is_none() {
+                        let entries = o.field("files")?;
+                        kept_paths = Some(entries.as_list()?.iter().filter_map(entry_path).collect());
+                    }
+                    if let (Some(k), Some(p)) = (&kept_paths, entry_path(e)) {
+                        if k.contains(&p) {
+                            break;
+                        }
+                    }
+                }
+                return Err(Crash::new(format!(
+                    "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
+                    comp
+                )));
             }
         }
     }

@@ -946,19 +946,20 @@ Within it:
 1. **Validate shape.** `new` has the shape of a `Repo`; every `id` occurs
    exactly once; every snapshot has unique paths, none of them the root `./`
    and none both a file and a directory (§7.3); every path component of the
-   focus, and of every other commit that is not in `old` or whose files
-   differ from its files there (§7.3), is a name a checkout can create: not
-   empty, `.`, `..`, `.git` or `.jj`, without `/` or NUL, and a name the
-   workspace's filesystem can hold. A name the working directory holds
-   (§7.4) is one. A name longer than 255 bytes, the limit of ext4, is tried
-   on the filesystem, since exFAT, NTFS and APFS count 255 UTF-16 units or
-   characters instead; where a filesystem's limit is lower, or a whole path
-   outgrows the system's limit, the checkout of step 7 refuses it instead.
-   Where the working directory's filesystem folds case (`.JJ` names its
-   `.jj`), `.git` and `.jj` are refused in any letter case. (Any other commit
-   that keeps its files is neither checked out nor written with a name jj
-   has not already stored, and a fetched branch can hold any name git can.)
-   Violations crash with a message naming the rule.
+   focus, of every other commit that is not in `old`, and of every path any
+   other commit holds that it did not hold in `old` (§7.3), is a name a
+   checkout can create: not empty, `.`, `..`, `.git` or `.jj`, without `/`
+   or NUL, and a name the workspace's filesystem can hold. A name the working
+   directory holds (§7.4) is one. A name longer than 255 bytes, the limit of
+   ext4, is tried on the filesystem, since exFAT, NTFS and APFS count 255
+   UTF-16 units or characters instead; where a filesystem's limit is lower,
+   or a whole path outgrows the system's limit, the checkout of step 7
+   refuses it instead. Where the working directory's filesystem folds case
+   (`.JJ` names its `.jj`), `.git` and `.jj` are refused in any letter case.
+   (Any other path is neither checked out nor written with a name jj has not
+   already stored, and a fetched branch can hold any name git can, even one
+   above the focus that a snapshot rebases.) Violations crash with a message
+   naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.

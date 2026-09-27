@@ -323,9 +323,12 @@ fn unchanged_mutable_commits_keep_stored_path_components() {
     // git stores `.jj/x`, so a fetched branch can hold it; the branch is
     // mutable and labelled, so it cannot be abandoned. Refusing its names
     // stopped every persist in the clone, though persisting neither checks
-    // it out nor writes any name of it jj has not already stored
+    // it out nor writes any name of it jj has not already stored. So did a
+    // name longer than this filesystem holds
     let root = commit(ROOT_ID, "", &[], vec![]);
-    let feature_files = j::domain::lazy_files("kfffffff", vec![entry(".jj/x", "fixture")]);
+    let long = format!("wide/{}", "n".repeat(300));
+    let feature_files =
+        j::domain::lazy_files("kfffffff", vec![entry(".jj/x", "fixture"), entry(&long, "wide")]);
     let with_files = |id: &str, msg: &str, labels: &[&str], files: Value| {
         let c = commit(id, msg, labels, vec![]);
         let Value::Record(m) = c else { unreachable!() };
@@ -360,21 +363,29 @@ fn unchanged_mutable_commits_keep_stored_path_components() {
     assert_eq!(check(&described), Ok(()));
     let renamed = with_files("kfffffff", "renamed", &["feature"], feature_files.clone());
     assert_eq!(check(&beside(a.clone(), renamed, vec![])), Ok(()));
-    let relisted = commit("kfffffff", "feat", &["feature"], vec![entry(".jj/x", "fixture")]);
+    let relisted = commit(
+        "kfffffff",
+        "feat",
+        &["feature"],
+        vec![entry(".jj/x", "fixture"), entry(&long, "wide")],
+    );
     assert_eq!(check(&beside(a.clone(), relisted, vec![])), Ok(()));
-    // checked out, written with new files, or new: refused
+    // written with other files, as a snapshot rebasing it does, but with
+    // those names at the paths it holds already: accepted
+    let edited = |extra: Value| {
+        let files = vec![entry(".jj/x", "rebased"), entry(&long, "wide"), extra];
+        commit("kfffffff", "feat", &["feature"], files)
+    };
+    assert_eq!(check(&beside(a.clone(), edited(entry("b", "more")), vec![])), Ok(()));
+    // checked out, holding them at a path it did not hold, or new: refused
     let refused = |r: Result<(), String>| {
         let e = r.unwrap_err();
         assert!(e.contains("path component"), "{}", e);
     };
     refused(check(&beside(feature.clone(), a.clone(), vec![])));
-    let edited = commit(
-        "kfffffff",
-        "feat",
-        &["feature"],
-        vec![entry(".jj/x", "fixture"), entry("b", "more")],
-    );
-    refused(check(&beside(a.clone(), edited, vec![])));
+    refused(check(&beside(a.clone(), edited(entry(".jj/y", "more")), vec![])));
+    let longer = format!("wide/{}", "m".repeat(300));
+    refused(check(&beside(a.clone(), edited(entry(&longer, "more")), vec![])));
     let copy = commit("knnnnnnn", "", &[], vec![entry(".jj/x", "fixture")]);
     refused(check(&beside(a.clone(), feature.clone(), vec![subtree(copy, vec![])])));
 }

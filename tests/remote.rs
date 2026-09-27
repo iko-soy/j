@@ -531,6 +531,63 @@ fn fetched_branch_with_a_reserved_name_does_not_block_persisting() {
 }
 
 #[test]
+fn fetched_descendant_with_a_reserved_name_does_not_block_snapshots() {
+    // §7.5 step 1: a snapshot that rewrites the focus rebases the fetched
+    // branch above it, so the branch's files differ, and all of its names
+    // were checked again: `.jj`, a name over 255 bytes on ext4, `.GIT`
+    // where the filesystem folds case. Every persisting run crashed, `j id`
+    // included, until the edit on disk was undone, though none checks the
+    // branch out and jj stored those names already. Only the paths the
+    // branch did not hold are checked now. Run with TMPDIR on a
+    // case-folding mount to exercise `.GIT`.
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    git(&other, &["checkout", "-qb", "base"]);
+    std::fs::write(other.join("b.txt"), "b\n").unwrap();
+    git(&other, &["add", "b.txt"]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "base"]);
+    git(&other, &["push", "-q", "origin", "base"]);
+    // git refuses `.GIT` in an index, so the tree is built by hand
+    let blob = git(&env.remote, &["hash-object", "-w", other.join("a.txt").to_str().unwrap()]);
+    let mktree = |entries: String| git_stdin(&env.remote, &["mktree"], &entries).trim().to_string();
+    let x = mktree(format!("100644 blob {}\tx\n", blob.trim()));
+    let wide = mktree(format!("100644 blob {}\t{}\n", blob.trim(), "日".repeat(100)));
+    let top = git(&env.remote, &["ls-tree", "base"]);
+    let tree = mktree(format!(
+        "{}040000 tree {x}\t.GIT\n040000 tree {x}\t.jj\n040000 tree {wide}\twide\n",
+        top
+    ));
+    let commit = git(
+        &env.remote,
+        &["-c", "user.email=t@t", "-c", "user.name=T", "commit-tree", &tree, "-p", "base", "-m", "feat"],
+    );
+    git(&env.remote, &["update-ref", "refs/heads/feature", commit.trim()]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    env.j(&dest, &["goto %base"]).ok();
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    let before = ops();
+    std::fs::write(dest.join("b.txt"), "b\nedited\n").unwrap();
+    env.j(&dest, &["tree . validate . id"]).ok();
+    env.j(&dest, &["id"]).ok();
+    env.j(&dest, &["describe \"base edited\""]).ok();
+    env.j(&dest, &["new"]).ok();
+    assert_eq!(ops(), before + 3);
+    // the branch was rebased onto the edit and keeps its names
+    let feature = |expr: &str| env.j(&dest, &[&format!("{} . files . goto %feature", expr)]).ok().stdout;
+    assert_eq!(feature("contentAt ./b.txt"), "b\nedited\n");
+    let paths = feature("map (.path)");
+    let wide = format!("wide/{}", "日".repeat(100));
+    assert_eq!(paths.lines().collect::<Vec<_>>(), [".GIT/x", ".jj/x", "a.txt", "b.txt", wide.as_str()]);
+    // checking it out is still refused, and records nothing
+    let out = env.j(&dest, &["goto %feature"]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert!(out.stderr.contains("path component"), "{}", out.stderr);
+    assert_eq!(ops(), before + 3);
+}
+
+#[test]
 fn init_over_git_starts_on_head() {
     // §7.8: init over an existing git repository creates the working-copy
     // commit as a child of git's HEAD: not of the bookmark that sorts first,
