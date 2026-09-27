@@ -175,6 +175,29 @@ fn let_bindings_evaluate_in_dependency_order() {
     // lambdas give them: `b` applies `a`, whose body needs `y`, and `y`
     // refers back to `b`; `b` waits for `z`, so `y` is bound by then
     check!(i, cfg, "let a = \\_ -> y; b = a z; y = \\_ -> b; z = 1 in z", Value::int(1));
+    // among them, one that refers to none of the others outside a lambda and
+    // only stores its lambdas that do goes first: `env` is bound before
+    // `out` applies `fmt`, whose body needs it, wherever the block lists it
+    check!(
+        i,
+        cfg,
+        "let fmt = \\x -> env.lanes; out = fmt 1; env = { lanes = 3, again = \\_ -> out } in out",
+        Value::int(3)
+    );
+    check!(
+        i,
+        cfg,
+        "let fmt = \\x -> env.lanes; out = fmt 1; env = let n = 3 in { lanes = n, again = [(\\_ -> out)] } in out",
+        Value::int(3)
+    );
+    // a binding that applies such a lambda keeps its place in the first
+    // order: `bm` must still follow `ax`
+    check!(
+        i,
+        cfg,
+        "let aa = \\_ -> bm; ax = { f = aa, n = 1 }; bm = (\\f -> f 0) (\\_ -> ax) in bm.n",
+        Value::int(1)
+    );
 }
 
 #[test]

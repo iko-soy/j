@@ -586,6 +586,46 @@ fn load_order_follows_lambda_bodies() {
     ))
     .expect("config loads");
     assert!(i.globals.lookup("b").is_some());
+    // among definitions that reach each other, one that refers to none of
+    // them outside a lambda and only stores its lambdas that do cannot apply
+    // their functions, so it goes first: `aout` applies `afmt`, whose body
+    // needs the record, and the record's stored lambda refers back to
+    // `aout`. The record used to be evaluated first only when its name
+    // sorted first, and otherwise the config failed with an unbound name
+    for (env, def) in [
+        ("zenv", "{ lanes = 3, again = \\_ -> aout }"),
+        ("aaenv", "{ lanes = 3, again = \\_ -> aout }"),
+        ("zenv", "let n = 3 in { lanes = n, again = [(\\_ -> aout)] }"),
+        ("zenv", "if true then base { lanes = 3, again = \\_ -> aout } else base"),
+    ] {
+        let src = format!(
+            "{}\nbase = {{ lanes = 0, again = \\_ -> 0 }}\nafmt = \\x -> {env}.lanes\n\
+             aout = afmt 1\n{env} = {def}\n",
+            MINIMAL
+        );
+        let i = eval_cfg(&src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        let aout = i.globals.lookup("aout").expect("aout");
+        assert!(j::value::value_eq(&aout, &Value::int(3)).unwrap(), "{}", src);
+    }
+    for names in ["names", "anames"] {
+        let src = format!(
+            "{}\n{names} = 3\nenv = {{ lanes = {names}, header = \\_ -> aout }}\n\
+             render = \\x -> env.lanes\naout = render 1\n",
+            MINIMAL
+        );
+        let i = eval_cfg(&src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        let aout = i.globals.lookup("aout").expect("aout");
+        assert!(j::value::value_eq(&aout, &Value::int(3)).unwrap(), "{}", src);
+    }
+    // a lambda that is applied, not stored, leaves its definition in the
+    // first order: `bm` reaches `ax` through the lambda it passes, so it must
+    // still follow `ax`, which the first order puts before it
+    let i = eval_cfg(&format!(
+        "{}\naa = \\_ -> bm\nax = {{ f = aa }}\nbm = (\\f -> f 0) (\\_ -> ax)\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    assert!(i.globals.lookup("bm").is_some());
 }
 
 #[test]

@@ -339,10 +339,17 @@ references inside lambda bodies never form cycles, since a lambda is a value
 before it is applied. The bindings of a `let` block are evaluated by the same
 rule, with a cycle being a crash. A top-level definition is moreover evaluated
 after every definition that it reaches through a chain of references of
-either kind but that does not reach it back, so a function applied at load
-finds the definitions its body refers to; a `let` binding is ordered the same
-way among the bindings of its block. A lambda body is evaluated on each
-application.
+either kind but that does not reach it back. Among definitions that do reach
+each other, one that refers to none of the others outside a lambda, and whose
+every lambda outside other lambdas that refers to one of them is stored, is
+evaluated before the rest, since it cannot apply their functions; an
+expression is stored when it is the whole definition, or a record field, list
+element, `if` branch or `let` body of a stored expression. So a function
+applied at load finds the definitions its body refers to, save one that
+reaches back to the definition applying the function and is not evaluated
+before the rest; the order among the rest is otherwise unspecified. A `let`
+binding is ordered the same way among the bindings of its block. A lambda
+body is evaluated on each application.
 Recursion is unbounded; the interpreter must handle deep recursion without
 stack overflow (or turn exhaustion into a crash).
 
