@@ -874,8 +874,10 @@ some other value in its place.
   another a directory that `onto` or `to` holds, as replaying the addition
   of `./a/b` onto a file `./a` would: one entry cannot list the directory's
   entries. (The in-memory merge of §10 crashes when it would leave both
-  `./a` and `./a/b`.) A directory side that a conflict already had is
-  carried like any other side. It
+  `./a` and `./a/b`.) It does not crash where one of the three already
+  holds a conflict at that path (an unresolved blob there, not one below
+  it): the sides came in with that conflict and are carried like any others,
+  so a child that resolves such a conflict can be squashed into it. It
   crashes if any of the three is not a well-formed snapshot (a list of `Entry`
   records with unique paths, none of them the root `./`, and none both a file
   and a directory as `./a` beside `./a/b` would be).

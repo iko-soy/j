@@ -902,6 +902,102 @@ fn conflict_directory_sides_kept_whole() {
 }
 
 #[test]
+fn conflict_between_a_file_and_a_directory_resolved_in_a_child_squashes() {
+    // resolving a conflict in a child and squashing it: contract replays the
+    // child with `from` the conflicted parent, whose file side the merge
+    // carries beside the child's directory. That mix came in with the
+    // conflict, but replay refused it as one it made, so `squash`, its
+    // dry run, `abandon . goto parents`, and the law
+    // (abandon . contract m . split m) r = r all crashed (§7.3, §8)
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let paths = "\\r -> show (map (.path) (files r))";
+    let resolve_into_directory = |r: &Repo| {
+        r.j(&["new"]).ok();
+        let a = r.dir.join("a");
+        std::fs::remove_file(&a).or_else(|_| std::fs::remove_dir_all(&a)).unwrap();
+        std::fs::create_dir(&a).unwrap();
+        r.write("a/b", "deep2\n");
+        r.j(&["describe \"C\""]).ok();
+    };
+    let squashes = |r: &Repo| {
+        for m in ["everything", "(under ./a)"] {
+            let law = format!("\\r -> remove ((abandon . contract {m} . split {m}) r) == r");
+            assert_eq!(r.j(&[&law]).ok().stdout.trim(), "true", "{}", m);
+        }
+        r.j(&["tree . validate . squash"]).ok();
+        r.j(&["tree . validate . abandon . goto parents"]).ok();
+        r.j(&["squash"]).ok();
+        assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+        assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
+        let parent = "\\r -> show (conflicted (files (up r)))";
+        assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[]");
+        assert_eq!(r.read("a/b"), "deep2\n");
+    };
+    let onto_l = "rebase (matching (\\c -> c.message == \"L\") all)";
+
+    // jj's conflict between R's directory and L's deletion of P's file
+    let r = setup();
+    r.write("a", "base\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b", "deep\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&[onto_l]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    resolve_into_directory(&r);
+    squashes(&r);
+
+    // a conflict between two files, resolved into a directory
+    let r = setup();
+    r.write("a", "base\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "left\n");
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a", "right\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&[onto_l]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    // `a/b` added beside the conflict at `a` is carried as one of its sides,
+    // where the in-memory merge refuses it (§7.3, §10)
+    let e = "\\r -> show (conflicted (replay (files r) \
+             ({ from = [], to = [{ path = ./a/b, content = blob \"b\" }] })))";
+    assert_eq!(r.j(&[e]).ok().stdout.trim(), "[[\"a\"]]");
+    resolve_into_directory(&r);
+    squashes(&r);
+
+    // a conflict below the path is none at it: the merge still makes the
+    // clash between `onto`'s file and `to`'s directory, and is refused
+    let r = setup();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b", "base\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a/b", "left\n");
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a/b", "right\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&[onto_l]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
+    let e = "\\r -> show (replay [{ path = ./a, content = blob \"f\" }] \
+             ({ from = files r, to = [{ path = ./a/b, content = blob \"r\" }] }))";
+    let out = r.j(&[e]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert!(
+        out.stderr.contains("`a` would be a file on one side and a directory on another"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
 fn edit_applied_to_an_edit_is_a_contract_crash() {
     // `new new` gives `new` a function where its signature wants a Repo: a
     // contract crash (§4.13), so nothing is persisted (§1.2). It used to

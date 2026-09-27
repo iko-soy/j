@@ -2260,26 +2260,32 @@ async fn jj_replay(
     // keeping unresolvable paths as conflicts. Empty labels leave the result
     // unlabeled; the labels would not survive tree_to_files anyway.
     let merged = MergedTree::merge(Merge::from_removes_adds(
-        vec![(from_tree, String::new())],
+        vec![(from_tree.clone(), String::new())],
         vec![(onto_tree.clone(), String::new()), (to_tree.clone(), String::new())],
     ))
     .await
     .map_err(|e| Crash::new(format!("replay: {}", e)))?;
-    refuse_file_directory_clash(&merged, &[&onto_tree, &to_tree]).await?;
+    refuse_file_directory_clash(&merged, &onto_tree, &from_tree, &to_tree).await?;
     // conflicts stay as unresolved blobs (§7.3)
     tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
 }
 
 /// Crash if the merge left a conflict with a file on one side and, on
-/// another, a directory one of `inputs` holds at that path: one entry cannot
-/// list that directory's entries, and the in-memory backend refuses the same
-/// merge, whose result would hold both `a` and `a/b` (§7.3). A directory side
-/// of a conflict jj made earlier is no such directory: it came in as the
-/// opaque side of an unresolved blob, and replay carries it.
+/// another, a directory `onto` or `to` holds at that path: one entry cannot
+/// list that directory's entries (§7.3). A conflict that `onto`, `from` or
+/// `to` already holds at the path is not made here: its sides, a directory
+/// side jj made earlier included, came in as an unresolved blob, and replay
+/// carries them beside the others, as when the child resolving that conflict
+/// is squashed into it.
 async fn refuse_file_directory_clash(
     merged: &MergedTree,
-    inputs: &[&MergedTree],
+    onto: &MergedTree,
+    from: &MergedTree,
+    to: &MergedTree,
 ) -> Result<(), Crash> {
+    let value_at = async |tree: &MergedTree, path: &RepoPath| {
+        tree.path_value(path).await.map_err(|e| Crash::new(format!("replay: {}", e)))
+    };
     // walks only the unresolved part of the tree: nothing when it is resolved
     for (path, value) in merged.conflicts() {
         let value = value.map_err(|e| Crash::new(format!("replay: {}", e)))?;
@@ -2293,16 +2299,23 @@ async fn refuse_file_directory_clash(
         if !has(false) || !has(true) {
             continue;
         }
-        for input in inputs {
-            let held = input
-                .path_value(&path)
-                .await
-                .map_err(|e| Crash::new(format!("replay: {}", e)))?;
-            if held.is_tree() && value.adds().any(|v| v.is_some() && held.iter().any(|h| h == v)) {
-                let comps: Vec<String> =
-                    path.components().map(|c| c.as_internal_str().to_string()).collect();
-                return Err(crate::domain::file_directory_clash(&comps));
-            }
+        let held = [
+            value_at(onto, &path).await?,
+            value_at(from, &path).await?,
+            value_at(to, &path).await?,
+        ];
+        // an input's conflict at the path, as opposed to one inside the
+        // directory there, which leaves the path a directory in the input
+        if held.iter().any(|h| !h.is_resolved() && !h.is_tree()) {
+            continue;
+        }
+        let side = |dir: &MergedTreeValueT| {
+            dir.is_tree() && value.adds().any(|v| v.is_some() && dir.iter().any(|h| h == v))
+        };
+        if side(&held[0]) || side(&held[2]) {
+            let comps: Vec<String> =
+                path.components().map(|c| c.as_internal_str().to_string()).collect();
+            return Err(crate::domain::file_directory_clash(&comps));
         }
     }
     Ok(())

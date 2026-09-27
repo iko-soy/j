@@ -289,9 +289,10 @@ pub fn simple_replay(
             }
         }
     }
-    // a file at a path and entries below it: jj's merge makes that one
-    // conflict between a file and a directory, which the jj backend refuses
-    // too (§7.3)
+    // a file at a path and entries below it cannot be one snapshot. jj
+    // keeps the path as one conflict with the directory as a side, and
+    // refuses that unless one of the three held a conflict there; this
+    // merge keeps no directory as a side, so it always refuses (§7.3, §10)
     if let Some(p) = file_and_directory(out.keys()) {
         return Err(file_directory_clash(p));
     }
