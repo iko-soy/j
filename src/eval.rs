@@ -20,6 +20,12 @@ pub struct Interp {
     fresh: RefCell<u64>,
     /// the currently executing top-level definition (for crash reports)
     pub current_def: RefCell<Option<String>>,
+    /// The definitions written as lambdas, by the address of the lambda's
+    /// body, which every closure made from it shares: while that body runs,
+    /// the definition is executing (§1.4), whatever name its closure has
+    /// been bound to since (`prev = goto parents` runs goto's body). The body
+    /// is held so its address cannot be reused.
+    def_bodies: HashMap<*const Expr, (Rc<str>, Rc<Expr>)>,
     /// the repository as loaded, before snapshotting (for `validate`)
     pub old_repo: RefCell<Option<Value>>,
     /// Results of applying a config revset the binary itself calls (`trunk`,
@@ -158,6 +164,12 @@ pub(crate) enum Cont {
         supplied: usize,
         cont: Rc<Cont>,
     },
+    /// the body of a definition's lambda is running (§1.4); passes its value
+    /// on unchanged
+    InDef {
+        name: Rc<str>,
+        cont: Rc<Cont>,
+    },
     // The builtins that apply functions they are given run as steps of this
     // machine, not in a nested run, so a recursion through them takes no
     // native stack (§4.1; Interp::step_applying). Each frame below receives
@@ -253,6 +265,7 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::CheckExpr { cont, .. } => Some(cont),
         Cont::NamePartial { cont, .. } => Some(cont),
         Cont::CheckResult { cont, .. } => Some(cont),
+        Cont::InDef { cont, .. } => Some(cont),
         Cont::MapNext { cont, .. } => Some(cont),
         Cont::FilterNext { cont, .. } => Some(cont),
         Cont::FoldlArg { cont, .. } => Some(cont),
@@ -266,12 +279,13 @@ pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
     parent_rc(k).map(|r| (**r).clone())
 }
 
-/// The innermost definition whose application `k` continues (§1.4): a signed
-/// definition's body runs under a `CheckExpr` of its result, which stays on
-/// the chain until the body has returned, and one whose value is a builtin
-/// that applies functions runs them under a `BuiltinResult` naming it. Only
-/// used on a crash no `Try` caught, so there is no `Try` on the chain to stop
-/// the walk early.
+/// The innermost definition whose application `k` continues (§1.4): a
+/// signed definition's application runs under the `CheckExpr` of its result,
+/// the body of a definition's lambda under an `InDef` naming it unless that
+/// `CheckExpr` names it already, and the functions a builtin applies as a
+/// signed definition's value under a `BuiltinResult` naming it; each stays on
+/// the chain until the body has returned. Only used on a crash no `Try`
+/// caught, so there is no `Try` on the chain to stop the walk early.
 fn innermost_def(k: &Cont) -> Option<String> {
     let mut k = k;
     loop {
@@ -280,6 +294,7 @@ fn innermost_def(k: &Cont) -> Option<String> {
             | Cont::BuiltinResult {
                 def: Some(name), ..
             } => return Some(name.clone()),
+            Cont::InDef { name, .. } => return Some(name.to_string()),
             _ => {}
         }
         k = parent_rc(k)?;
@@ -329,6 +344,7 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
@@ -387,6 +403,7 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
@@ -418,6 +435,26 @@ impl Interp {
 
     pub fn global_env(&self) -> Env {
         self.globals.clone()
+    }
+
+    /// Record `expr`, the expression of the definition `name`: the body of
+    /// the lambda it is written as runs as `name`'s (§1.4), and so does the
+    /// body of each lambda that body is in turn (`\a -> \b -> e`). A lambda
+    /// in parentheses or ending a `let` is the definition's lambda too.
+    pub fn name_bodies(&mut self, name: &str, expr: &Rc<Expr>) {
+        let name: Rc<str> = Rc::from(name);
+        let mut e = expr;
+        loop {
+            match &**e {
+                Expr::Paren(inner) | Expr::Let(_, inner) => e = inner,
+                Expr::Lambda(_, body, _) => {
+                    self.def_bodies
+                        .insert(Rc::as_ptr(body), (name.clone(), body.clone()));
+                    e = body;
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Main entry: evaluate an expression in an environment.
@@ -1040,6 +1077,7 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::InDef { cont, .. } => Run::Step(State::Ret(v, (*cont).clone())),
             Cont::MapNext {
                 f,
                 xs,
@@ -1275,6 +1313,24 @@ impl Interp {
                         None => true,
                     };
                     if new_applied == params.len() {
+                        // the definition whose lambda this body is, if any,
+                        // executes while it runs (§1.4)
+                        let def = self
+                            .def_bodies
+                            .get(&Rc::as_ptr(body))
+                            .map(|(d, _)| d.clone());
+                        // a call in tail position of a definition's body
+                        // leaves that definition nothing to do but pass this
+                        // body's value on, so its frame gives way to the one
+                        // this body runs under, and unsigned tail recursion
+                        // keeps its continuation constant in size
+                        let signed = cname.is_some() && advanced.is_some();
+                        let k = match k {
+                            Cont::InDef { cont, .. } if signed || def.is_some() => {
+                                (*cont).clone()
+                            }
+                            k => k,
+                        };
                         // the body is evaluated now, as at any application
                         // (§4.1): a signature adds checks and never changes
                         // when a body runs, or whether an `or` around the
@@ -1301,6 +1357,20 @@ impl Interp {
                                 Cont::CheckExpr {
                                     name: n,
                                     cexpr: c,
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
+                        // inside the check of the definition it was bound to,
+                        // which names this one already when it is the same
+                        let k = match def {
+                            Some(d)
+                                if !matches!(&k, Cont::CheckExpr { name, .. }
+                                    if **name == *d) =>
+                            {
+                                Cont::InDef {
+                                    name: d,
                                     cont: Rc::new(k),
                                 }
                             }

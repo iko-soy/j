@@ -233,6 +233,8 @@ fn crash_trace_names_the_innermost_definition() {
         ("describe 3", "   in describe, from describe 3"),
         ("new . goto %nope", "   in goto, from new . goto %nope"),
         ("squash 3", "   in squash, from squash 3"),
+        // `prev = goto parents` runs goto's body, which raised the crash
+        ("prev . top", "   in goto, from prev . top"),
         ("crash \"boom\"", "   from crash \"boom\""),
     ] {
         let out = r.j(&[expr]);

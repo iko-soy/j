@@ -532,6 +532,30 @@ mapped = map (\x -> x + head [])
 
 counted : [Int] -> Int
 counted = map id
+
+plain = \n -> if n > 0 then n else crash "not positive"
+
+plainOuter = \n -> plain n + 1
+
+plainAfter = \n -> plain n + head []
+
+plainTail = \n -> if n > 0 then plainTail (n - 1) else plain n
+
+plainBack = \n -> if n > 0 then plainBack (n - 1) else head []
+
+signedCallsPlain : Int -> Int
+signedCallsPlain = \n -> plain n
+
+plainCallsSigned = \n -> inner n
+
+sumPos : Int -> Int -> Int
+sumPos = \a b -> if b > 0 then a + b else crash "not positive"
+
+addOne : Int -> Int
+addOne = sumPos 1
+
+sameAsInner : Int -> Int
+sameAsInner = inner
 "#;
 
 /// The message of the crash `src` raises and the definition it is in.
@@ -553,6 +577,8 @@ fn crash_names_the_innermost_definition_executing() {
     // at run time reported none and the CLI printed only `from EXPR`.
     let (mut i, cfg) = make_interp_with(&format!("{}{}", DEFERRED, NESTED));
     let goto = format!("goto (\\_ -> []) ({})", REPO);
+    let prev = format!("prev ({})", REPO);
+    let next = format!("next ({})", REPO);
     for (src, want) in [
         ("inner 0", Some("inner")),
         // §5.1's example, on a repository literal
@@ -584,6 +610,27 @@ fn crash_names_the_innermost_definition_executing() {
         // and so do the functions it applies, and its result's check
         ("mapped [1]", Some("mapped")),
         ("counted [1]", Some("counted")),
+        // a definition without a signature is executing while its body runs,
+        // as one with a signature is: nothing named one, so `plain 0` and
+        // `plainOuter 0` named none, and `signedCallsPlain 0` named the
+        // signed definition that called `plain`
+        ("plain 0", Some("plain")),
+        ("plainOuter 0", Some("plain")),
+        ("plainAfter 1", Some("plainAfter")),
+        ("plainTail 3", Some("plain")),
+        ("plainBack 3", Some("plainBack")),
+        ("signedCallsPlain 0", Some("plain")),
+        ("signedCallsPlain \"x\"", Some("signedCallsPlain")),
+        ("plainCallsSigned 0", Some("inner")),
+        // a definition whose value is another's function runs that one's
+        // body, the innermost (`prev = goto parents`), where the outer
+        // name was reported; its own signature still checks its arguments
+        ("addOne 0", Some("sumPos")),
+        ("addOne \"x\"", Some("addOne")),
+        ("sameAsInner 0", Some("inner")),
+        ("sameAsInner \"x\"", Some("sameAsInner")),
+        (prev.as_str(), Some("goto")),
+        (next.as_str(), Some("goto")),
         // a builtin is no definition: outside every definition, none
         ("head []", None),
         ("crash \"top\"", None),
@@ -592,6 +639,22 @@ fn crash_names_the_innermost_definition_executing() {
         let (msg, def) = crash_in(&mut i, &cfg, src);
         assert_eq!(def.as_deref(), want, "{} crashed with {}", src, msg);
     }
+}
+
+#[test]
+fn unsigned_tail_recursion_keeps_its_continuation_constant() {
+    // §1.4, §4.1: a definition's body runs under a frame naming it, and a
+    // call in tail position of that body replaces its frame. A frame kept
+    // per call grew the continuation with every step of an unsigned tail
+    // recursion, which only signed definitions' checks did before, and a
+    // crash at the end dropped the whole chain at once on the native stack.
+    on_stack(4, || {
+        let (mut i, cfg) = make_interp_with(NESTED);
+        let (msg, def) = crash_in(&mut i, &cfg, "plainTail 50000");
+        assert_eq!(def.as_deref(), Some("plain"), "{}", msg);
+        let (msg, def) = crash_in(&mut i, &cfg, "plainBack 50000");
+        assert_eq!(def.as_deref(), Some("plainBack"), "{}", msg);
+    });
 }
 
 #[test]

@@ -579,6 +579,10 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
         }
     }
     interp.globals = Env::with_globals(globals);
+    // a definition executes while its lambda's body runs (§1.4)
+    for (name, expr) in &cfg.defs {
+        interp.name_bodies(name, expr);
+    }
     // evaluate definitions in dependency order, through one recursive frame so
     // top-level definitions are mutually recursive (§4.1)
     let (genv, cell) = interp.globals.extend_rec();
