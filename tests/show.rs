@@ -148,6 +148,24 @@ fn show_nested_list_atoms() {
 }
 
 #[test]
+fn show_breaks_a_list_of_records_bare() {
+    // on one line a record in a list keeps its parens (above); broken over
+    // lines it is bare, as each element begins a line or follows the `[`
+    // (§3.3). A `Subtree` holding a commit is always that wide, so §3.4
+    // counts what `show` renders of one at 3 levels a commit, not 5, as
+    // tests/parse.rs nesting_bound_counts_levels_as_the_spec_says does
+    let (mut i, cfg) = make_interp();
+    let subtree = (0..30).fold(Value::list(vec![]), |v, _| {
+        Value::list(vec![Value::record(&[("children", v), ("root", Value::int(1))])])
+    });
+    let s = show(&i, &subtree).unwrap();
+    let want = (0..30).fold("[]".to_string(), |s, _| format!("[{{ children = {}\n, root = 1 }}]", s));
+    let unindented: Vec<&str> = s.lines().map(str::trim_start).collect();
+    assert_eq!(unindented.join("\n"), want);
+    roundtrip(&mut i, &cfg, &subtree);
+}
+
+#[test]
 fn show_roundtrips_values_nested_up_to_the_parsers_bound() {
     // §5.2 exempts only values whose rendering nests past §3.4's bound of
     // 40,000 levels, where a list is one level and a record's braces two. A

@@ -326,7 +326,9 @@ Notes:
   `r.a.b …` is thus one level deeper per link, as are right-associative
   operators, `or`, and `\`/`if`/`let` bodies. Lists nest 40,000 deep,
   parentheses and records about 20,000, and a `Subtree` as `show` renders it
-  (§5.2) about 8,000. A type in `config.j` is bounded the same way: one
+  (§5.2) about 13,000: three levels a commit, the braces of its record and
+  the list around them, as a list broken over lines holds records without
+  parentheses (§3.3). A type in `config.j` is bounded the same way: one
   level, plus one for each bracket, parenthesis, field or `->` around it.
 
 ---
