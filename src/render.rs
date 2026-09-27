@@ -391,15 +391,21 @@ const SIZE_BAR_TOP: usize = 1000;
 ///
 /// A line diff costs the product of the file's length and the size of the
 /// change, so a plain one of a rewritten or reordered long file takes
-/// seconds. The search here stops at the cap, so its cost is bounded by the
-/// cap rather than by a clock and the same two versions always give the same
-/// count, and every step before it keeps the count exact: the common prefix
-/// and suffix are equal lines of some shortest diff, and the difference in
-/// length is a lower bound. A small change is then settled by a short search
-/// over the lines as they are. Otherwise a line that does not occur on the
-/// other side at all cannot be part of any common subsequence, so, as git's
-/// xdiff does, it counts as changed up front, and the rest is searched
-/// unless `reorder_bound` already puts it past the cap.
+/// seconds. The search here stops at the cap rather than at a clock, so the
+/// same two versions always give the same count, but that only bounds its
+/// cost by the product of the file's length and the cap: at most one pass
+/// over the lines for each of the `2 × cap + 1` diagonals it reaches
+/// (`edit_distance`). Every step before it keeps the count exact: the common
+/// prefix and suffix are equal lines of some shortest diff, and the
+/// difference in length is a lower bound. A small change is then settled by
+/// a short search over the lines as they are. Otherwise a line that does not
+/// occur on the other side at all cannot be part of any common subsequence,
+/// so, as git's xdiff does, it counts as changed up front, and the rest is
+/// searched unless `reorder_bound` already puts it past the cap. On most
+/// content a diagonal soon stops at a line that differs; a long file of a
+/// few lines repeating, with a change just under the cap, pays a pass for
+/// many of them: a million lines of two alternating, with 480 pairs of
+/// neighbours swapped, take some 5 × 10⁸ comparisons.
 fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
     use std::collections::HashMap;
     // the rounds of the first, short search
