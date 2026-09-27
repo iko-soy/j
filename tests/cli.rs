@@ -1128,6 +1128,19 @@ fn a_commit_is_shown_where_it_stands_after_the_snapshot() {
     assert!(lines[0].starts_with("◌ ") && lines[0].ends_with("  E"), "{}", out);
     assert!(lines[1].ends_with(" · 0 files"), "{}", out);
     assert_eq!(lines.len(), 2, "{}", out);
+    // a commit table draws each row as the commit's line, glyph included
+    r.j(&["new"]).ok();
+    r.write("d.txt", "d\n");
+    r.j(&["describe \"N\""]).ok();
+    let tree = r.j(&["tree"]).ok().stdout;
+    let out = r.j(&["ancestors"]).ok().stdout;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", out);
+    assert!(tree_row(&tree, "N").contains('◉'), "{}", tree);
+    assert!(lines[0].starts_with("◉ ") && lines[0].ends_with("  N"), "{}", out);
+    assert!(tree_row(&tree, "A").contains('●'), "{}", tree);
+    assert!(lines[1].starts_with("● ") && lines[1].ends_with("  A"), "{}", out);
+    assert!(lines[2].starts_with("⌂ "), "{}", out);
 }
 
 #[test]

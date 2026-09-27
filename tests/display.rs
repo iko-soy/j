@@ -463,6 +463,51 @@ fn field_line<'a>(out: &'a str, key: &str) -> &'a str {
 }
 
 #[test]
+fn a_commit_line_draws_the_glyph_its_block_does() {
+    // the line form drew `○` for every commit and a `Repo` `◉`, so a commit
+    // nested in a record, a frame, a subtree or a commit table was drawn
+    // otherwise than its block, whose first line §5.1 defines as that line,
+    // and than `tree`: the root got `○` in a table, not `⌂`
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let first = |out: String| out.lines().next().unwrap().to_string();
+    let focus = first(eval_and_display(&mut i, &cfg, "focus", repo.clone()));
+    let parent = first(eval_and_display(&mut i, &cfg, "focus . up", repo.clone()));
+    let root = first(eval_and_display(&mut i, &cfg, "focus . top", repo.clone()));
+    assert_eq!(focus, "◉ wqztbbbb  wip  feature");
+    assert_eq!(parent, "◆ kpqxaaaa  add parser  main");
+    assert!(root.starts_with("⌂ "), "{}", root);
+    let src = "\\r -> { c = r.root, p = (up r).root, t = (top r).root, repo = r, \
+               frame = head r.context, sub = head (up r).children }";
+    let rec = eval_and_display(&mut i, &cfg, src, repo.clone());
+    for (key, want) in [
+        ("c", &focus),
+        ("p", &parent),
+        ("t", &root),
+        ("repo", &focus),
+        ("frame", &parent),
+        ("sub", &focus),
+    ] {
+        assert_eq!(field_line(&rec, key), want, "{}\n{}", key, rec);
+    }
+    let table = eval_and_display(&mut i, &cfg, "ancestors", repo);
+    assert_eq!(table, format!("{}\n{}\n{}\n", focus, parent, root));
+    // an empty focus is `◌` in every form, as in `tree`
+    let (repo, be) = linear_repo(vec![
+        ("kpqxaaaa", "msg-a", vec![("f.txt", "one\n")]),
+        ("kpqxbbbb", "msg-b", vec![("f.txt", "one\n")]),
+    ]);
+    let (mut i, cfg) = make_interp(be);
+    let tree = eval_and_display(&mut i, &cfg, "tree", repo.clone());
+    let block = first(eval_and_display(&mut i, &cfg, "focus", repo.clone()));
+    let rec = eval_and_display(&mut i, &cfg, "\\r -> { c = r.root, repo = r }", repo);
+    assert_eq!(tree_glyph(&tree, "msg-b"), '◌', "{}", tree);
+    assert_eq!(block, "◌ kpqxbbbb  msg-b");
+    assert_eq!(field_line(&rec, "c"), block, "{}", rec);
+    assert_eq!(field_line(&rec, "repo"), block, "{}", rec);
+}
+
+#[test]
 fn a_commit_the_expression_made_lists_its_files_unmarked() {
     // its parent is not in the repository the expression was given, and the
     // block diffed it against no files: `focus . new` said the new commit adds

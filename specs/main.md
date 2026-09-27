@@ -600,12 +600,13 @@ line form. Author and age in a `Commit` block are read from jj's commit
 metadata by id;
 they are not fields of the value. Nor is where it stands, which is read by id
 from `r`, the repository the expression was given (§1.2 step 4, after the
-snapshot): its paths are those it changes against its parent's files there,
-and its glyph is the one `tree` draws for it there, with `⊗` and `◌` judged
-by the value's own files. What a commit with no parent there (the root, or
-one the expression made) changes is not known: its block lists and counts
-its files unmarked, and its glyph claims no `◌`. One the expression moved is
-still compared with its parent there. A list of `[Text]` prints as paths because
+snapshot): a block's paths are those it changes against its parent's files
+there, and its glyph, in either form, is the one `tree` draws for it there,
+with `⊗` and `◌` judged by the value's own files. What a commit with no
+parent there (the root, or one the expression made) changes is not known:
+its block lists and counts its files unmarked, and its glyph claims no `◌`.
+One the expression moved is still compared with its parent there. A `Repo`'s
+line draws its focus as the focus. A list of `[Text]` prints as paths because
 that is what such a list is in every base function; `show` is available
 when the literal is wanted. Alignment in tables and columns uses display
 width (East Asian wide characters count two cells, combining marks zero), not
