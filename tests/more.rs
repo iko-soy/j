@@ -114,7 +114,7 @@ fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
         value_eq(&got, &want).unwrap(),
         "{} gave {}",
         src,
-        j::show::show(i, &got)
+        j::show::show(i, &got).unwrap()
     );
 }
 
@@ -175,7 +175,8 @@ fn composition_argument_belongs_to_the_right_operand() {
 #[test]
 fn signatures_hold_whatever_the_definition_is_built_from() {
     // §4.13: a signature is checked at every application of the definition,
-    // whether its value is a lambda, a composition, an `or`, or a label.
+    // whether its value is a lambda, a composition, a builtin's partial
+    // application, an `or`, or a label.
     let (mut i, cfg) = make_interp_with(
         r#"
 inc : Int -> Int
@@ -195,6 +196,18 @@ choose = (\a b -> a) or (\a b -> b)
 
 mainCount : Repo -> Int
 mainCount = %main
+
+addT : Int -> Int -> Text
+addT = (+) . inc
+
+sumInc : Int -> Int -> Int
+sumInc = (+) . inc
+
+badEdit : Text -> Edit
+badEdit = (\e r -> 5) . describe
+
+constT : Int -> Int -> Text
+constT = const (\y -> y)
 "#,
     );
     // a signed composition checks its argument and its result
@@ -224,6 +237,29 @@ mainCount = %main
         "mainCount ({ root = { files = [], message = \"\", labels = [], id = @ }, children = [], context = [] })",
     );
     assert!(m.contains("mainCount: result expected Int, got list"), "{}", m);
+    // a composition or a builtin's partial application that consumes fewer
+    // arguments than the signature lists returns a function, which is the
+    // definition's partial application under the rest of the signature: its
+    // later arguments and its result were checked by nothing, or by the
+    // builtin it happened to return
+    let m = crash_msg(&mut i, &cfg, "addT 1 5");
+    assert!(m.contains("addT: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "addT 1 \"x\"");
+    assert!(m.contains("addT expected Int as argument 2, got Text"), "{}", m);
+    assert_value(&mut i, &cfg, "sumInc 1 5", Value::int(7));
+    assert_value(&mut i, &cfg, "show (sumInc 1)", Value::text("sumInc 1"));
+    let m = crash_msg(
+        &mut i,
+        &cfg,
+        "badEdit \"x\" ({ root = { files = [], message = \"\", labels = [], id = @ }, children = [], context = [] })",
+    );
+    assert!(m.contains("badEdit: result expected record, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "constT 1 2");
+    assert!(m.contains("constT: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "constT 1 \"x\"");
+    assert!(m.contains("constT expected Int as argument 2, got Text"), "{}", m);
+    // the arguments baked into the value are not the definition's own
+    assert_value(&mut i, &cfg, "show (constT 1)", Value::text("constT 1"));
 }
 
 #[test]

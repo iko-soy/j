@@ -590,6 +590,23 @@ proptest! {
     }
 
     #[test]
+    fn law_history_walks_are_their_recursive_definitions((tree, focus, backend) in arb_repo()) {
+        // `commits` is the builtin `subtreeCommits` and `ancestors` reads the
+        // context frames, so that neither is quadratic in the depth of the
+        // history; from any focus they give what the recursive definitions
+        // they replaced give (§4.9, §9)
+        let repo = repo_value(&tree, &focus);
+        let (mut i, cfg) = make_interp(backend);
+        let src = "let oldCommits = \\t -> t.root :: (concat (map oldCommits t.children) or []); \
+                       oldAncestors = \\r -> r.root.id :: ((let p = up r in oldAncestors p) or []) \
+                   in \\r -> [(commits (top r) == oldCommits (top r)) \
+                              (commits r == oldCommits r) \
+                              (ancestors r == oldAncestors r)]";
+        let got = eval_fn(&mut i, &cfg, src, repo).expect("history walks");
+        prop_assert!(value_eq(&got, &Value::list(vec![Value::Bool(true); 3])).unwrap());
+    }
+
+    #[test]
     fn law_concat_laws((_t, _f, backend) in arb_repo()) {
         let (mut i, cfg) = make_interp(backend);
         // concat [xs] = xs

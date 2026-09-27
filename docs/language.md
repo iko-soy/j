@@ -174,6 +174,11 @@ let r = { a = 1, b = 2 } in r { b = 99 }
 >
 > The same applies inside lists: `[{ root = c, children = [] }]` — write the
 > braces as a parenthesised element `[(…)]` if it follows another element.
+>
+> A line break stops this: a `.name` or `{` that starts a line never attaches
+> to what came before, so `r` with `.a` on the next (indented) line is
+> `r (.a)`, not `r.a`. Keep a selector or update on the line where the
+> expression it applies to ends.
 
 ### Functions
 
@@ -279,6 +284,12 @@ This is an error, not silent shadowing:
 ```
 let x = 1 in let f = \x -> x in f 2     -- parse error: `x` is already bound
 ```
+
+The one exception is inside `config.j`: a binder there may reuse the name of
+one of the config's own top-level definitions, as the reference config's
+`newCommit = \files -> …` does, and within that binder's scope the name means
+the binder. Builtin names and names bound by an enclosing lambda or `let` are
+still refused there.
 
 ### Lexical scope
 

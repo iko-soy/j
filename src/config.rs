@@ -40,7 +40,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
     "replay", "unresolved", "blob", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
-    "extract", "touchedPaths",
+    "extract", "touchedPaths", "subtreeCommits",
 ];
 
 pub fn is_reserved_builtin(name: &str) -> bool {
@@ -53,6 +53,8 @@ pub fn reserved_set() -> BTreeSet<String> {
 
 /// Parse and validate config.j (§6.2). Id literals are resolved separately.
 pub fn load_config(src: &str) -> Result<Config, ConfigError> {
+    // the builtins only: config.j's binders may reuse its own top-level
+    // names (§4.2), as the reference config's `\files ->` does
     let outer = Rc::new(reserved_set());
     let items = parse_config(src, outer).map_err(ConfigError::Parse)?;
     validate_items(items)
@@ -173,9 +175,16 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
 /// name with no cycle anywhere. So the definitions are then grouped into the
 /// strongly connected components of all references, lambda bodies included,
 /// and the groups evaluated referenced first, the members of each in the
-/// first order. Every definition still follows its references outside
-/// lambdas, and since evaluating one looks up only names it reaches by
-/// references, whatever the first order had bound in time still is.
+/// first order, save that a member which cannot apply a function of its group
+/// at load goes first: one that refers to the group only inside lambdas it
+/// stores (`env = { lanes = 3, header = \_ -> out }`, with `out = render 1`
+/// and `render = \x -> env.lanes`). Such a member looks up only earlier
+/// groups and builtins, and every other definition keeps its place among the
+/// rest, so each still follows its references outside lambdas; and since
+/// evaluating one looks up only names it reaches by references, whatever the
+/// first order had bound in time still is (a lookup that came too early, its
+/// crash caught by `or`, may now find its name). Among members that can apply
+/// a function of their group, the first order may still apply one too early.
 fn dependency_order(
     defs: &HashMap<String, Rc<Expr>>,
 ) -> Result<Vec<(String, Rc<Expr>)>, ConfigError> {
@@ -218,12 +227,36 @@ fn dependency_order(
             free.iter().filter_map(|n| position.get(n.as_str()).copied()).collect()
         })
         .collect();
-    let mut grouped = Vec::with_capacity(ordered.len());
-    for mut group in components(&edges) {
+    let order = group_order(&edges, |group, p| {
+        let (n, e) = &ordered[p];
+        let mut eager = deps[n].clone();
+        applied_refs(e, true, &mut Vec::new(), &mut eager);
+        !eager
+            .iter()
+            .filter_map(|d| position.get(d.as_str()))
+            .any(|q| group.binary_search(q).is_ok())
+    });
+    Ok(order.into_iter().map(|p| ordered[p].clone()).collect())
+}
+
+/// Positions in a first order regrouped for evaluation (§4.1): the strongly
+/// connected components of `edges`, each after every one it has an edge
+/// into, and inside a component of several, first the members for which
+/// `early` holds, given the component (sorted) and the member, then the
+/// others, each part in the first order.
+fn group_order(edges: &[Vec<usize>], early: impl Fn(&[usize], usize) -> bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(edges.len());
+    for mut group in components(edges) {
         group.sort_unstable();
-        grouped.extend(group.into_iter().map(|i| ordered[i].clone()));
+        if group.len() > 1 {
+            let (front, rest): (Vec<usize>, Vec<usize>) =
+                group.iter().partition(|&&p| early(&group, p));
+            group = front;
+            group.extend(rest);
+        }
+        out.extend(group);
     }
-    Ok(grouped)
+    out
 }
 
 /// The strongly connected components of a graph given as adjacency lists,
@@ -283,8 +316,9 @@ fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// them, or `None` when references outside lambdas form a cycle.
 ///
 /// The rule is `dependency_order`'s, with ready bindings taken in source
-/// order: a binding follows every binding it refers to outside a lambda, and
-/// the bindings are then grouped by all their references, so a function
+/// order: a binding follows every binding it refers to outside a lambda; the
+/// bindings are then grouped by all their references, and inside a group
+/// those that cannot apply a function of it go first, so that a function
 /// applied in a binding finds the bindings its body refers to. That order is
 /// the source order when every reference is to an earlier binding, or from
 /// inside a lambda to its own, as in nearly every block, which is so taken
@@ -326,12 +360,15 @@ pub(crate) fn let_order(bs: &[(String, Rc<Expr>)]) -> Option<Vec<usize>> {
         .iter()
         .map(|&i| refs[i].iter().map(|&(j, _)| position[j]).collect())
         .collect();
-    let mut grouped = Vec::with_capacity(bs.len());
-    for mut group in components(&edges) {
-        group.sort_unstable();
-        grouped.extend(group.into_iter().map(|p| ordered[p]));
-    }
-    Some(grouped)
+    let order = group_order(&edges, |group, p| {
+        let i = ordered[p];
+        let mut applied = BTreeSet::new();
+        applied_refs(&bs[i].1, true, &mut Vec::new(), &mut applied);
+        let in_group = |j: usize| group.binary_search(&position[j]).is_ok();
+        !refs[i].iter().any(|&(j, outside)| outside && in_group(j))
+            && !bs.iter().enumerate().any(|(j, (b, _))| applied.contains(b) && in_group(j))
+    });
+    Some(order.into_iter().map(|p| ordered[p]).collect())
 }
 
 /// Record the references in `e` to the names a `let` block binds, as indices
@@ -396,6 +433,58 @@ fn binding_refs(
         | Expr::Bool(_)
         | Expr::SelectorFun(_)
         | Expr::Crash => {}
+    }
+}
+
+/// Record the free names of the lambdas that evaluating `e` may apply
+/// (§4.1): every lambda outside the others, save where its value is only
+/// stored, which is `e` itself when `stored`, and a record field, list
+/// element, `if` branch or `let` body of such a place. `bound` holds the
+/// `let` names in scope, which in config.j may reuse a top-level name (§4.2).
+fn applied_refs(e: &Expr, stored: bool, bound: &mut Vec<String>, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Lambda(_, _, _) => {
+            if !stored {
+                e.free_vars(bound, out);
+            }
+        }
+        Expr::Paren(a) => applied_refs(a, stored, bound, out),
+        Expr::If(c, a, b) => {
+            applied_refs(c, false, bound, out);
+            applied_refs(a, stored, bound, out);
+            applied_refs(b, stored, bound, out);
+        }
+        Expr::Let(bs, body) => {
+            let start = bound.len();
+            bound.extend(bs.iter().map(|(n, _)| n.clone()));
+            for (_, b) in bs {
+                applied_refs(b, false, bound, out);
+            }
+            applied_refs(body, stored, bound, out);
+            bound.truncate(start);
+        }
+        Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Or(a, b) => {
+            applied_refs(a, false, bound, out);
+            applied_refs(b, false, bound, out);
+        }
+        Expr::Select(a, _) => applied_refs(a, false, bound, out),
+        Expr::Update(a, fs) => {
+            applied_refs(a, false, bound, out);
+            for (_, v) in fs {
+                applied_refs(v, stored, bound, out);
+            }
+        }
+        Expr::Record(fs) => {
+            for (_, v) in fs {
+                applied_refs(v, stored, bound, out);
+            }
+        }
+        Expr::List(es) => {
+            for e in es {
+                applied_refs(e, stored, bound, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -490,6 +579,10 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
         }
     }
     interp.globals = Env::with_globals(globals);
+    // a definition executes while its lambda's body runs (§1.4)
+    for (name, expr) in &cfg.defs {
+        interp.name_bodies(name, expr);
+    }
     // evaluate definitions in dependency order, through one recursive frame so
     // top-level definitions are mutually recursive (§4.1)
     let (genv, cell) = interp.globals.extend_rec();

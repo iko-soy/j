@@ -467,6 +467,24 @@ no such visible commit. Backed by the change-id index. Applied to one argument
 by @wqzt        -- an edit: refocus on the commit @wqzt
 ```
 
+### `subtreeCommits` — every commit of a tree
+
+```
+subtreeCommits : a -> [Commit]
+```
+
+Every commit of a tree (anything with `root` and `children`, so a `Subtree`
+or a `Repo`'s focused subtree), in preorder, in one pass. It gives exactly
+what `\t -> t.root :: (concat (map subtreeCommits t.children) or [])` gives,
+but in time linear in the size of the tree: written that way, every level
+copies the list below it. The reference config's `commits` is this builtin
+(§6).
+
+```
+subtreeCommits ({ root = 1, children = [({ root = 2, children = [] })] })
+    => [1 2]
+```
+
 ### `meta` — commit metadata
 
 ```
@@ -599,13 +617,16 @@ commits . top           -- every commit, preorder
 
 ```
 commits : a -> [Commit]
-commits = \t -> t.root :: (concat (map commits t.children) or [])
+commits = subtreeCommits
 ```
 
 Every commit of a subtree (or of the focused subtree of a `Repo`), in
 preorder. Takes anything with `root` and `children`, so the signature is left
-open. The `or []` handles a leaf (whose `children` is empty, so `concat`
-crashes and yields `[]`).
+open. It is the builtin `subtreeCommits` (§5), which computes
+`\t -> t.root :: (concat (map commits t.children) or [])` in one pass. (There
+the `or []` handles a leaf, whose `children` is empty, so `concat` crashes and
+yields `[]`.) Written in the language, it copies the list below every commit,
+and takes time quadratic in the length of the history.
 
 ```
 length . commits . top      -- how many commits are visible?
@@ -1182,6 +1203,7 @@ j 'tree'
 | `stack` | `Revset` | §7.3 |
 | `startsWith` | `Text -> Text -> Bool` | §4 |
 | `status` | `Repo -> {…}` | §10 |
+| `subtreeCommits` | `a -> [Commit]` | §5 |
 | `tail` | `[a] -> [a]` | §4 |
 | `take` | `Int -> [a] -> [a]` | §4 |
 | `text` | `Blob -> Text` | §5 |

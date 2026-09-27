@@ -22,7 +22,7 @@ fn make_interp() -> (Interp, config::Config) {
 }
 
 fn roundtrip(i: &mut Interp, cfg: &config::Config, v: &Value) {
-    let s = show(i, v);
+    let s = show(i, v).unwrap();
     let outer = Rc::new(cfg.global_names.clone());
     let e = parse_expr(&s, outer)
         .unwrap_or_else(|err| panic!("show output {:?} does not parse: {}", s, err.msg));
@@ -34,9 +34,9 @@ fn roundtrip(i: &mut Interp, cfg: &config::Config, v: &Value) {
     assert!(
         value_eq(v, &v2).unwrap_or(false),
         "roundtrip failed: {:?} -> {} -> {}",
-        show(i, v),
+        show(i, v).unwrap(),
         s,
-        show(i, &v2)
+        show(i, &v2).unwrap()
     );
 }
 
@@ -83,7 +83,7 @@ fn show_roundtrips_all_kinds() {
 fn show_record_field_order() {
     let (i, _cfg) = make_interp();
     let v = Value::record(&[("z", Value::int(1)), ("a", Value::int(2)), ("m", Value::int(3))]);
-    assert_eq!(show(&i, &v), "{ a = 2, m = 3, z = 1 }");
+    assert_eq!(show(&i, &v).unwrap(), "{ a = 2, m = 3, z = 1 }");
 }
 
 #[test]
@@ -101,18 +101,46 @@ fn show_nested_list_atoms() {
         Value::list(vec![Value::int(1), Value::int(2)]),
         Value::list(vec![Value::int(3)]),
     ]);
-    assert_eq!(show(&i, &v), "[[1 2] [3]]");
+    assert_eq!(show(&i, &v).unwrap(), "[[1 2] [3]]");
     let deep = Value::list(vec![Value::list(vec![Value::list(vec![Value::int(1)])])]);
-    assert_eq!(show(&i, &deep), "[[[1]]]");
+    assert_eq!(show(&i, &deep).unwrap(), "[[[1]]]");
     // a record element keeps its parens: `{ … }` after another element would
     // parse as a record update on it (§3.4)
     let r = Value::list(vec![Value::record(&[("a", Value::int(1))])]);
-    assert_eq!(show(&i, &r), "[({ a = 1 })]");
+    assert_eq!(show(&i, &r).unwrap(), "[({ a = 1 })]");
     let mixed = Value::list(vec![
         Value::text("x"),
         Value::record(&[("a", Value::int(1))]),
     ]);
-    assert_eq!(show(&i, &mixed), "[\"x\" ({ a = 1 })]");
+    assert_eq!(show(&i, &mixed).unwrap(), "[\"x\" ({ a = 1 })]");
+}
+
+#[test]
+fn show_roundtrips_values_nested_up_to_the_parsers_bound() {
+    // §5.2 exempts only values whose rendering nests past §3.4's bound of
+    // 40,000 levels, where a list is one level and a record's braces two. A
+    // bound of half that refused to read back a record nested 10,000 deep.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024) // the binary's worker stack (main.rs)
+        .spawn(|| {
+            let (mut i, cfg) = make_interp();
+            // `k` records around an Int: 2k + 1 levels; `k` lists: k levels
+            let records = |k: usize| (0..k).fold(Value::int(1), |v, _| Value::record(&[("a", v)]));
+            let lists = |k: usize| (1..k).fold(Value::list(vec![]), |v, _| Value::list(vec![v]));
+            roundtrip(&mut i, &cfg, &records(19_999));
+            roundtrip(&mut i, &cfg, &lists(40_000));
+            // one level deeper is a parse error, never a stack overflow
+            let outer = Rc::new(cfg.global_names.clone());
+            for v in [records(20_000), lists(40_001)] {
+                match parse_expr(&show(&i, &v).unwrap(), outer.clone()) {
+                    Ok(_) => panic!("a value nested past the bound read back"),
+                    Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
@@ -126,7 +154,7 @@ fn show_unresolved_blob() {
             Some(ConflictSide::regular(b"theirs")),
         ]),
     }));
-    let s = show(&i, &v);
+    let s = show(&i, &v).unwrap();
     assert!(s.starts_with("{- unresolved -} blob"), "{}", s);
 }
 
@@ -135,11 +163,11 @@ fn show_line_breaking() {
     let (i, _cfg) = make_interp();
     // over 80 columns breaks
     let long = Value::list((0..30).map(Value::int).collect());
-    let s = show(&i, &long);
+    let s = show(&i, &long).unwrap();
     assert!(s.contains('\n'), "{}", s);
     // short stays on one line
     let short = Value::list(vec![Value::int(1), Value::int(2)]);
-    assert!(!show(&i, &short).contains('\n'));
+    assert!(!show(&i, &short).unwrap().contains('\n'));
 }
 
 #[test]
@@ -154,12 +182,12 @@ fn show_wide_roundtrips() {
         .map(|(n, name)| (name.as_str(), Value::int(n as i64)))
         .collect();
     let wide_rec = Value::record(&fields);
-    let s = show(&i, &wide_rec);
+    let s = show(&i, &wide_rec).unwrap();
     assert!(s.contains('\n'), "expected wide rendering: {}", s);
     roundtrip(&mut i, &cfg, &wide_rec);
     // a wide list too
     let wide_list = Value::list((0..30).map(Value::int).collect());
-    assert!(show(&i, &wide_list).contains('\n'));
+    assert!(show(&i, &wide_list).unwrap().contains('\n'));
     roundtrip(&mut i, &cfg, &wide_list);
     // a wide record with nested wide values
     let nested = Value::record(&[
@@ -167,7 +195,7 @@ fn show_wide_roundtrips() {
         ("beta", Value::list((100..120).map(Value::int).collect())),
         ("gamma", Value::list((200..220).map(Value::int).collect())),
     ]);
-    let s = show(&i, &nested);
+    let s = show(&i, &nested).unwrap();
     assert!(s.contains('\n'), "{}", s);
     roundtrip(&mut i, &cfg, &nested);
 }
@@ -196,8 +224,8 @@ fn show_wide_sees_through_lazy_files() {
     };
     let lazy = commit(j::domain::lazy_files("xruqnqvokyloollnxruqnqvokyloolln", entries.clone()));
     let eager = commit(Value::list(entries.clone()));
-    let s = show(&i, &lazy);
-    assert_eq!(s, show(&i, &eager));
+    let s = show(&i, &lazy).unwrap();
+    assert_eq!(s, show(&i, &eager).unwrap());
     assert!(
         s.lines().all(|l| j::render::width(l) <= 80),
         "files list left on one line: {}",
@@ -214,12 +242,28 @@ fn show_fits_by_display_width() {
     // characters of which 45 are wide is 100 columns and must break
     let (mut i, cfg) = make_interp();
     let wide = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 3]);
-    let s = show(&i, &wide);
+    let s = show(&i, &wide).unwrap();
     assert!(s.contains('\n'), "{}", s);
     roundtrip(&mut i, &cfg, &wide);
     // two of them are 67 columns and stay on one line
     let narrow = Value::list(vec![Value::text("日本語日本語日本語日本語日本語"); 2]);
-    assert!(!show(&i, &narrow).contains('\n'));
+    assert!(!show(&i, &narrow).unwrap().contains('\n'));
+}
+
+#[test]
+fn show_fit_counts_what_follows_an_escape_in_the_data() {
+    // `show` writes no colour codes, so an ESC from the data (a file, a
+    // message) starts none and what follows it still counts toward the 80
+    // columns: an ESC, 60 `x` and no `m` anywhere after it, beside 30 `y`,
+    // is over 90 columns and must break
+    let (mut i, cfg) = make_interp();
+    let v = Value::list(vec![
+        Value::text(format!("\x1b{}", "x".repeat(60))),
+        Value::text("y".repeat(30)),
+    ]);
+    let s = show(&i, &v).unwrap();
+    assert!(s.contains('\n'), "{:?}", s);
+    roundtrip(&mut i, &cfg, &v);
 }
 
 #[test]
@@ -229,7 +273,7 @@ fn show_partial_application() {
     let e = parse_expr("describe \"wip\"", outer).unwrap();
     let env = i.global_env();
     let v = i.eval(&Rc::new(e), &env).unwrap();
-    let s = show(&i, &v);
+    let s = show(&i, &v).unwrap();
     assert_eq!(s, "describe \"wip\"", "{}", s);
 }
 
@@ -239,7 +283,7 @@ fn show_of(i: &mut Interp, cfg: &config::Config, src: &str) -> String {
     let e = parse_expr(src, outer).unwrap_or_else(|e| panic!("{:?}: {}", src, e.msg));
     let env = i.global_env();
     let v = i.eval(&Rc::new(e), &env).unwrap_or_else(|c| panic!("{:?}: {}", src, c.msg));
-    show(i, &v)
+    show(i, &v).unwrap()
 }
 
 #[test]
@@ -320,7 +364,7 @@ fn show_lambda_from_config_is_its_source() {
 fn show_id_full() {
     let (i, _cfg) = make_interp();
     let v = Value::Id(Rc::new("wqztkpqxmnrvyxskptlmzzzzabcd".to_string()));
-    assert_eq!(show(&i, &v), "@wqztkpqxmnrvyxskptlmzzzzabcd");
+    assert_eq!(show(&i, &v).unwrap(), "@wqztkpqxmnrvyxskptlmzzzzabcd");
 }
 
 // ------------------------------------------------------------------
@@ -392,6 +436,26 @@ fn unified_diff_marks_missing_newline() {
     );
     // terminated lines get no marker
     assert!(!unified_diff("a\nb\n", "a\nc\n").contains("No newline"));
+}
+
+#[test]
+fn unified_diff_lines_end_at_newline_only() {
+    // as for GNU diff and git, a lone `\r` ends no line: a last line ending
+    // in one has no trailing newline and is marked, so the two directions
+    // differ, and `a\rb` is one line (outputs as `diff -u` gives them)
+    const MARK: &str = "\\ No newline at end of file\n";
+    assert_eq!(
+        unified_diff("a\nb\r", "a\nb\r\n"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\r\n{}+b\r\n", MARK)
+    );
+    assert_eq!(
+        unified_diff("a\nb\r\n", "a\nb\r"),
+        format!("@@ -1,2 +1,2 @@\n a\n-b\r\n+b\r\n{}", MARK)
+    );
+    assert_eq!(unified_diff("a\rb\n", "a\r\nb\n"), "@@ -1 +1,2 @@\n-a\rb\n+a\r\n+b\n");
+    assert_eq!(unified_diff("a\r\nb\n", "a\rb\n"), "@@ -1,2 +1 @@\n-a\r\n-b\n+a\rb\n");
+    // a `\r\n` line is a line with its terminator, and gets no marker
+    assert_eq!(unified_diff("a\r\nb\r\n", "a\r\nc\r\n"), "@@ -1,2 +1,2 @@\n a\r\n-b\r\n+c\r\n");
 }
 
 #[test]

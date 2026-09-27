@@ -563,6 +563,36 @@ fn local_shadowing_is_a_configuration_error() {
 }
 
 #[test]
+fn config_binders_may_reuse_the_configs_own_top_level_names() {
+    // §4.2's one exception, which the reference config's `\files ->` and
+    // `\old new repo ->` rely on. Within the binder's scope the name means
+    // the binder, for load order (§4.1) as for lookup: were `loop` in `sh`
+    // the definition, `sh` and `loop` would be a cycle
+    let i = eval_cfg(&format!(
+        "{}\nfocus = 7\nparam = (\\focus -> focus) 1\nbound = let focus = 2 in focus\n\
+         sh = let loop = 3 in loop\nloop = sh\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    for (name, want) in [("focus", 7), ("param", 1), ("bound", 2), ("loop", 3)] {
+        let v = i.globals.lookup(name).expect(name);
+        assert!(j::value::value_eq(&v, &Value::int(want)).unwrap(), "{}", name);
+    }
+    // a builtin's name stays reserved there, declared or not (§6.2)
+    let e = cfg_err(&format!("{}\nsh = \\map -> map\n", MINIMAL));
+    assert!(e.contains("`map` is already bound"), "{}", e);
+    // and an expression may not bind a top-level name at all
+    let cfg = config::load_config(&format!("{}\nfocus = 7\n", MINIMAL)).unwrap();
+    let outer = Rc::new(cfg.global_names.clone());
+    for src in ["\\focus -> focus", "let focus = 1 in focus"] {
+        match j::parse::parse_expr(src, outer.clone()) {
+            Ok(_) => panic!("{:?} must not parse", src),
+            Err(e) => assert!(e.msg.contains("`focus` is already bound"), "{}: {}", src, e.msg),
+        }
+    }
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);
@@ -655,6 +685,46 @@ fn load_order_follows_lambda_bodies() {
     ))
     .expect("config loads");
     assert!(i.globals.lookup("b").is_some());
+    // among definitions that reach each other, one that refers to none of
+    // them outside a lambda and only stores its lambdas that do cannot apply
+    // their functions, so it goes first: `aout` applies `afmt`, whose body
+    // needs the record, and the record's stored lambda refers back to
+    // `aout`. The record used to be evaluated first only when its name
+    // sorted first, and otherwise the config failed with an unbound name
+    for (env, def) in [
+        ("zenv", "{ lanes = 3, again = \\_ -> aout }"),
+        ("aaenv", "{ lanes = 3, again = \\_ -> aout }"),
+        ("zenv", "let n = 3 in { lanes = n, again = [(\\_ -> aout)] }"),
+        ("zenv", "if true then base { lanes = 3, again = \\_ -> aout } else base"),
+    ] {
+        let src = format!(
+            "{}\nbase = {{ lanes = 0, again = \\_ -> 0 }}\nafmt = \\x -> {env}.lanes\n\
+             aout = afmt 1\n{env} = {def}\n",
+            MINIMAL
+        );
+        let i = eval_cfg(&src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        let aout = i.globals.lookup("aout").expect("aout");
+        assert!(j::value::value_eq(&aout, &Value::int(3)).unwrap(), "{}", src);
+    }
+    for names in ["names", "anames"] {
+        let src = format!(
+            "{}\n{names} = 3\nenv = {{ lanes = {names}, header = \\_ -> aout }}\n\
+             render = \\x -> env.lanes\naout = render 1\n",
+            MINIMAL
+        );
+        let i = eval_cfg(&src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        let aout = i.globals.lookup("aout").expect("aout");
+        assert!(j::value::value_eq(&aout, &Value::int(3)).unwrap(), "{}", src);
+    }
+    // a lambda that is applied, not stored, leaves its definition in the
+    // first order: `bm` reaches `ax` through the lambda it passes, so it must
+    // still follow `ax`, which the first order puts before it
+    let i = eval_cfg(&format!(
+        "{}\naa = \\_ -> bm\nax = {{ f = aa }}\nbm = (\\f -> f 0) (\\_ -> ax)\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    assert!(i.globals.lookup("bm").is_some());
 }
 
 #[test]

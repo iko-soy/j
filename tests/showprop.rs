@@ -47,7 +47,7 @@ proptest! {
     #[test]
     fn show_roundtrips_generated_values(v in arb_value(4)) {
         let (mut i, cfg) = make_interp();
-        let s = show(&i, &v);
+        let s = show(&i, &v).unwrap();
         let outer = Rc::new(cfg.global_names.clone());
         let e = parse_expr(&s, outer)
             .unwrap_or_else(|err| panic!("show output does not parse: {:?}\nerror: {}", s, err.msg));
@@ -69,6 +69,6 @@ fn show_record_field_order_stability() {
             ("a", Value::int(2)),
             ("m", Value::int(3)),
         ]);
-        assert_eq!(show(&i, &v), "{ a = 2, m = 3, z = 1 }");
+        assert_eq!(show(&i, &v).unwrap(), "{ a = 2, m = 3, z = 1 }");
     }
 }

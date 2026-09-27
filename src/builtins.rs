@@ -95,6 +95,7 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("replay", 2, b_replay),
         builtin("unresolved", 1, b_unresolved),
         builtin("touchedPaths", 1, b_touched_paths),
+        builtin("subtreeCommits", 1, b_subtree_commits),
         builtin("blob", 1, b_blob),
         builtin("text", 1, b_text),
         builtin("by", 2, b_by),
@@ -265,7 +266,7 @@ fn b_ge(_i: &mut Interp, args: &[Value]) -> BResult {
 }
 
 fn b_show(i: &mut Interp, args: &[Value]) -> BResult {
-    Ok(Value::text(crate::show::show(i, &args[0])))
+    Ok(Value::text(crate::show::show(i, &args[0])?))
 }
 
 fn b_cons(_i: &mut Interp, args: &[Value]) -> BResult {
@@ -489,6 +490,31 @@ fn b_touched_paths(_i: &mut Interp, args: &[Value]) -> BResult {
         if changed {
             out.push(Value::list(p.into_iter().map(Value::text).collect()));
         }
+    }
+    Ok(Value::list(out))
+}
+
+/// every commit of a tree in preorder (§4.9): the value of the recursive
+/// `\t -> t.root :: (concat (map subtreeCommits t.children) or [])`, which
+/// the reference config's `commits` was. `::` and `concat` build new lists,
+/// so that definition copied the list below every node and took time
+/// quadratic in the length of the history, which the binary walks this way
+/// on every run (`immutable`, §7.2). Its `or []` decides malformed trees:
+/// only a top without `root` crashes, and a node whose `children` is not a
+/// list of values with a `root` contributes its own root alone.
+fn b_subtree_commits(_i: &mut Interp, args: &[Value]) -> BResult {
+    let mut out = Vec::new();
+    // the nodes still to visit, each with its root, the next one last
+    let mut todo = vec![(args[0].field("root")?, args[0].clone())];
+    while let Some((root, node)) = todo.pop() {
+        out.push(root);
+        let Ok(Value::List(kids)) = node.field("children") else {
+            continue;
+        };
+        let Ok(roots) = kids.iter().map(|k| k.field("root")).collect::<Result<Vec<_>, _>>() else {
+            continue;
+        };
+        todo.extend(roots.into_iter().zip(kids.iter().cloned()).rev());
     }
     Ok(Value::list(out))
 }

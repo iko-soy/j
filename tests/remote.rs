@@ -962,3 +962,92 @@ fn clone_default_dir_name() {
     let dest = workdir.join(&name);
     assert!(dest.join(".jj").exists(), "no clone at {}", dest.display());
 }
+
+/// The reference config.j as a user copied it before `commits` became the
+/// builtin `subtreeCommits`, as it was then byte for byte: it declares no
+/// such builtin, and defines `commits` and `ancestors` recursively.
+fn config_before_subtree_commits() -> String {
+    let mut config = include_str!("../config.j").to_string();
+    for (now, before) in [
+        (
+            concat!(
+                "subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one\n",
+                "                                           -- pass: what `commits` (below) is\n",
+            ),
+            "",
+        ),
+        (
+            concat!(
+                "-- The builtin is  \\t -> t.root :: (concat (map commits t.children) or [])\n",
+                "-- in one pass; written that way it copies the list below every commit, and\n",
+                "-- so takes time quadratic in the length of the history.\n",
+                "commits : a -> [Commit]\n",
+                "commits = subtreeCommits\n",
+            ),
+            concat!(
+                "commits : a -> [Commit]\n",
+                "commits = \\t -> t.root :: (concat (map commits t.children) or [])\n",
+            ),
+        ),
+        (
+            "ancestors = \\repo -> repo.root.id :: map (\\f -> f.parent.id) repo.context\n",
+            "ancestors = \\repo -> repo.root.id :: ((let p = up repo in ancestors p) or [])\n",
+        ),
+    ] {
+        assert_eq!(config.matches(now).count(), 1, "config.j no longer has {:?}", now);
+        config = config.replacen(now, before, 1);
+    }
+    assert!(!config.contains("subtreeCommits"));
+    config.replace("Your Name", "Test User").replace("you@example.com", "test@example.com")
+}
+
+#[test]
+fn a_config_copied_before_subtree_commits_loads_and_agrees() {
+    // A user's config.j is never updated (§6.1). One copied before the
+    // reference config's `commits` became the builtin `subtreeCommits` does
+    // not declare it, and walks the history recursively. It must still load,
+    // and show and refuse exactly what the reference config does, with
+    // `trunk` and `immutable` non-empty.
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("b.txt"), "two\n").unwrap();
+    env.j(&dest, &["new . describe \"two\""]).ok();
+    std::fs::write(dest.join("c.txt"), "three\n").unwrap();
+    env.j(&dest, &["describe \"three\""]).ok();
+    let exprs = [
+        "1",
+        "tree",
+        "log",
+        "trunk",
+        "immutable",
+        "ancestors",
+        "all",
+        "length . commits . top",
+        "commits ({ root = 1, children = [({ root = 2, children = [({ root = 3 })] }) 7] })",
+        "commits 5",
+        "goto trunk",
+        "describe \"x\" . goto trunk",
+        "length . all . validate . new . goto trunk",
+    ];
+    let run = || -> Vec<(i32, String, String)> {
+        exprs
+            .iter()
+            .map(|e| {
+                let o = env.j(&dest, &[e]);
+                (o.code, o.stdout, o.stderr)
+            })
+            .collect()
+    };
+    let reference = run();
+    std::fs::write(env.cfg.join("j/config.j"), config_before_subtree_commits()).unwrap();
+    let before = run();
+    for ((e, r), b) in exprs.iter().zip(&reference).zip(&before) {
+        assert_eq!(r, b, "{}", e);
+    }
+    // what it does not declare is unbound (§6.2), and edits still persist
+    let out = env.j(&dest, &["subtreeCommits"]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    env.j(&dest, &["describe \"four\""]).ok();
+    assert!(env.j(&dest, &["log"]).ok().stdout.contains("four"));
+}

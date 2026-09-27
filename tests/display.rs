@@ -264,6 +264,31 @@ fn functions_display_as_written() {
 }
 
 #[test]
+fn lambda_over_several_lines_is_one_line_in_line_form() {
+    // a lambda's source (§5.2) may run over several lines and hold comments;
+    // its line form is the first line, `…` if there are more, as a Text's is
+    // (§5.1), so a record keeps one line per field and a column table one
+    // line per row, aligned. Its block form is all of the source.
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let f = "\\x -> x -- note\n      + 1";
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ f = {}, g = 2 }}", f), repo.clone());
+    assert_eq!(out, "f  \\x -> x -- note…\ng  2\n");
+    let out = eval_and_display(
+        &mut i,
+        &cfg,
+        &format!("[({{ f = {}, g = 2 }}) ({{ f = \\y -> y, g = (1 +) 2 }})]", f),
+        repo.clone(),
+    );
+    assert_eq!(out, "f                  g\n\\x -> x -- note…   2\n\\y -> y            3\n");
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ fs = [({}) (\\y -> y)] }}", f), repo.clone());
+    assert_eq!(out, "fs  \n    \\x -> x -- note\n          + 1\n\n    \\y -> y\n");
+    // a partial application whose argument runs over lines is cut the same way
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ m = map ({}) }}", f), repo);
+    assert_eq!(out, "m  map (\\x -> x -- note…\n");
+}
+
+#[test]
 fn conflicts_table() {
     // a repo where the focus has an unresolved file
     let (repo, be) = sample_repo();
@@ -887,6 +912,13 @@ fn an_unreadable_file_list_crashes_every_time() {
         "length (repo.root.files or []) + length repo.root.files",
         "[(show repo.root.files or \"\") (show repo.root.files)]",
         "[(null (files repo) or true) (null (files repo))]",
+        // `show` crashes as any other use does, and does not stand `<lazy>`
+        // (which does not parse) in for the list: a record, first rendered
+        // on one line and then again broken over lines, a list, a function
+        "show repo.root",
+        "[(show repo.root or \"\") (show repo.root)]",
+        "show [repo.root]",
+        "show (const repo.root)",
     ] {
         let (repo, be) = unreadable_repo(unreadable_files());
         let (mut i, cfg) = make_interp(be);
@@ -895,13 +927,6 @@ fn an_unreadable_file_list_crashes_every_time() {
             Err(msg) => assert!(msg.contains(UNREADABLE), "{}: crashed with {:?}", src, msg),
             Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
         }
-    }
-    // `show` renders a record on one line first and again broken over lines
-    // when that is too wide: the second rendering saw the stand-in `false`
-    let (repo, be) = unreadable_repo(unreadable_files());
-    let (mut i, cfg) = make_interp(be);
-    if let Ok(out) = try_eval_and_display(&mut i, &cfg, "(\\repo -> show repo.root)", repo) {
-        assert!(!out.contains("false"), "{}", out);
     }
 }
 
@@ -914,6 +939,14 @@ fn an_unreadable_blob_crashes_every_time() {
         // the tree's size bar counts the lines of every touched file and
         // swallowed the failure, so a later `text` read the file as empty
         "[(tree repo) (text (contentAt [\"f.txt\"] (files repo)))]",
+        // `show` crashes too: `blob "<unreadable>"` is the literal of
+        // another blob, one holding that text (§5.2)
+        "show (contentAt [\"f.txt\"] (files repo))",
+        "let b = contentAt [\"f.txt\"] (files repo) in [(text b or \"x\") (show b)]",
+        "show (const (contentAt [\"f.txt\"] (files repo)))",
+        "[(show (files repo)) (show (files repo))]",
+        // and so does displaying a function holding it, rendered by `show`
+        "const (contentAt [\"f.txt\"] (files repo))",
     ] {
         let (repo, be) = unreadable_repo(unreadable_blob_files());
         let (mut i, cfg) = make_interp(be);
@@ -923,16 +956,9 @@ fn an_unreadable_blob_crashes_every_time() {
             Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
         }
     }
-    // the same pure expression twice in one run agrees with itself
+    // the crash is an ordinary one, which `or` catches
     let (repo, be) = unreadable_repo(unreadable_blob_files());
     let (mut i, cfg) = make_interp(be);
-    let src = "(\\repo -> [(show (files repo)) (show (files repo))])";
-    match try_eval_and_display(&mut i, &cfg, src, repo) {
-        Ok(out) => {
-            let lines: Vec<&str> = out.lines().collect();
-            assert_eq!(lines.len(), 2, "{}", out);
-            assert_eq!(lines[0], lines[1], "{}", out);
-        }
-        Err(msg) => assert!(msg.contains(UNREADABLE), "crashed with {:?}", msg),
-    }
+    let src = "(\\repo -> show (contentAt [\"f.txt\"] (files repo)) or \"caught\")";
+    assert_eq!(try_eval_and_display(&mut i, &cfg, src, repo), Ok("caught\n".to_string()));
 }

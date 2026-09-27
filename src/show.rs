@@ -2,23 +2,27 @@
 
 use crate::eval::Interp;
 use crate::value::{BlobContent, Crash, FunVal, Value};
+use unicode_width::UnicodeWidthChar;
 
-pub fn show(interp: &Interp, v: &Value) -> String {
-    let s = render(interp, v);
+/// Crashes where `v` holds a lazy part the store cannot read (§7.2), as any
+/// other use of it does: a stand-in for the part would be the literal of
+/// some other value, or would not parse.
+pub fn show(interp: &Interp, v: &Value) -> Result<String, Crash> {
+    let s = render(interp, v)?;
     // line breaking: one line if it fits in 80 columns, counted in display
-    // cells as everywhere else (§5.1), not code points
-    if crate::render::width(&s) <= 80 {
-        return s;
+    // cells as everywhere else (§5.1), not code points. Not by
+    // `render::width`, which skips colour codes: `show` writes none, and an
+    // ESC from the data would hide everything up to the next `m`
+    let w: usize = s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    if w <= 80 {
+        return Ok(s);
     }
     render_wide(interp, v, 0)
 }
 
-fn render(interp: &Interp, v: &Value) -> String {
-    match v {
-        Value::Thunk(t) => match t.force() {
-            Ok(v) => render(interp, &v),
-            Err(_) => "<lazy>".to_string(),
-        },
+fn render(interp: &Interp, v: &Value) -> Result<String, Crash> {
+    Ok(match v {
+        Value::Thunk(t) => render(interp, &t.force()?)?,
         Value::Int(n) => {
             if n.sign() == num_bigint::Sign::Minus {
                 format!("(0 - {})", n.magnitude())
@@ -32,14 +36,17 @@ fn render(interp: &Interp, v: &Value) -> String {
         Value::List(xs) => {
             // list elements must be atoms: parenthesise applications and
             // operator expressions (§3.4)
-            let parts: Vec<String> = xs.iter().map(|x| render_atom(interp, x)).collect();
+            let parts = xs
+                .iter()
+                .map(|x| render_atom(interp, x))
+                .collect::<Result<Vec<_>, _>>()?;
             format!("[{}]", parts.join(" "))
         }
         Value::Record(m) => {
-            let parts: Vec<String> = m
+            let parts = m
                 .iter()
-                .map(|(k, x)| format!("{} = {}", k, render(interp, x)))
-                .collect();
+                .map(|(k, x)| Ok(format!("{} = {}", k, render(interp, x)?)))
+                .collect::<Result<Vec<_>, Crash>>()?;
             format!("{{ {} }}", parts.join(", "))
         }
         Value::Blob(b) => match &b.content {
@@ -48,27 +55,24 @@ fn render(interp: &Interp, v: &Value) -> String {
                 Err(_) => "blob \"<binary>\"".into(),
             },
             BlobContent::Lazy(_) | BlobContent::Conflict(_) => {
-                let s = b
-                    .bytes()
-                    .map(|v| String::from_utf8_lossy(&v).to_string())
-                    .unwrap_or_else(|_| "<unreadable>".into());
+                let s = String::from_utf8_lossy(&b.bytes()?).to_string();
                 let marker = if b.is_unresolved() { "{- unresolved -} " } else { "" };
                 format!("{}blob {}", marker, text_literal(&s))
             }
         },
         Value::Shape(s) => s.name.clone(),
-        Value::Fun(f) => render_fun(interp, f),
-    }
+        Value::Fun(f) => render_fun(interp, f)?,
+    })
 }
 
-fn render_fun(interp: &Interp, f: &FunVal) -> String {
-    match f {
+fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
+    Ok(match f {
         FunVal::Builtin { name, args, .. } => {
             // a selector `.name` carries its field as a baked-in first
             // argument (builtins::make_selector) and renders as the selector
             // atom itself (§3.4), not as an application to that field
             if name.starts_with('.') && name.len() > 1 {
-                return name.clone();
+                return Ok(name.clone());
             }
             // operator builtins render parenthesised when bare
             if args.is_empty() {
@@ -93,13 +97,15 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
                     "(.)" if args.len() == 2 => {
                         format!(
                             "(.) ({}) ({})",
-                            render_atom(interp, &args[0]),
-                            render_atom(interp, &args[1])
+                            render_atom(interp, &args[0])?,
+                            render_atom(interp, &args[1])?
                         )
                     }
                     _ => {
-                        let shown: Vec<String> =
-                            args.iter().map(|a| render_atom(interp, a)).collect();
+                        let shown = args
+                            .iter()
+                            .map(|a| render_atom(interp, a))
+                            .collect::<Result<Vec<_>, _>>()?;
                         format!("{} {}", base, shown.join(" "))
                     }
                 }
@@ -115,8 +121,10 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
             } else {
                 // partial application of a named definition: the name followed
                 // by the arguments supplied so far (§5.2)
-                let args: Vec<String> =
-                    applied_args.iter().map(|a| render_atom(interp, a)).collect();
+                let args = applied_args
+                    .iter()
+                    .map(|a| render_atom(interp, a))
+                    .collect::<Result<Vec<_>, _>>()?;
                 format!("{} {}", n, args.join(" "))
             }
         }
@@ -140,18 +148,20 @@ fn render_fun(interp: &Interp, f: &FunVal) -> String {
             } else {
                 // partial application: the lambda, parenthesised as it is not
                 // atomic, followed by the arguments supplied so far (§5.2)
-                let args: Vec<String> =
-                    applied_args.iter().map(|a| render_atom(interp, a)).collect();
+                let args = applied_args
+                    .iter()
+                    .map(|a| render_atom(interp, a))
+                    .collect::<Result<Vec<_>, _>>()?;
                 format!("({}) {}", base, args.join(" "))
             }
         }
-        FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a), render_atom(interp, b)),
+        FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a)?, render_atom(interp, b)?),
         FunVal::Labelled(n, _) => format!("%{}", n),
-        FunVal::ComposeLazy(f, g) => format!("({} . {})", render_atom(interp, f), render_atom(interp, g)),
-    }
+        FunVal::ComposeLazy(f, g) => format!("({} . {})", render_atom(interp, f)?, render_atom(interp, g)?),
+    })
 }
 
-fn render_atom(interp: &Interp, v: &Value) -> String {
+fn render_atom(interp: &Interp, v: &Value) -> Result<String, Crash> {
     // parenthesise if not atomic; a nested list is self-delimiting (a `[`
     // cannot begin a postfix), but a record is not: `{ … }` following another
     // element would parse as a record *update* on it (§3.4), so records keep
@@ -160,12 +170,8 @@ fn render_atom(interp: &Interp, v: &Value) -> String {
         v,
         Value::Int(_) | Value::Text(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) | Value::List(_)
     ) || is_section(v);
-    let s = render(interp, v);
-    if atomic {
-        s
-    } else {
-        format!("({})", s)
-    }
+    let s = render(interp, v)?;
+    Ok(if atomic { s } else { format!("({})", s) })
 }
 
 /// A section renders as its source, `(op e)` or `(e op)` (§5.2), which is
@@ -218,14 +224,11 @@ pub fn text_literal(s: &str) -> String {
     out
 }
 
-fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
-    match v {
+fn render_wide(interp: &Interp, v: &Value, indent: usize) -> Result<String, Crash> {
+    Ok(match v {
         // see through a lazy `files` list as `render` does, so that it breaks
         // like the equal forced list instead of staying on one line
-        Value::Thunk(t) => match t.force() {
-            Ok(v) => render_wide(interp, &v, indent),
-            Err(_) => "<lazy>".to_string(),
-        },
+        Value::Thunk(t) => render_wide(interp, &t.force()?, indent)?,
         Value::List(xs) if !xs.is_empty() => {
             let mut out = String::from("[");
             for (i, x) in xs.iter().enumerate() {
@@ -234,7 +237,7 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
                     out.push_str(&" ".repeat(indent + 2));
                 }
                 // list elements must be atoms (§3.4)
-                let s = render_wide(interp, x, indent + 2);
+                let s = render_wide(interp, x, indent + 2)?;
                 if matches!(
                     x,
                     Value::Int(_)
@@ -262,13 +265,13 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
                     out.push_str(&" ".repeat(indent));
                     out.push_str(", ");
                 }
-                out.push_str(&format!("{} = {}", k, render_wide(interp, x, indent + 2)));
+                out.push_str(&format!("{} = {}", k, render_wide(interp, x, indent + 2)?));
             }
             out.push_str(" }");
             out
         }
-        _ => render(interp, v),
-    }
+        _ => render(interp, v)?,
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -276,7 +279,12 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
 // ----------------------------------------------------------------------
 
 pub fn unified_diff(a: &str, b: &str) -> String {
-    let diff = similar::TextDiff::from_lines(a, b);
+    // lines end after each `\n` and nowhere else, as for GNU diff and git:
+    // `similar`'s own line splitting also ends one at a lone `\r`, so a last
+    // line `b\r` counted as terminated and got no marker below
+    let old: Vec<&str> = a.split_inclusive('\n').collect();
+    let new: Vec<&str> = b.split_inclusive('\n').collect();
+    let diff = similar::TextDiff::configure().diff_slices(&old, &new);
     let mut out = String::new();
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         out.push_str(&format!("{}\n", hunk.header()));
@@ -287,19 +295,14 @@ pub fn unified_diff(a: &str, b: &str) -> String {
                 similar::ChangeTag::Equal => " ",
             };
             out.push_str(sign);
-            let text = change.to_string();
-            // similar yields the line with its terminator when present (and
-            // supplies a `\n` for the last line of a text without a trailing
-            // newline); a lone `\r` also ends a line for it, so add a `\n` to
-            // keep the diff line-oriented
-            out.push_str(&text);
+            let text: &str = change.value();
+            out.push_str(text);
+            // a line with no terminator, only ever the last, is ended here
+            // and marked, as GNU diff and git do: otherwise dropping the
+            // final newline shows as the same line removed and re-added,
+            // alike in both directions
             if !text.ends_with('\n') {
                 out.push('\n');
-            }
-            // mark a line that had no terminator, as GNU diff and git do:
-            // otherwise dropping the final newline shows as the same line
-            // removed and re-added, alike in both directions
-            if change.missing_newline() {
                 out.push_str("\\ No newline at end of file\n");
             }
         }

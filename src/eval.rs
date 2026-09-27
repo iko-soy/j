@@ -20,6 +20,12 @@ pub struct Interp {
     fresh: RefCell<u64>,
     /// the currently executing top-level definition (for crash reports)
     pub current_def: RefCell<Option<String>>,
+    /// The definitions written as lambdas, by the address of the lambda's
+    /// body, which every closure made from it shares: while that body runs,
+    /// the definition is executing (§1.4), whatever name its closure has
+    /// been bound to since (`prev = goto parents` runs goto's body). The body
+    /// is held so its address cannot be reused.
+    def_bodies: HashMap<*const Expr, (Rc<str>, Rc<Expr>)>,
     /// the repository as loaded, before snapshotting (for `validate`)
     pub old_repo: RefCell<Option<Value>>,
     /// the repository the expression was given (§1.2 step 4, after the
@@ -114,8 +120,7 @@ pub(crate) enum Cont {
         on_crash: Box<State>,
     },
     /// apply the returned function to this argument: the `labelled "name"`
-    /// of a Labelled to the real arg, or a deferred body to the arguments
-    /// that arrived after it was deferred
+    /// of a Labelled to the real arg
     ApplyTo(Value, Rc<Cont>),
     UpdateBase(Vec<(String, Rc<Expr>)>, Env, Rc<Cont>),
     UpdateFields {
@@ -145,12 +150,28 @@ pub(crate) enum Cont {
         cexpr: Rc<crate::shape::ContractExpr>,
         cont: Rc<Cont>,
     },
+    /// the function a signed definition's value returned when it ran out of
+    /// parameters before its signature (a lambda's body, or a builtin or a
+    /// composition given its last argument): make it the named partial
+    /// application of `args` (§5.2), checked against the rest of `cexpr`
+    NamePartial {
+        name: String,
+        cexpr: Rc<crate::shape::ContractExpr>,
+        args: Vec<Value>,
+        cont: Rc<Cont>,
+    },
     /// after applying, check the (partial) result against the contract
     #[allow(dead_code)]
     CheckResult {
         name: String,
         contract: Rc<Contract>,
         supplied: usize,
+        cont: Rc<Cont>,
+    },
+    /// the body of a definition's lambda is running (§1.4); passes its value
+    /// on unchanged
+    InDef {
+        name: Rc<str>,
         cont: Rc<Cont>,
     },
     // The builtins that apply functions they are given run as steps of this
@@ -246,7 +267,9 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::RecordFields { cont, .. } => Some(cont),
         Cont::ListElems { cont, .. } => Some(cont),
         Cont::CheckExpr { cont, .. } => Some(cont),
+        Cont::NamePartial { cont, .. } => Some(cont),
         Cont::CheckResult { cont, .. } => Some(cont),
+        Cont::InDef { cont, .. } => Some(cont),
         Cont::MapNext { cont, .. } => Some(cont),
         Cont::FilterNext { cont, .. } => Some(cont),
         Cont::FoldlArg { cont, .. } => Some(cont),
@@ -260,12 +283,13 @@ pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
     parent_rc(k).map(|r| (**r).clone())
 }
 
-/// The innermost definition whose application `k` continues (§1.4): a signed
-/// definition's body runs under a `CheckExpr` of its result, which stays on
-/// the chain until the body has returned, and one whose value is a builtin
-/// that applies functions runs them under a `BuiltinResult` naming it. Only
-/// used on a crash no `Try` caught, so there is no `Try` on the chain to stop
-/// the walk early.
+/// The innermost definition whose application `k` continues (§1.4): a
+/// signed definition's application runs under the `CheckExpr` of its result,
+/// the body of a definition's lambda under an `InDef` naming it unless that
+/// `CheckExpr` names it already, and the functions a builtin applies as a
+/// signed definition's value under a `BuiltinResult` naming it; each stays on
+/// the chain until the body has returned. Only used on a crash no `Try`
+/// caught, so there is no `Try` on the chain to stop the walk early.
 fn innermost_def(k: &Cont) -> Option<String> {
     let mut k = k;
     loop {
@@ -274,6 +298,7 @@ fn innermost_def(k: &Cont) -> Option<String> {
             | Cont::BuiltinResult {
                 def: Some(name), ..
             } => return Some(name.clone()),
+            Cont::InDef { name, .. } => return Some(name.to_string()),
             _ => {}
         }
         k = parent_rc(k)?;
@@ -323,6 +348,7 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
             given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
@@ -382,6 +408,7 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
             given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
@@ -414,6 +441,26 @@ impl Interp {
 
     pub fn global_env(&self) -> Env {
         self.globals.clone()
+    }
+
+    /// Record `expr`, the expression of the definition `name`: the body of
+    /// the lambda it is written as runs as `name`'s (§1.4), and so does the
+    /// body of each lambda that body is in turn (`\a -> \b -> e`). A lambda
+    /// in parentheses or ending a `let` is the definition's lambda too.
+    pub fn name_bodies(&mut self, name: &str, expr: &Rc<Expr>) {
+        let name: Rc<str> = Rc::from(name);
+        let mut e = expr;
+        loop {
+            match &**e {
+                Expr::Paren(inner) | Expr::Let(_, inner) => e = inner,
+                Expr::Lambda(_, body, _) => {
+                    self.def_bodies
+                        .insert(Rc::as_ptr(body), (name.clone(), body.clone()));
+                    e = body;
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Main entry: evaluate an expression in an environment.
@@ -630,7 +677,6 @@ impl Interp {
                     params: params.clone(),
                     applied: 0,
                     applied_args: Vec::new(),
-                    deferred: false,
                     body: body.clone(),
                     env,
                     src: src.clone(),
@@ -1004,6 +1050,15 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::NamePartial {
+                name,
+                cexpr,
+                args,
+                cont,
+            } => {
+                let named = crate::value::named_apply(v, args, &name, cexpr);
+                Run::Step(State::Ret(named, (*cont).clone()))
+            }
             Cont::CheckResult {
                 name,
                 contract,
@@ -1028,6 +1083,7 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::InDef { cont, .. } => Run::Step(State::Ret(v, (*cont).clone())),
             Cont::MapNext {
                 f,
                 xs,
@@ -1156,6 +1212,30 @@ impl Interp {
                             name != "(.)"
                                 || matches!(**c, crate::shape::ContractExpr::Known { .. })
                         });
+                        // a signed definition's builtin or composition that
+                        // consumes fewer arguments than its signature lists
+                        // (`addT = (+) . inc` under `Int -> Int -> Text`)
+                        // returns a function, which becomes the named partial
+                        // application `addT 1` under the rest of the
+                        // signature, as a lambda that runs out of parameters
+                        // first does (§4.13, §5.2)
+                        let k = match &check {
+                            Some(c)
+                                if !c.is_exhausted()
+                                    && self.builtin_def(name, &cname).is_some() =>
+                            {
+                                // the arguments the definition was given, not
+                                // those baked into its value
+                                let own = c.position().unwrap_or(0).min(all.len());
+                                Cont::NamePartial {
+                                    name: cname.clone(),
+                                    cexpr: c.clone(),
+                                    args: all[all.len() - own..].to_vec(),
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
                         if applies_functions(name) {
                             // the result is checked once the functions have
                             // run, and a crash while they run is blamed as
@@ -1205,66 +1285,11 @@ impl Interp {
                     params,
                     applied,
                     applied_args,
-                    deferred,
                     body,
                     env,
                     src,
                     pending,
                 } => {
-                    if *deferred {
-                        // Every parameter of the lambda is bound and its body
-                        // waits for the rest of the signature (§5.2). This
-                        // argument is checked like any other (§4.13). While
-                        // the contract has parameters left it is only
-                        // collected; once it is exhausted the body runs, its
-                        // value is applied to the collected arguments in
-                        // order, and the result is checked. Nothing here
-                        // catches: a crash keeps its own message and unwinds
-                        // to any enclosing `or` (§4.6, §4.7).
-                        let (cname, cexpr) = match pending {
-                            Some((n, c)) => (n.clone(), Some(c.clone())),
-                            None => (name.clone().unwrap_or_default(), None),
-                        };
-                        if let Some(c) = &cexpr {
-                            let at = c.position().unwrap_or(applied_args.len());
-                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
-                                return Run::Crash(in_def(cr, &cname));
-                            }
-                        }
-                        let advanced = cexpr
-                            .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
-                        if let Some(c) = advanced.as_ref().filter(|c| !c.is_exhausted()) {
-                            let mut new_args = applied_args.clone();
-                            new_args.push(arg);
-                            let v = Value::Fun(Rc::new(FunVal::Closure {
-                                name: name.clone(),
-                                params: params.clone(),
-                                applied: *applied,
-                                applied_args: new_args,
-                                deferred: true,
-                                body: body.clone(),
-                                env: env.clone(),
-                                src: src.clone(),
-                                pending: Some((cname, c.clone())),
-                            }));
-                            return Run::Step(State::Ret(v, k));
-                        }
-                        let mut k = match advanced {
-                            Some(c) => Cont::CheckExpr {
-                                name: cname,
-                                cexpr: c,
-                                cont: Rc::new(k),
-                            },
-                            None => k,
-                        };
-                        k = Cont::ApplyTo(arg, Rc::new(k));
-                        // the arguments past the lambda's own parameters
-                        let collected = applied_args.get(*applied..).unwrap_or(&[]);
-                        for a in collected.iter().rev() {
-                            k = Cont::ApplyTo(a.clone(), Rc::new(k));
-                        }
-                        return Run::Step(State::Eval(body.clone(), env.clone(), k));
-                    }
                     let (cname, cexpr) = match pending {
                         Some((n, c)) => (Some(n.clone()), Some(c.clone())),
                         None => (name.clone(), None),
@@ -1289,47 +1314,75 @@ impl Interp {
                     let new_applied = applied + 1;
                     let advanced = cexpr
                         .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
-                    // a signed definition's body is not evaluated until its
-                    // contract is exhausted, so partial applications of named
-                    // definitions stay named values (§5.2's `describe "wip"`)
                     let contract_exhausted = match &advanced {
                         Some(c) => c.is_exhausted(),
                         None => true,
                     };
-                    if new_applied == params.len() && contract_exhausted {
-                        Run::Step(State::Eval(
-                            body.clone(),
-                            env2,
-                            match (&cname, &advanced) {
-                                (Some(n), Some(c)) => Cont::CheckExpr {
-                                    name: n.clone(),
-                                    cexpr: c.clone(),
+                    if new_applied == params.len() {
+                        // the definition whose lambda this body is, if any,
+                        // executes while it runs (§1.4)
+                        let def = self
+                            .def_bodies
+                            .get(&Rc::as_ptr(body))
+                            .map(|(d, _)| d.clone());
+                        // a call in tail position of a definition's body
+                        // leaves that definition nothing to do but pass this
+                        // body's value on, so its frame gives way to the one
+                        // this body runs under, and unsigned tail recursion
+                        // keeps its continuation constant in size
+                        let signed = cname.is_some() && advanced.is_some();
+                        let k = match k {
+                            Cont::InDef { cont, .. } if signed || def.is_some() => {
+                                (*cont).clone()
+                            }
+                            k => k,
+                        };
+                        // the body is evaluated now, as at any application
+                        // (§4.1): a signature adds checks and never changes
+                        // when a body runs, or whether an `or` around the
+                        // application catches its crash (§4.6, §4.13)
+                        let k = match (cname, advanced) {
+                            (Some(n), Some(c)) => {
+                                // a lambda that runs out of parameters before
+                                // its signature (`describe = \m -> mapRoot …`)
+                                // returns a function, which becomes the named
+                                // partial application `describe "wip"` (§5.2)
+                                // under the rest of the signature
+                                let k = if c.is_exhausted() {
+                                    k
+                                } else {
+                                    let mut args = applied_args.clone();
+                                    args.push(arg);
+                                    Cont::NamePartial {
+                                        name: n.clone(),
+                                        cexpr: c.clone(),
+                                        args,
+                                        cont: Rc::new(k),
+                                    }
+                                };
+                                Cont::CheckExpr {
+                                    name: n,
+                                    cexpr: c,
                                     cont: Rc::new(k),
-                                },
-                                _ => k,
-                            },
-                        ))
-                    } else if new_applied == params.len() {
-                        // the lambda is exhausted but the contract is not:
-                        // defer the body so the definition stays a named
-                        // partial application (§5.2)
-                        let mut new_args = applied_args.clone();
-                        new_args.push(arg.clone());
-                        let v = Value::Fun(Rc::new(FunVal::Closure {
-                            name: name.clone(),
-                            params: params.clone(),
-                            applied: new_applied,
-                            applied_args: new_args,
-                            deferred: true,
-                            body: body.clone(),
-                            env: env2,
-                            src: src.clone(),
-                            pending: match (&cname, &advanced) {
-                                (Some(n), Some(c)) => Some((n.clone(), c.clone())),
-                                _ => None,
-                            },
-                        }));
-                        Run::Step(State::Ret(v, k))
+                                }
+                            }
+                            _ => k,
+                        };
+                        // inside the check of the definition it was bound to,
+                        // which names this one already when it is the same
+                        let k = match def {
+                            Some(d)
+                                if !matches!(&k, Cont::CheckExpr { name, .. }
+                                    if **name == *d) =>
+                            {
+                                Cont::InDef {
+                                    name: d,
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
+                        Run::Step(State::Eval(body.clone(), env2, k))
                     } else if contract_exhausted {
                         // lambda params remain but the contract is satisfied;
                         // keep currying (unsigned tail)
@@ -1340,7 +1393,6 @@ impl Interp {
                             params: params.clone(),
                             applied: new_applied,
                             applied_args: new_args,
-                            deferred: false,
                             body: body.clone(),
                             env: env2,
                             src: src.clone(),
@@ -1358,7 +1410,6 @@ impl Interp {
                             params: params.clone(),
                             applied: new_applied,
                             applied_args: new_args,
-                            deferred: false,
                             body: body.clone(),
                             env: env2,
                             src: src.clone(),

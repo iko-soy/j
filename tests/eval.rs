@@ -33,7 +33,7 @@ fn ok(interp: &mut Interp, cfg: &config::Config, src: &str) -> Value {
 
 fn crash(interp: &mut Interp, cfg: &config::Config, src: &str) -> String {
     match ev(interp, cfg, src) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v).unwrap()),
         Err(m) => m,
     }
 }
@@ -45,8 +45,8 @@ macro_rules! check {
             value_eq(&got, &$want).unwrap_or(false),
             "{} => {}, want {}",
             $src,
-            j::show::show(&$i, &got),
-            j::show::show(&$i, &$want)
+            j::show::show(&$i, &got).unwrap(),
+            j::show::show(&$i, &$want).unwrap()
         );
     }};
 }
@@ -175,6 +175,29 @@ fn let_bindings_evaluate_in_dependency_order() {
     // lambdas give them: `b` applies `a`, whose body needs `y`, and `y`
     // refers back to `b`; `b` waits for `z`, so `y` is bound by then
     check!(i, cfg, "let a = \\_ -> y; b = a z; y = \\_ -> b; z = 1 in z", Value::int(1));
+    // among them, one that refers to none of the others outside a lambda and
+    // only stores its lambdas that do goes first: `env` is bound before
+    // `out` applies `fmt`, whose body needs it, wherever the block lists it
+    check!(
+        i,
+        cfg,
+        "let fmt = \\x -> env.lanes; out = fmt 1; env = { lanes = 3, again = \\_ -> out } in out",
+        Value::int(3)
+    );
+    check!(
+        i,
+        cfg,
+        "let fmt = \\x -> env.lanes; out = fmt 1; env = let n = 3 in { lanes = n, again = [(\\_ -> out)] } in out",
+        Value::int(3)
+    );
+    // a binding that applies such a lambda keeps its place in the first
+    // order: `bm` must still follow `ax`
+    check!(
+        i,
+        cfg,
+        "let aa = \\_ -> bm; ax = { f = aa, n = 1 }; bm = (\\f -> f 0) (\\_ -> ax) in bm.n",
+        Value::int(1)
+    );
 }
 
 #[test]
@@ -336,7 +359,7 @@ fn alias_of_an_undeclared_type_is_not_a_usable_shape() {
 }
 
 /// Signed definitions whose lambda takes fewer parameters than the signature,
-/// so the body is deferred until the contract is exhausted (§5.2).
+/// so the body's value is a function the rest of the signature checks (§4.13).
 const DEFERRED: &str = r#"
 failIf : Int -> Edit
 failIf = \n -> if n > 0 then id else crash "negative"
@@ -410,6 +433,77 @@ fn deferred_body_is_contract_checked() {
     assert!(m.contains("argument 2"), "{}", m);
 }
 
+#[test]
+fn signature_does_not_change_when_a_body_runs() {
+    // §4.1: evaluation is strict and a lambda body is evaluated on each
+    // application; a signature only adds checks (§4.13). A signed definition
+    // whose lambda took fewer parameters than its signature deferred its
+    // body until the signature was used up, so `failIf 0` did not crash,
+    // `failIf 0 or 7` crashed past the `or` (§4.6), and the body ran again
+    // at every later application.
+    let (mut i, cfg) = make_interp_with(&format!(
+        "{}{}",
+        DEFERRED,
+        r#"
+failIfU = \n -> if n > 0 then id else crash "negative"
+
+pick2 : Int -> Int -> Int -> Int
+pick2 = \n -> if n > 0 then (\a b -> a + b) else crash "negative"
+
+notFn : Int -> Edit
+notFn = \n -> n
+
+once : Int -> Int -> Id
+once = \n -> let i = @ in \m -> i
+
+onceU = \n -> let i = @ in \m -> i
+"#
+    ));
+    // the body crashes at the application that binds the lambda's last
+    // parameter, signed or not, and `or` catches it there
+    for f in ["failIf", "failIfU"] {
+        check!(i, cfg, &format!("{} 0 or 7", f), Value::int(7));
+        check!(i, cfg, &format!("show ({} 0 or \"fallback\")", f), Value::text("\"fallback\""));
+        let m = crash(&mut i, &cfg, &format!("let e = {} 0 in 5", f));
+        assert_eq!(m, "crash: negative");
+    }
+    check!(i, cfg, "choose 0 or 7", Value::int(7));
+    check!(i, cfg, "pick2 0 or 5", Value::int(5));
+    check!(i, cfg, "pick2 0 1 or 5", Value::int(5));
+    let m = crash(&mut i, &cfg, "let e = pick2 0 1 in 5");
+    assert_eq!(m, "crash: negative");
+    let (m, def) = crash_in(&mut i, &cfg, "failIf 0");
+    assert_eq!((m.as_str(), def.as_deref()), ("negative", Some("failIf")));
+    // it runs once, not again at every later argument
+    for f in ["once", "onceU"] {
+        check!(i, cfg, &format!("let g = {} 1 in g 1 == g 2", f), Value::Bool(true));
+    }
+    // the body's value must be a function while the signature lists more
+    let (m, def) = crash_in(&mut i, &cfg, "notFn 1");
+    assert_eq!(m, "contract: notFn expected a function, got Int");
+    assert_eq!(def.as_deref(), Some("notFn"));
+    check!(i, cfg, "notFn 1 or 7", Value::int(7));
+    // the application still renders by name (§5.2), and the arguments the
+    // signature lists past the lambda's, and the result, are still checked
+    check!(i, cfg, "show (pick2 1 2)", Value::text("pick2 1 2"));
+    check!(i, cfg, "show (failIf 1)", Value::text("failIf 1"));
+    check!(i, cfg, "show (describe \"wip\")", Value::text("describe \"wip\""));
+    check!(
+        i,
+        cfg,
+        "show (at (parents) (describe \"x\"))",
+        Value::text("at (parents) (describe \"x\")")
+    );
+    check!(i, cfg, "pick2 1 2 3", Value::int(5));
+    check!(i, cfg, "let f = pick2 1 in f 2 3 + f 4 5", Value::int(14));
+    let m = crash(&mut i, &cfg, "pick2 1 \"x\"");
+    assert!(m.contains("contract: pick2 expected Int as argument 2, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "pick2 1 2 \"y\"");
+    assert!(m.contains("contract: pick2 expected Int as argument 3, got Text"), "{}", m);
+    let m = crash(&mut i, &cfg, "once 1 \"x\"");
+    assert!(m.contains("contract: once expected Int as argument 2, got Text"), "{}", m);
+}
+
 /// Definitions that crash at different depths, for the crash trace (§1.4).
 const NESTED: &str = r#"
 inner : Int -> Int
@@ -438,6 +532,30 @@ mapped = map (\x -> x + head [])
 
 counted : [Int] -> Int
 counted = map id
+
+plain = \n -> if n > 0 then n else crash "not positive"
+
+plainOuter = \n -> plain n + 1
+
+plainAfter = \n -> plain n + head []
+
+plainTail = \n -> if n > 0 then plainTail (n - 1) else plain n
+
+plainBack = \n -> if n > 0 then plainBack (n - 1) else head []
+
+signedCallsPlain : Int -> Int
+signedCallsPlain = \n -> plain n
+
+plainCallsSigned = \n -> inner n
+
+sumPos : Int -> Int -> Int
+sumPos = \a b -> if b > 0 then a + b else crash "not positive"
+
+addOne : Int -> Int
+addOne = sumPos 1
+
+sameAsInner : Int -> Int
+sameAsInner = inner
 "#;
 
 /// The message of the crash `src` raises and the definition it is in.
@@ -447,7 +565,7 @@ fn crash_in(interp: &mut Interp, cfg: &config::Config, src: &str) -> (String, Op
     let e = config::resolve_ids(&e, interp).unwrap_or_else(|_| panic!("{}: ids", src));
     let env = interp.global_env();
     match interp.eval(&Rc::new(e), &env) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v).unwrap()),
         Err(c) => (c.msg, c.def),
     }
 }
@@ -459,6 +577,8 @@ fn crash_names_the_innermost_definition_executing() {
     // at run time reported none and the CLI printed only `from EXPR`.
     let (mut i, cfg) = make_interp_with(&format!("{}{}", DEFERRED, NESTED));
     let goto = format!("goto (\\_ -> []) ({})", REPO);
+    let prev = format!("prev ({})", REPO);
+    let next = format!("next ({})", REPO);
     for (src, want) in [
         ("inner 0", Some("inner")),
         // §5.1's example, on a repository literal
@@ -473,10 +593,11 @@ fn crash_names_the_innermost_definition_executing() {
         // definition a builtin runs is itself the innermost
         ("viaMap [1]", Some("viaMap")),
         ("mapInner [0]", Some("inner")),
-        // a deferred body runs in its definition too (§5.2)
+        // a body whose lambda is shorter than its signature runs in its
+        // definition too (§4.13)
         ("choose 0 5", Some("choose")),
         // a contract violation is in the definition checked (§4.13),
-        // whether an argument, a deferred argument, or the result
+        // whether an argument, one past the lambda's, or the result
         ("inner \"x\"", Some("inner")),
         ("outer \"x\"", Some("outer")),
         ("bad 1 \"x\"", Some("bad")),
@@ -489,6 +610,27 @@ fn crash_names_the_innermost_definition_executing() {
         // and so do the functions it applies, and its result's check
         ("mapped [1]", Some("mapped")),
         ("counted [1]", Some("counted")),
+        // a definition without a signature is executing while its body runs,
+        // as one with a signature is: nothing named one, so `plain 0` and
+        // `plainOuter 0` named none, and `signedCallsPlain 0` named the
+        // signed definition that called `plain`
+        ("plain 0", Some("plain")),
+        ("plainOuter 0", Some("plain")),
+        ("plainAfter 1", Some("plainAfter")),
+        ("plainTail 3", Some("plain")),
+        ("plainBack 3", Some("plainBack")),
+        ("signedCallsPlain 0", Some("plain")),
+        ("signedCallsPlain \"x\"", Some("signedCallsPlain")),
+        ("plainCallsSigned 0", Some("inner")),
+        // a definition whose value is another's function runs that one's
+        // body, the innermost (`prev = goto parents`), where the outer
+        // name was reported; its own signature still checks its arguments
+        ("addOne 0", Some("sumPos")),
+        ("addOne \"x\"", Some("addOne")),
+        ("sameAsInner 0", Some("inner")),
+        ("sameAsInner \"x\"", Some("sameAsInner")),
+        (prev.as_str(), Some("goto")),
+        (next.as_str(), Some("goto")),
         // a builtin is no definition: outside every definition, none
         ("head []", None),
         ("crash \"top\"", None),
@@ -497,6 +639,22 @@ fn crash_names_the_innermost_definition_executing() {
         let (msg, def) = crash_in(&mut i, &cfg, src);
         assert_eq!(def.as_deref(), want, "{} crashed with {}", src, msg);
     }
+}
+
+#[test]
+fn unsigned_tail_recursion_keeps_its_continuation_constant() {
+    // §1.4, §4.1: a definition's body runs under a frame naming it, and a
+    // call in tail position of that body replaces its frame. A frame kept
+    // per call grew the continuation with every step of an unsigned tail
+    // recursion, which only signed definitions' checks did before, and a
+    // crash at the end dropped the whole chain at once on the native stack.
+    on_stack(4, || {
+        let (mut i, cfg) = make_interp_with(NESTED);
+        let (msg, def) = crash_in(&mut i, &cfg, "plainTail 50000");
+        assert_eq!(def.as_deref(), Some("plain"), "{}", msg);
+        let (msg, def) = crash_in(&mut i, &cfg, "plainBack 50000");
+        assert_eq!(def.as_deref(), Some("plainBack"), "{}", msg);
+    });
 }
 
 #[test]
@@ -647,7 +805,7 @@ fn on_stack(mb: usize, f: impl FnOnce() + Send + 'static) {
 
 #[test]
 fn deep_linear_history_takes_no_native_stack_per_commit() {
-    // `commits` recurses through `map` once per level of history, and
+    // `commits` recursed through `map` once per level of history, and
     // `labelled`, `trunk` and `immutable` walk the history with it. The
     // binary evaluates `immutable` on every run (§7.2), so a long linear
     // history made every command overflow the stack and abort (§4.1). The
@@ -670,6 +828,88 @@ fn deep_linear_history_takes_no_native_stack_per_commit() {
             Value::list(vec![Value::int(n), Value::int(1), Value::int(n)])
         );
     });
+}
+
+#[test]
+fn history_walks_take_time_linear_in_the_length_of_history() {
+    // `commits` was `\t -> t.root :: (concat (map commits t.children) or [])`
+    // and `ancestors` consed the focus onto the ancestors of `up repo`. `::`
+    // and `concat` build a new list, so every level copied the whole list
+    // below it and both were quadratic in the depth of the history. The
+    // binary evaluates `immutable` on every run (§7.2), which walks the
+    // history with both through `labelled`, `trunk` and `ancestorsOf`: `j 1`
+    // took a minute on a linear history of 32000 commits. Here the history
+    // is seen from the top, its deepest commit labelled `main`, so
+    // `immutable` walks it with both. In linear time that takes seconds in a
+    // debug build; in quadratic time, many minutes. The stack is the
+    // binary's, since `by` and dropping the chain take native stack per
+    // level.
+    let n = 100_000;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || {
+            let (mut i, cfg) = make_interp();
+            let src = format!(
+                "let commit = \\l -> {{ files = [], message = \"\", labels = l, id = @ }}; \
+                 chain = foldl (\\t k -> {{ root = commit [], children = [t] }}) \
+                               ({{ root = commit [\"main\"], children = [] }}) (range 0 {n}); \
+                 repo = {{ root = chain.root, children = chain.children, context = [] }} \
+                 in [(length (commits repo)) (length (immutable repo))]"
+            );
+            let got = ev(&mut i, &cfg, &src).map(|v| j::show::show(&i, &v).unwrap());
+            let _ = tx.send(got);
+        })
+        .unwrap();
+    let limit = std::time::Duration::from_secs(60);
+    match rx.recv_timeout(limit) {
+        Ok(got) => assert_eq!(got, Ok(format!("[{m} {m}]", m = n + 1))),
+        Err(_) => panic!("walking {} commits took more than {:?}", n, limit),
+    }
+}
+
+#[test]
+fn commits_gives_what_its_recursive_definition_gave_on_any_tree() {
+    // `commits` is the builtin `subtreeCommits`, which must give what the
+    // recursive definition it replaced gives (§4.9), on malformed trees too.
+    // That definition's `or []` catches a crash anywhere under a node: only
+    // a top without `root` crashes, and a node whose `children` is not a
+    // list of values with a `root` contributes its own root alone.
+    let (mut i, cfg) = make_interp();
+    let old = "let old = \\t -> t.root :: (concat (map old t.children) or []) in";
+    let ints = |xs: &[i64]| Value::list(xs.iter().map(|&x| Value::int(x)).collect());
+    for (t, want) in [
+        ("({ root = 1, children = [] })", ints(&[1])),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ root = 3, children = [] })] }) \
+                                     ({ root = 4, children = [] })] })",
+            ints(&[1, 2, 3, 4]),
+        ),
+        ("({ root = 1, children = [], context = [] })", ints(&[1])),
+        ("({ root = 1, children = 5 })", ints(&[1])),
+        ("({ root = 1 })", ints(&[1])),
+        ("({ root = 1, children = [({ root = 2, children = [] }) 7] })", ints(&[1])),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ root = 3 })] }) \
+                                     ({ root = 4, children = [5] })] })",
+            ints(&[1, 2, 3, 4]),
+        ),
+        (
+            "({ root = 1, children = [({ root = 2, children = [({ children = [] })] }) \
+                                     ({ root = 4, children = [({ root = 5, children = \"x\" })] })] })",
+            ints(&[1, 2, 4, 5]),
+        ),
+    ] {
+        check!(i, cfg, &format!("commits {}", t), want);
+        check!(i, cfg, &format!("{} old {}", old, t), want);
+    }
+    for (t, msg) in [
+        ("5", "crash: cannot select field `root` from a Int"),
+        ("({ children = [] })", "crash: record has no field `root`"),
+    ] {
+        assert_eq!(crash(&mut i, &cfg, &format!("commits {}", t)), msg);
+        assert_eq!(crash(&mut i, &cfg, &format!("{} old {}", old, t)), msg);
+    }
 }
 
 #[test]
@@ -716,7 +956,7 @@ fn or_caught_crash_yields_rhs_id() {
         &cfg,
         "((\\_ -> let discard = @ in crash \"boom\") 0) or @",
     );
-    assert!(matches!(v, Value::Id(_)), "got {}", j::show::show(&i, &v));
+    assert!(matches!(v, Value::Id(_)), "got {}", j::show::show(&i, &v).unwrap());
 }
 
 #[test]

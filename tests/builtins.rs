@@ -36,7 +36,7 @@ fn ok(i: &mut Interp, cfg: &config::Config, src: &str) -> Value {
 
 fn crash(i: &mut Interp, cfg: &config::Config, src: &str) -> String {
     match ev(i, cfg, src) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(i, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(i, &v).unwrap()),
         Err(m) => m,
     }
 }
@@ -48,8 +48,8 @@ macro_rules! check {
             value_eq(&got, &$want).unwrap_or(false),
             "{} => {}, want {}",
             $src,
-            j::show::show(&$i, &got),
-            j::show::show(&$i, &$want)
+            j::show::show(&$i, &got).unwrap(),
+            j::show::show(&$i, &$want).unwrap()
         );
     }};
 }
