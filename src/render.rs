@@ -3001,18 +3001,22 @@ mod tests {
         // the size bar is drawn from this count (§7.11 column 5), and no
         // shortcut may change it, whatever the machine or the content.
         // A few lines repeating, disjoint adjacent pairs of them swapped, or
-        // one of each pair replaced by the other (two lines each): no line
-        // occurs once on either side, and every diagonal the period divides
-        // runs along equal lines from one change to the next. Replacing
-        // changes how many times each line occurs; swapping does not
+        // lines a whole number of periods apart each replaced by the line
+        // after it (two lines each): no line occurs once on either side, and
+        // every diagonal the period divides runs along equal lines from one
+        // change to the next. Swapping leaves how many times each line
+        // occurs as it was; replacing always turns the same line into the
+        // same other one, so the counts alone bound it by its size
         for period in [2, 3] {
             let lines: Vec<String> = (0..3000).map(|i| format!("l{}\n", i % period)).collect();
             for changes in [1, 33, 499, 501] {
                 let (mut swapped, mut replaced) = (lines.clone(), lines.clone());
                 let step = 2990 / changes;
+                let periods = step / period * period;
                 for k in 0..changes {
                     let at = 3 + step * k;
                     swapped.swap(at, at + 1);
+                    let at = 3 + periods * k;
                     replaced[at] = lines[at + 1].clone();
                 }
                 check(&lines, &swapped, None);
@@ -3064,5 +3068,35 @@ mod tests {
             }
             check(&a, &b, Some(1 + rng.below(SIZE_BAR_TOP)));
         }
+    }
+
+    #[test]
+    fn reorder_bound_keeps_no_line_more_often_than_either_side_has_it() {
+        // the bound only spares `changed_lines` a search: the exact counts
+        // above hold with any lower bound, however loose, so only this pins
+        // how tight it is. Lines that occur once on each side keep at most a
+        // longest sequence of them in the same order on both: ten reversed
+        // keep one
+        let distinct: Vec<usize> = (0..10).collect();
+        let reversed: Vec<usize> = (0..10).rev().collect();
+        assert_eq!(reorder_bound(&distinct, &reversed, 10), 18);
+        // any other line is kept at most as many times as the side with
+        // fewer of it has it: two lines alternating with 501 of the 1500
+        // `0`s turned into `1`s keep 999 `0`s and 1500 `1`s. Counting them
+        // only up to the shorter side kept all 3000, a bound of 0, and the
+        // search ran over the whole file
+        let alternating: Vec<usize> = (0..3000).map(|i| i % 2).collect();
+        let mut replaced = alternating.clone();
+        for k in 0..501 {
+            replaced[2 * k] = 1;
+        }
+        assert_eq!(reorder_bound(&alternating, &replaced, 2), 1002);
+        assert_eq!(reorder_bound(&replaced, &alternating, 2), 1002);
+        // the two kinds side by side add up
+        let then = |once: &[usize], others: &[usize]| -> Vec<usize> {
+            once.iter().copied().chain(others.iter().map(|l| l + 10)).collect()
+        };
+        let (a, b) = (then(&distinct, &alternating), then(&reversed, &replaced));
+        assert_eq!(reorder_bound(&a, &b, 12), 1020);
     }
 }
