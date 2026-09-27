@@ -17,7 +17,7 @@ use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::backend::{CommitId, FileId, TreeId};
+use jj_lib::backend::{CommitId, FileId, MergedTreeValueExt, TreeId};
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
@@ -2106,12 +2106,51 @@ async fn jj_replay(
     // unlabeled; the labels would not survive tree_to_files anyway.
     let merged = MergedTree::merge(Merge::from_removes_adds(
         vec![(from_tree, String::new())],
-        vec![(onto_tree, String::new()), (to_tree, String::new())],
+        vec![(onto_tree.clone(), String::new()), (to_tree.clone(), String::new())],
     ))
     .await
     .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+    refuse_file_directory_clash(&merged, &[&onto_tree, &to_tree]).await?;
     // conflicts stay as unresolved blobs (§7.3)
     tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
+}
+
+/// Crash if the merge left a conflict with a file on one side and, on
+/// another, a directory one of `inputs` holds at that path: one entry cannot
+/// list that directory's entries, and the in-memory backend refuses the same
+/// merge, whose result would hold both `a` and `a/b` (§7.3). A directory side
+/// of a conflict jj made earlier is no such directory: it came in as the
+/// opaque side of an unresolved blob, and replay carries it.
+async fn refuse_file_directory_clash(
+    merged: &MergedTree,
+    inputs: &[&MergedTree],
+) -> Result<(), Crash> {
+    // walks only the unresolved part of the tree: nothing when it is resolved
+    for (path, value) in merged.conflicts() {
+        let value = value.map_err(|e| Crash::new(format!("replay: {}", e)))?;
+        // sides that cancel are no sides
+        let value = value.simplify();
+        let has = |dir: bool| {
+            value
+                .adds()
+                .any(|v| matches!(v, Some(t) if matches!(t, TreeValue::Tree(_)) == dir))
+        };
+        if !has(false) || !has(true) {
+            continue;
+        }
+        for input in inputs {
+            let held = input
+                .path_value(&path)
+                .await
+                .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+            if held.is_tree() && value.adds().any(|v| v.is_some() && held.iter().any(|h| h == v)) {
+                let comps: Vec<String> =
+                    path.components().map(|c| c.as_internal_str().to_string()).collect();
+                return Err(crate::domain::file_directory_clash(&comps));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------

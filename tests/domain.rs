@@ -191,6 +191,33 @@ fn replay_rejects_root_entries_and_file_directory_clashes() {
 }
 
 #[test]
+fn replay_refuses_a_path_both_a_file_and_a_directory() {
+    // adding `a/b` onto a file `a` left both in the result: a snapshot that
+    // the next replay (replayTree's, for a child) refused as malformed, and
+    // one jj's merge makes into a single conflict at `a` whose directory
+    // side cannot be listed as entries. Both backends now crash, naming the
+    // path (§7.3, §10).
+    let file = snap(vec![entry("a", "x")]);
+    let dir = snap(vec![entry("a/b", "y")]);
+    for (onto, to) in [(&file, &dir), (&dir, &file)] {
+        let e = simple_replay(onto, &[], to).unwrap_err();
+        assert!(
+            e.msg.contains("`a` would be a file on one side and a directory on another"),
+            "{}",
+            e.msg
+        );
+    }
+    // a file on one side, and a file below it on another, deeper down
+    let e = simple_replay(&dir, &[], &snap(vec![entry("a/b/c", "z")])).unwrap_err();
+    assert!(e.msg.contains("`a/b` would be a file"), "{}", e.msg);
+    // one side replacing the file with a directory is no clash
+    let out = simple_replay(&file, &file, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
+    let out = simple_replay(&dir, &dir, &file).unwrap();
+    assert_eq!(paths_of(&out), vec!["a"]);
+}
+
+#[test]
 fn replay_identity_laws() {
     // replay b { from = b, to = x } = x
     let b = snap(vec![entry("a", "1"), entry("dir/b", "2")]);

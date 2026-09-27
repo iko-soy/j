@@ -824,7 +824,13 @@ some other value in its place.
   content, non-overlapping line-level hunks). A path unresolved in any of the
   three takes part with all its sides, as when jj rebases a conflicted commit,
   so sides that cancel drop out and a replay can resolve a conflict as well
-  as keep one. It never crashes on content. It
+  as keep one. It never crashes on content, except that it crashes, naming
+  the path, when the merge would make a path a file on one side and on
+  another a directory that `onto` or `to` holds, as replaying the addition
+  of `./a/b` onto a file `./a` would: one entry cannot list the directory's
+  entries. (The in-memory merge of §10 crashes when it would leave both
+  `./a` and `./a/b`.) A directory side that a conflict already had is
+  carried like any other side. It
   crashes if any of the three is not a well-formed snapshot (a list of `Entry`
   records with unique paths, none of them the root `./`, and none both a file
   and a directory as `./a` beside `./a/b` would be).

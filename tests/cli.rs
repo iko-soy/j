@@ -607,6 +607,46 @@ fn file_and_directory_at_one_path_refused() {
 }
 
 #[test]
+fn replay_making_a_file_and_a_directory_of_one_path_refused() {
+    // rebasing a commit that adds `a/b` onto one with a file `a`: jj's merge
+    // makes one conflict at `a` with the directory as a side, so the rebase
+    // and its `validate` dry run exited 0 with `a/b` gone from `files` (and,
+    // while such a side was stored as an empty file, from every tree). The
+    // in-memory backend left both `a` and `a/b` instead, which its next
+    // replay refused (§7.3).
+    let clash = "would be a file on one side and a directory on another";
+    let r = setup();
+    r.write("a", "a\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new . top"]).ok();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b", "nested\n");
+    r.j(&["describe \"S\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let out = r.j(&["tree . validate . rebase siblings"]);
+    assert_eq!(out.code, 1, "validate accepted it: {}", out.stdout);
+    assert!(out.stderr.contains(&format!("`a` {}", clash)), "{}", out.stderr);
+    let out = r.j(&["rebase siblings"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains(&format!("`a` {}", clash)), "{}", out.stderr);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    let paths = r.j(&["\\r -> show (map (.path) (files r))"]).ok().stdout;
+    assert_eq!(paths.trim(), "[[\"a\" \"b\"]]");
+    assert_eq!(r.read("a/b"), "nested\n");
+    // the builtin, either way round, and catchable
+    let file = "[{ path = ./a, content = blob \"x\" }]";
+    let dir = "[{ path = ./a/b, content = blob \"y\" }]";
+    for (onto, to) in [(file, dir), (dir, file)] {
+        let e = format!("replay {} ({{ from = [], to = {} }})", onto, to);
+        let out = r.j(&[&format!("show ({})", e)]);
+        assert_eq!(out.code, 1, "{}", out.stdout);
+        assert!(out.stderr.contains(clash), "{}", out.stderr);
+        let out = r.j(&[&format!("(show ({})) or \"caught\"", e)]).ok();
+        assert_eq!(out.stdout.trim(), "caught");
+    }
+}
+
+#[test]
 fn conflict_directory_sides_kept_whole() {
     // jj keeps a conflict between a file and a directory as one path whose
     // side is the whole directory. Such a side was read as an empty file and
@@ -618,7 +658,7 @@ fn conflict_directory_sides_kept_whole() {
     let onto = |m: &str| format!("rebase (matching (\\c -> c.message == \"{}\") all)", m);
 
     // R replaces the file `a` with a directory, L deletes it: R onto L is a
-    // conflict with R's directory as a side
+    // conflict with R's directory as a side, and no side a file
     let r = setup();
     r.write("a", "base\n");
     r.j(&["describe \"P\""]).ok();
@@ -638,7 +678,7 @@ fn conflict_directory_sides_kept_whole() {
     // a rewrite writes the conflict back as it was read
     r.j(&["describe \"R again\""]).ok();
     // onto Q's file `a`: the directory stays a side of R's conflict, now
-    // beside Q's file
+    // beside Q's file, and is not refused, as it was a side already (§7.3)
     r.j(&[&onto("Q")]).ok();
     assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
     // R back onto P: the sides cancel, leaving R's own directory

@@ -156,6 +156,16 @@ pub fn file_and_directory<'a>(
     None
 }
 
+/// The crash of a replay whose result would make `path` a file on one side
+/// and a directory on another: one entry cannot list the directory's
+/// entries, so both backends refuse the merge, naming the path (§7.3)
+pub fn file_directory_clash(path: &[String]) -> Crash {
+    Crash::new(format!(
+        "replay: `{}` would be a file on one side and a directory on another",
+        path.join("/")
+    ))
+}
+
 pub fn map_to_snapshot(m: BTreeMap<Vec<String>, Value>) -> Vec<Value> {
     m.into_iter()
         .map(|(path, content)| {
@@ -270,6 +280,12 @@ pub fn simple_replay(
                 }
             }
         }
+    }
+    // a file at a path and entries below it: jj's merge makes that one
+    // conflict between a file and a directory, which the jj backend refuses
+    // too (§7.3)
+    if let Some(p) = file_and_directory(out.keys()) {
+        return Err(file_directory_clash(p));
     }
     Ok(map_to_snapshot(out))
 }
