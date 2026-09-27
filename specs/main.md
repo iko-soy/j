@@ -232,7 +232,7 @@ keyword and is always available.
 
 ### 3.3 Layout
 
-Two layout rules and nothing else.
+Three layout rules and nothing else.
 
 1. **Top level.** A top-level item begins with a token in column 1. Every
    following line whose first token is in a column greater than 1 continues
@@ -245,9 +245,17 @@ Two layout rules and nothing else.
    be past column 1, and in an outer block's binding past that block's column.
    Bindings on a single line are separated by `;`. Blank and comment-only
    lines are ignored here too.
+3. **Selectors and updates.** A `SELECTOR` or `{` that is the first token of
+   a line never selects from or updates what precedes it. On a continuation
+   line it begins a new `postfix` (§3.4), which after another `postfix` is
+   the next application argument or list element: `r` followed by a line
+   `  .a` is `r (.a)`, and followed by `  { a = 2 }` it is `r ({ a = 2 })`.
+   So `r.a` and `r { a = 2 }` need the `.a` or `{` on the line `r` ends on.
+   `show` relies on this to break a list of records one per line with nothing
+   between them (§5.2).
 
 An expression given on the command line or on stdin is a single `expr`, not a
-list of items, so rule 1 does not apply to it; rule 2 does.
+list of items, so rule 1 does not apply to it; rules 2 and 3 do.
 
 ### 3.4 Grammar
 
@@ -273,7 +281,7 @@ binding    := ident '=' expr
 
 opexpr     := app (op app)*             -- resolved by the fixity table
 app        := postfix+                  -- juxtaposition; left-associative
-postfix    := atom ( SELECTOR | '{' fields '}' )*
+postfix    := atom ( SELECTOR | '{' fields '}' )*   -- no SELECTOR or '{' after a line break (§3.3)
 atom       := ident | TYPENAME | INT | TEXT | IDLIT | NEWID | LABELLIT | PATHLIT | 'true' | 'false'
             | '(' expr ')' | '(' op ')' | '(' op expr ')' | '(' expr op ')'
             | '[' postfix* ']'

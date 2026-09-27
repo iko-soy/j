@@ -764,6 +764,8 @@ impl Parser {
                     h = self.within(h.max(self.height) + 2)?;
                     e = Expr::Update(Rc::new(e), fields);
                 }
+                // a Newline ends the chain too: a selector or `{` that
+                // begins a line is the next postfix, not this one's (§3.3)
                 _ => break,
             }
         }

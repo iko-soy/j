@@ -319,6 +319,28 @@ fn block_comment_within_a_line_is_whitespace() {
 }
 
 #[test]
+fn a_line_break_ends_a_postfix_chain() {
+    // §3.3 rule 3: a selector or `{` that begins a continuation line starts
+    // the next argument or list element instead of extending the `postfix`
+    // before it; `show`'s wide list of records relies on this (§5.2)
+    assert_eq!(r(&p("r\n  .a")), "r (.a)");
+    assert_eq!(r(&p("r\n  { a = 2 }")), "r ({ a = 2 })");
+    assert_eq!(r(&p("f r\n  .a")), "(f (r)) (.a)");
+    assert!(matches!(p("[r\n  { a = 2 }]"), Expr::List(ref es) if es.len() == 2));
+    assert!(matches!(p("[{ a = 1 }\n  { a = 2 }]"), Expr::List(ref es) if es.len() == 2));
+    assert_eq!(r(&p("let y = r\n      .a\nin y")), "let y = r (.a) in y");
+    match &cfg("x = f\n  .a\n")[..] {
+        [Item::Definition(n, e, _)] => assert_eq!((n.as_str(), r(e).as_str()), ("x", "f (.a)")),
+        other => panic!("expected one definition, got {:?}", other),
+    }
+    // a comment that ends the line ends the chain too (§3.1)
+    assert_eq!(r(&p("r -- c\n  .a")), "r (.a)");
+    assert_eq!(r(&p("r {- c\n -} .a")), "r (.a)");
+    // on one line the chain continues, spaces or not
+    assert_eq!(r(&p("r .a { b = 1 }")), "r.a { b = 1 }");
+}
+
+#[test]
 fn multiline_signature_arrow() {
     let items = cfg("f : Int\n  -> Int\nf = \\x -> x\n");
     assert!(matches!(&items[0], Item::Signature(n, _, _) if n == "f"));
