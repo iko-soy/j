@@ -6,9 +6,41 @@ use j::eval::Interp;
 use j::parse::parse_expr;
 use j::show::{show, text_literal, unified_diff};
 use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Env, Value};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
+
+/// The system allocator, counting the bytes each thread asks it for, so a
+/// test can hold `show` to a cost in proportion to what it writes
+/// (show_costs_in_proportion_to_its_output).
+struct Counting;
+
+thread_local! {
+    static ASKED: Cell<usize> = const { Cell::new(0) };
+}
+
+fn asked() -> usize {
+    ASKED.with(|a| a.get())
+}
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let _ = ASKED.try_with(|a| a.set(a.get() + l.size()));
+        System.alloc(l)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        System.dealloc(p, l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        let _ = ASKED.try_with(|a| a.set(a.get() + size));
+        System.realloc(p, l, size)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 fn make_interp() -> (Interp, config::Config) {
     let cfg = config::load_config(CONFIG).expect("reference config must load");
@@ -144,6 +176,32 @@ fn show_roundtrips_values_nested_up_to_the_parsers_bound() {
 }
 
 #[test]
+fn show_takes_no_more_stack_a_level_than_before_it_could_crash() {
+    // `show` recurses natively, once or twice per level of the value, and
+    // running out of stack aborts the process, an exit §1.4 does not allow.
+    // Making `show` fallible nearly doubled the stack a level takes (a Result
+    // collected through iterator adapters at every level, every arm's
+    // temporaries in the one frame): lists 150,000 deep, which had shown in
+    // the binary's 512 MB, aborted with exit 134. These depths fit in 48 MB
+    // at the stack a level took before that, and not at what it took after.
+    std::thread::Builder::new()
+        .stack_size(48 * 1024 * 1024)
+        .spawn(|| {
+            let (mut i, cfg) = make_interp();
+            let lists = (1..16_000).fold(Value::list(vec![]), |v, _| Value::list(vec![v]));
+            assert!(show(&i, &lists).unwrap().starts_with("[[[["));
+            let records = (0..14_000).fold(Value::int(1), |v, _| Value::record(&[("a", v)]));
+            assert!(show(&i, &records).unwrap().starts_with("{ a = { a = "));
+            // a builtin applied to its partial application, and so on
+            let src = "let f = \\n -> if n == 0 then length else map (f (n - 1)) in f 9000";
+            assert!(show_of(&mut i, &cfg, src).starts_with("map (map (map "));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn show_unresolved_blob() {
     let (i, _cfg) = make_interp();
     let v = Value::Blob(Rc::new(BlobVal {
@@ -234,6 +292,40 @@ fn show_wide_sees_through_lazy_files() {
     // the broken-up list still reads back (the id above names no commit of
     // the in-memory backend, so round-trip the files alone)
     roundtrip(&mut i, &cfg, &Value::record(&[("files", j::domain::lazy_files("xruqnqvokyloollnxruqnqvokyloolln", entries))]));
+}
+
+#[test]
+fn show_costs_in_proportion_to_its_output() {
+    // a commit deep in a long history sits inside hundreds of lists and
+    // records, and breaking each one's `files` an entry per line (§5.2)
+    // makes the rendering megabytes, mostly indentation. Each level built
+    // its own string and copied its child's whole rendering into it, so
+    // showing a Repo with 1,000 commits below its focus cost that size times
+    // the depth: 27 s, and 8 before lazy `files` lists broke too. Here that
+    // was a thousand times what `show` returns; what it asks the allocator
+    // for is now a small multiple of it, whatever the depth.
+    let (i, _cfg) = make_interp();
+    let id = "xruqnqvokyloollnxruqnqvokyloolln";
+    let entries: Vec<Value> = (1..=4)
+        .map(|n| {
+            Value::record(&[
+                ("content", BlobVal::text_blob(&format!("content {}\n", n))),
+                ("path", Value::list(vec![Value::text(format!("file{}.txt", n))])),
+            ])
+        })
+        .collect();
+    let history = (0..200).fold(Value::list(vec![]), |children, _| {
+        Value::list(vec![Value::record(&[
+            ("children", children),
+            ("files", j::domain::lazy_files(id, entries.clone())),
+            ("id", Value::Id(Rc::new(id.to_string()))),
+        ])])
+    });
+    let before = asked();
+    let s = show(&i, &history).unwrap();
+    let cost = asked() - before;
+    assert!(s.len() > 500_000, "{}", s.len());
+    assert!(cost < 8 * s.len(), "{} bytes allocated to show {}", cost, s.len());
 }
 
 #[test]

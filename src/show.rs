@@ -1,14 +1,25 @@
 //! `show` (§5.2), unified diff (§4.9 `diff`), and the difftastic bridge (§7.10).
 
 use crate::eval::Interp;
-use crate::value::{BlobContent, Crash, FunVal, Value};
+use crate::value::{BlobContent, BlobVal, Crash, FunVal, ThunkVal, Value};
+use num_bigint::BigInt;
 use unicode_width::UnicodeWidthChar;
 
 /// Crashes where `v` holds a lazy part the store cannot read (§7.2), as any
 /// other use of it does: a stand-in for the part would be the literal of
 /// some other value, or would not parse.
+///
+/// Every level of `v` appends to the one string: a level that built its own
+/// and copied its child's rendering into it cost the rendering's size times
+/// its depth, and a Repo whose focus has a long line of descendants nests
+/// them hundreds of levels deep, in megabytes of indentation. The renderers
+/// recurse natively, once per level, so they also keep their frames small:
+/// plain loops, a call's result returned as theirs without a `?` where it can
+/// be, and the arms that end the recursion or seldom carry it on (a leaf, a
+/// lazy part, a function) out of line.
 pub fn show(interp: &Interp, v: &Value) -> Result<String, Crash> {
-    let s = render(interp, v)?;
+    let mut s = String::new();
+    render(interp, v, &mut s)?;
     // line breaking: one line if it fits in 80 columns, counted in display
     // cells as everywhere else (§5.1), not code points. Not by
     // `render::width`, which skips colour codes: `show` writes none, and an
@@ -17,56 +28,98 @@ pub fn show(interp: &Interp, v: &Value) -> Result<String, Crash> {
     if w <= 80 {
         return Ok(s);
     }
-    render_wide(interp, v, 0)
+    s.clear();
+    render_wide(interp, v, 0, &mut s)?;
+    Ok(s)
 }
 
-fn render(interp: &Interp, v: &Value) -> Result<String, Crash> {
-    Ok(match v {
-        Value::Thunk(t) => render(interp, &t.force()?)?,
-        Value::Int(n) => {
-            if n.sign() == num_bigint::Sign::Minus {
-                format!("(0 - {})", n.magnitude())
-            } else {
-                n.to_string()
-            }
+fn render(interp: &Interp, v: &Value, out: &mut String) -> Result<(), Crash> {
+    match v {
+        Value::Thunk(t) => return render_forced(interp, t, None, out),
+        Value::Int(n) => render_int(n, out),
+        Value::Text(t) => push_text_literal(t, out),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Id(id) => {
+            out.push('@');
+            out.push_str(id);
         }
-        Value::Text(t) => text_literal(t),
-        Value::Bool(b) => b.to_string(),
-        Value::Id(id) => format!("@{}", id),
         Value::List(xs) => {
             // list elements must be atoms: parenthesise applications and
             // operator expressions (§3.4)
-            let parts = xs
-                .iter()
-                .map(|x| render_atom(interp, x))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("[{}]", parts.join(" "))
+            out.push('[');
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                render_atom(interp, x, out)?;
+            }
+            out.push(']');
         }
         Value::Record(m) => {
-            let parts = m
-                .iter()
-                .map(|(k, x)| Ok(format!("{} = {}", k, render(interp, x)?)))
-                .collect::<Result<Vec<_>, Crash>>()?;
-            format!("{{ {} }}", parts.join(", "))
-        }
-        Value::Blob(b) => match &b.content {
-            BlobContent::Resolved(bytes) => match String::from_utf8(bytes.as_ref().clone()) {
-                Ok(s) => format!("blob {}", text_literal(&s)),
-                Err(_) => "blob \"<binary>\"".into(),
-            },
-            BlobContent::Lazy(_) | BlobContent::Conflict(_) => {
-                let s = String::from_utf8_lossy(&b.bytes()?).to_string();
-                let marker = if b.is_unresolved() { "{- unresolved -} " } else { "" };
-                format!("{}blob {}", marker, text_literal(&s))
+            out.push_str("{ ");
+            for (i, (k, x)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(" = ");
+                render(interp, x, out)?;
             }
-        },
-        Value::Shape(s) => s.name.clone(),
-        Value::Fun(f) => render_fun(interp, f)?,
-    })
+            out.push_str(" }");
+        }
+        Value::Blob(b) => return render_blob(b, out),
+        Value::Shape(s) => out.push_str(&s.name),
+        Value::Fun(f) => return render_fun(interp, f, out),
+    }
+    Ok(())
 }
 
-fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
-    Ok(match f {
+#[inline(never)]
+fn render_int(n: &BigInt, out: &mut String) {
+    if n.sign() == num_bigint::Sign::Minus {
+        out.push_str(&format!("(0 - {})", n.magnitude()));
+    } else {
+        out.push_str(&n.to_string());
+    }
+}
+
+#[inline(never)]
+fn render_blob(b: &BlobVal, out: &mut String) -> Result<(), Crash> {
+    match &b.content {
+        BlobContent::Resolved(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                out.push_str("blob ");
+                push_text_literal(s, out);
+            }
+            Err(_) => out.push_str("blob \"<binary>\""),
+        },
+        BlobContent::Lazy(_) | BlobContent::Conflict(_) => {
+            let bytes = b.bytes()?;
+            if b.is_unresolved() {
+                out.push_str("{- unresolved -} ");
+            }
+            out.push_str("blob ");
+            push_text_literal(&String::from_utf8_lossy(&bytes), out);
+        }
+    }
+    Ok(())
+}
+
+/// A lazy part (a commit's `files`) renders as the value it forces to: on
+/// one line, or broken as that value would be at the indentation `wide`
+/// gives.
+#[inline(never)]
+fn render_forced(interp: &Interp, t: &ThunkVal, wide: Option<usize>, out: &mut String) -> Result<(), Crash> {
+    let v = t.force()?;
+    match wide {
+        None => render(interp, &v, out),
+        Some(indent) => render_wide(interp, &v, indent, out),
+    }
+}
+
+#[inline(never)]
+fn render_fun(interp: &Interp, f: &FunVal, out: &mut String) -> Result<(), Crash> {
+    match f {
         // a signed definition whose value is a builtin's partial application
         // or a composition (`tree = treeWith { … }`) renders as its name,
         // followed only by the arguments it is given (§5.2), which its
@@ -78,55 +131,36 @@ fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
             ..
         } if interp.builtin_def(name, cname).is_some() => {
             let own = c.position().unwrap_or(0).min(args.len());
-            let mut out = cname.clone();
-            for a in &args[args.len() - own..] {
-                out.push(' ');
-                out.push_str(&render_atom(interp, a)?);
-            }
-            out
+            out.push_str(cname);
+            render_args(interp, &args[args.len() - own..], out)
         }
         FunVal::Builtin { name, args, .. } => {
             // a selector `.name` carries its field as a baked-in first
             // argument (builtins::make_selector) and renders as the selector
             // atom itself (§3.4), not as an application to that field
             if name.starts_with('.') && name.len() > 1 {
-                return Ok(name.clone());
+                out.push_str(name);
+                return Ok(());
             }
-            // operator builtins render parenthesised when bare
-            if args.is_empty() {
-                if is_operator_name(name) {
-                    format!("({})", name)
-                } else if name == "(.)" {
-                    "(.)".into()
-                } else {
-                    name.clone()
-                }
+            // operator builtins render parenthesised; `(.)` is its own name
+            if is_operator_name(name) {
+                out.push('(');
+                out.push_str(name);
+                out.push(')');
             } else {
-                // partial application: name followed by applied args
-                let base = if is_operator_name(name) {
-                    format!("({})", name)
-                } else if name == "(.)" {
-                    "(.)".into()
-                } else {
-                    name.clone()
-                };
-                // args may contain a baked-in value (compose)
-                match name.as_str() {
-                    "(.)" if args.len() == 2 => {
-                        format!(
-                            "(.) ({}) ({})",
-                            render_atom(interp, &args[0])?,
-                            render_atom(interp, &args[1])?
-                        )
-                    }
-                    _ => {
-                        let shown = args
-                            .iter()
-                            .map(|a| render_atom(interp, a))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        format!("{} {}", base, shown.join(" "))
-                    }
+                out.push_str(name);
+            }
+            // a partial application: the name followed by the applied args,
+            // which may contain a baked-in value (compose)
+            if name == "(.)" && args.len() == 2 {
+                for a in args {
+                    out.push_str(" (");
+                    render_atom(interp, a, out)?;
+                    out.push(')');
                 }
+                Ok(())
+            } else {
+                render_args(interp, args, out)
             }
         }
         FunVal::Closure {
@@ -134,17 +168,10 @@ fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
             applied_args,
             ..
         } => {
-            if applied_args.is_empty() {
-                n.clone()
-            } else {
-                // partial application of a named definition: the name followed
-                // by the arguments supplied so far (§5.2)
-                let args = applied_args
-                    .iter()
-                    .map(|a| render_atom(interp, a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                format!("{} {}", n, args.join(" "))
-            }
+            // a partial application of a named definition: the name followed
+            // by the arguments supplied so far (§5.2)
+            out.push_str(n);
+            render_args(interp, applied_args, out)
         }
         FunVal::Closure {
             name: None,
@@ -155,31 +182,53 @@ fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
             ..
         } => {
             // a lambda or section renders as its source, exactly as written
-            // (§5.2); only an AST built without source is re-rendered
-            let base = if src.as_str().is_empty() {
-                crate::parse::render_lambda(params, body)
-            } else {
-                src.as_str().to_string()
-            };
-            if applied_args.is_empty() {
-                base
-            } else {
-                // partial application: the lambda, parenthesised as it is not
-                // atomic, followed by the arguments supplied so far (§5.2)
-                let args = applied_args
-                    .iter()
-                    .map(|a| render_atom(interp, a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                format!("({}) {}", base, args.join(" "))
+            // (§5.2); only an AST built without source is re-rendered. A
+            // partial application parenthesises it, as it is not atomic, and
+            // follows it with the arguments supplied so far (§5.2)
+            let applied = !applied_args.is_empty();
+            if applied {
+                out.push('(');
             }
+            if src.as_str().is_empty() {
+                out.push_str(&crate::parse::render_lambda(params, body));
+            } else {
+                out.push_str(src.as_str());
+            }
+            if applied {
+                out.push(')');
+            }
+            render_args(interp, applied_args, out)
         }
-        FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a)?, render_atom(interp, b)?),
-        FunVal::Labelled(n, _) => format!("%{}", n),
-        FunVal::ComposeLazy(f, g) => format!("({} . {})", render_atom(interp, f)?, render_atom(interp, g)?),
-    })
+        FunVal::OrFun(a, b) => render_infix(interp, a, " or ", b, out),
+        FunVal::Labelled(n, _) => {
+            out.push('%');
+            out.push_str(n);
+            Ok(())
+        }
+        FunVal::ComposeLazy(f, g) => render_infix(interp, f, " . ", g, out),
+    }
 }
 
-fn render_atom(interp: &Interp, v: &Value) -> Result<String, Crash> {
+/// `(a op b)`, for the functions an `or` or a composition builds
+fn render_infix(interp: &Interp, a: &Value, op: &str, b: &Value, out: &mut String) -> Result<(), Crash> {
+    out.push('(');
+    render_atom(interp, a, out)?;
+    out.push_str(op);
+    render_atom(interp, b, out)?;
+    out.push(')');
+    Ok(())
+}
+
+/// The arguments of a partial application, each after a space.
+fn render_args(interp: &Interp, args: &[Value], out: &mut String) -> Result<(), Crash> {
+    for a in args {
+        out.push(' ');
+        render_atom(interp, a, out)?;
+    }
+    Ok(())
+}
+
+fn render_atom(interp: &Interp, v: &Value, out: &mut String) -> Result<(), Crash> {
     // parenthesise if not atomic; a nested list is self-delimiting (a `[`
     // cannot begin a postfix), but a record is not: `{ … }` following another
     // element would parse as a record *update* on it (§3.4), so records keep
@@ -188,8 +237,14 @@ fn render_atom(interp: &Interp, v: &Value) -> Result<String, Crash> {
         v,
         Value::Int(_) | Value::Text(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) | Value::List(_)
     ) || is_section(v);
-    let s = render(interp, v)?;
-    Ok(if atomic { s } else { format!("({})", s) })
+    if !atomic {
+        out.push('(');
+    }
+    render(interp, v, out)?;
+    if !atomic {
+        out.push(')');
+    }
+    Ok(())
 }
 
 /// A section renders as its source, `(op e)` or `(e op)` (§5.2), which is
@@ -227,7 +282,13 @@ fn is_operator_name(n: &str) -> bool {
 }
 
 pub fn text_literal(s: &str) -> String {
-    let mut out = String::from("\"");
+    let mut out = String::new();
+    push_text_literal(s, &mut out);
+    out
+}
+
+fn push_text_literal(s: &str, out: &mut String) {
+    out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -239,24 +300,22 @@ pub fn text_literal(s: &str) -> String {
         }
     }
     out.push('"');
-    out
 }
 
-fn render_wide(interp: &Interp, v: &Value, indent: usize) -> Result<String, Crash> {
-    Ok(match v {
+fn render_wide(interp: &Interp, v: &Value, indent: usize, out: &mut String) -> Result<(), Crash> {
+    match v {
         // see through a lazy `files` list as `render` does, so that it breaks
         // like the equal forced list instead of staying on one line
-        Value::Thunk(t) => render_wide(interp, &t.force()?, indent)?,
+        Value::Thunk(t) => return render_forced(interp, t, Some(indent), out),
         Value::List(xs) if !xs.is_empty() => {
-            let mut out = String::from("[");
+            out.push('[');
             for (i, x) in xs.iter().enumerate() {
                 if i > 0 {
                     out.push('\n');
                     out.push_str(&" ".repeat(indent + 2));
                 }
                 // list elements must be atoms (§3.4)
-                let s = render_wide(interp, x, indent + 2)?;
-                if matches!(
+                let atomic = matches!(
                     x,
                     Value::Int(_)
                         | Value::Text(_)
@@ -265,31 +324,34 @@ fn render_wide(interp: &Interp, v: &Value, indent: usize) -> Result<String, Cras
                         | Value::Shape(_)
                         | Value::List(_)
                         | Value::Record(_)
-                ) || is_section(x)
-                {
-                    out.push_str(&s);
-                } else {
-                    out.push_str(&format!("({})", s));
+                ) || is_section(x);
+                if !atomic {
+                    out.push('(');
+                }
+                render_wide(interp, x, indent + 2, out)?;
+                if !atomic {
+                    out.push(')');
                 }
             }
             out.push(']');
-            out
         }
         Value::Record(m) if !m.is_empty() => {
-            let mut out = String::from("{ ");
+            out.push_str("{ ");
             for (i, (k, x)) in m.iter().enumerate() {
                 if i > 0 {
                     out.push('\n');
                     out.push_str(&" ".repeat(indent));
                     out.push_str(", ");
                 }
-                out.push_str(&format!("{} = {}", k, render_wide(interp, x, indent + 2)?));
+                out.push_str(k);
+                out.push_str(" = ");
+                render_wide(interp, x, indent + 2, out)?;
             }
             out.push_str(" }");
-            out
         }
-        _ => render(interp, v)?,
-    })
+        _ => return render(interp, v, out),
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
