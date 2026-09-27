@@ -641,8 +641,10 @@ snapshot): a block's paths are those it changes against its parent's files
 there, and its glyph, in either form, is the one `tree` draws for it there,
 with `⊗` and `◌` judged by the value's own files. What a commit with no
 parent there (the root, or one the expression made) changes is not known:
-its block lists and counts its files unmarked, and its glyph claims no `◌`.
-One the expression moved is still compared with its parent there. A `Repo`'s
+its block lists its files unmarked (but for `✖` on an unresolved one), and
+its glyph claims no `◌`. One the expression made has no metadata either
+(§7.11), so its block has no `author · age · n files` line. One the
+expression moved is still compared with its parent there. A `Repo`'s
 line draws its focus as the focus. A list of `[Text]` prints as paths because
 that is what such a list is in every base function; `show` is available
 when the literal is wanted. Alignment in tables and columns uses display
