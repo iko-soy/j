@@ -1484,12 +1484,13 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
 
 /// §7.8: after init/clone, create a working-copy commit as a child of
 /// `head` (the root commit when there is none) and check it out, recording
-/// it in `tx` with what the command has imported. The commit is empty: it
-/// holds its parent's files. `adopt` says the working directory already
-/// holds a checkout of the parent (init over an existing git repository):
-/// the working copy is then reset to the commit instead of written, so no
-/// file is touched and what the directory holds beyond the parent is the
-/// next snapshot's change.
+/// it in `tx` with what the command has imported. The commit holds its
+/// parent's files less any a checkout cannot create (`checkout_tree`), so
+/// it is empty unless the parent has one. `adopt` says the working
+/// directory already holds a checkout of the parent (init over an existing
+/// git repository): the working copy is then reset to the commit instead of
+/// written, so no file is touched and what the directory holds beyond the
+/// parent is the next snapshot's change.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
@@ -1523,6 +1524,7 @@ fn create_initial_wc_commit(
     let parent_tree = block_on(store.get_commit_async(&parent))
         .map_err(|e| (1, format!("cannot read the parent commit: {}", e)))?
         .tree();
+    let wc_tree = block_on(checkout_tree(parent_tree, backend.folds_case()))?;
     let user_sig = backend
         .user_signature(cfg)
         .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
@@ -1534,7 +1536,7 @@ fn create_initial_wc_commit(
     }
     let wc = block_on(
         tx.repo_mut()
-            .new_commit(vec![parent], parent_tree)
+            .new_commit(vec![parent], wc_tree)
             .set_author(user_sig.clone())
             .set_committer(user_sig)
             .write(),
@@ -1557,6 +1559,33 @@ fn create_initial_wc_commit(
     let on_disk = if adopt { Some(&wc) } else { None };
     block_on(backend.checkout(&wc, on_disk, op_id)).map_err(|c| (1, c.msg))?;
     Ok(())
+}
+
+/// `tree` without the files at a path a checkout cannot create (§7.5 step
+/// 1), which a git branch can hold: a `.jj` directory committed by mistake,
+/// a name no filesystem takes. jj's checkout stops at the first such path
+/// with the operation already recorded, so the working-copy commit init or
+/// clone starts on leaves them out, and their removal is its change (§7.8).
+async fn checkout_tree(tree: MergedTree, folds_case: bool) -> Result<MergedTree, OpenError> {
+    let refused: Vec<RepoPathBuf> = tree
+        .entries()
+        .map(|(path, _)| path)
+        .filter(|path| {
+            path.components()
+                .any(|c| crate::repo::checkout_refuses(c.as_internal_str(), folds_case))
+        })
+        .collect();
+    if refused.is_empty() {
+        return Ok(tree);
+    }
+    let mut builder = MergedTreeBuilder::new(tree);
+    for path in refused {
+        builder.set_or_remove(path, Merge::absent());
+    }
+    builder
+        .write_tree()
+        .await
+        .map_err(|e| (1, format!("cannot write a tree: {}", e)))
 }
 
 /// user settings for init/clone: a missing or malformed `user` is a

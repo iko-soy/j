@@ -217,6 +217,44 @@ fn init_and_clone_are_not_undone() {
 }
 
 #[test]
+fn clone_leaves_out_paths_a_checkout_cannot_create() {
+    // §7.8: a default bookmark can hold a path jj's checkout refuses, such
+    // as `.jj/x`. The working-copy commit held it, so the checkout failed
+    // after clone had recorded its operations, leaving no file on disk and
+    // `changed` empty, and every persisting run was refused for the focus's
+    // `.jj` (§7.5 step 1). The commit now leaves such paths out, and their
+    // removal is its change.
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::create_dir_all(other.join(".jj")).unwrap();
+    std::fs::write(other.join(".jj/x"), "evil\n").unwrap();
+    std::fs::create_dir_all(other.join("fixture/.jj")).unwrap();
+    std::fs::write(other.join("fixture/.jj/repo"), "vendored\n").unwrap();
+    std::fs::write(other.join("fixture/kept"), "kept\n").unwrap();
+    git(&other, &["add", "-f", ".jj", "fixture"]);
+    // a name no filesystem holds, which git stores all the same
+    let long = format!("long/{}", "n".repeat(300));
+    let blob = git(&other, &["hash-object", "-w", "a.txt"]);
+    let info = format!("100644,{},{}", blob.trim(), long);
+    git(&other, &["update-index", "--add", "--cacheinfo", &info]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "withjj"]);
+    git(&other, &["push", "-q", "origin", "master"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(dest.join("fixture/kept")).unwrap(), "kept\n");
+    assert!(!dest.join(".jj/x").exists());
+    assert!(!dest.join("fixture/.jj").exists());
+    let changed = env.j(&dest, &["changed"]).ok().stdout;
+    let changed: Vec<&str> = changed.lines().collect();
+    assert_eq!(changed, [".jj/x", "fixture/.jj/repo", long.as_str()]);
+    env.j(&dest, &["describe \"x\""]).ok();
+    env.j(&dest, &["new"]).ok();
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
 fn clone_starts_on_the_remotes_default_bookmark() {
     // §7.8: the working-copy commit is a child of the target of the bookmark
     // the remote's HEAD names (master here), not of whichever bookmark sorts

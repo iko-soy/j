@@ -463,12 +463,21 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
 /// which 255 bytes of UTF-8 never exceed.
 const NAME_MAX: usize = 255;
 
-/// Path components (§7.5 step 1) of every commit persisting writes anew or
-/// checks out. jj stores any name that is not empty and has no `/`, but its
+/// Whether a checkout cannot create the path component `comp` (§7.5 step
+/// 1). jj stores any name that is not empty and has no `/`, but its
 /// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
 /// over `NAME_MAX`, after the operation is recorded; a git tree cannot hold
 /// a NUL. Where the filesystem folds case, `.GIT` is the file `.git`, which
 /// the checkout refuses by its file identity.
+pub fn checkout_refuses(comp: &str, folds_case: bool) -> bool {
+    matches!(comp, "" | "." | ".." | ".git" | ".jj")
+        || comp.contains(['/', '\0'])
+        || comp.len() > NAME_MAX
+        || (folds_case && (comp.eq_ignore_ascii_case(".git") || comp.eq_ignore_ascii_case(".jj")))
+}
+
+/// Path components (§7.5 step 1) of every commit persisting writes anew or
+/// checks out must be ones a checkout can create (`checkout_refuses`).
 ///
 /// A commit that keeps the files it has in `old` is checked only as the
 /// focus: persisting at most rewrites it with the tree jj already stored and
@@ -489,12 +498,6 @@ fn validate_path_names(
             .collect::<Result<_, _>>()?,
         None => BTreeMap::new(),
     };
-    let reserved = |comp: &str| {
-        matches!(comp, "" | "." | ".." | ".git" | ".jj")
-            || comp.contains(['/', '\0'])
-            || comp.len() > NAME_MAX
-            || (folds_case && (comp.eq_ignore_ascii_case(".git") || comp.eq_ignore_ascii_case(".jj")))
-    };
     for c in all_commits(new)? {
         let id = id_of(&c)?;
         if immutable.contains(&id) {
@@ -512,7 +515,7 @@ fn validate_path_names(
             let path = e.field("path")?;
             for comp in path.as_list()? {
                 let comp = comp.as_text()?;
-                if reserved(comp) {
+                if checkout_refuses(comp, folds_case) {
                     return Err(Crash::new(format!(
                         "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
                         comp

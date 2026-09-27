@@ -1024,7 +1024,10 @@ that state, §7.2 applies.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
 at most one operation, described `init` and `clone URL`, holding what they
-imported and the working-copy commit; `undo` never undoes it (§7.7).
+imported and the working-copy commit; `undo` never undoes it (§7.7). That
+commit holds its parent's files less any at a path a checkout cannot create
+(§7.5 step 1), such as a committed `.jj` directory: their removal is its
+change.
 
 ### 7.9 Identity
 
