@@ -864,6 +864,9 @@ fn worked_example_with_run(n: usize) -> (Value, MemBackend) {
 
 #[test]
 fn tree_worked_example() {
+    // specs/tree.md drew the labels 35 and the margin 45 columns in and the
+    // detail line's marks at 11; the rows put them at 31, 40 and 16. This
+    // test compared only tokens, so the two drifted apart unseen.
     let (repo, be) = worked_example();
     let (mut i, cfg) = make_interp(be);
     let text = tree_text(
@@ -872,46 +875,33 @@ fn tree_worked_example() {
         "treeWith ({ detail = 2, margin = true, elide = true, icons = false, color = \"never\", lanes = 3, author = false, date = false, files = false })",
         repo,
     );
-    let expected = "\
-  ╎ 14
-  ◆─╮    @aaaa ▅  add parser                 3w  mo
-  ◆ │    @kpqx ▅  release 1.2      main      2w  mo
-  │ ○    @mnrv ▂  fix lexer                  1w  mo
-▶ ├─⊗    @wqzt ▃  wip              feature   2d  mo
+    // (the first row starts on the literal's line: a `\` line continuation
+    // would eat its gutter)
+    let expected = "  ╎ 14
+  ◆─╮    @aaaa ▅  add parser            3w  mo
+  ◆ │    @kpqx ▅  release 1.2  main     2w  mo
+  │ ○    @mnrv ▂  fix lexer             1w  mo
+▶ ├─⊗    @wqzt ▃  wip          feature  2d  mo
   │ │      ✖ src/lexer.rs   ~ src/parser.rs   + tests/lexer.rs
-  ╰─┼─◌  @ptlm    docs  ⋯ 3                  1d  ak
-    ├─○  @qrst ▁  spike                      5h  mo
-    ○    @yxsk ▃                             1h  mo
+  ╰─┼─◌  @ptlm    docs  ⋯ 3             1d  ak
+    ├─○  @qrst ▁  spike                 5h  mo
+    ○    @yxsk ▃                        1h  mo
 ";
-    // The spec pins down the rails *graph* (which structural characters appear
-    // on each row, in order) and the id/size-bar/message/label/detail content.
-    // Exact column widths and the gutter on the spec's first row are
-    // implementation/spec-formatting details, so we compare (a) the ordered
-    // sequence of structural characters per row and (b) the word tokens,
-    // ignoring all whitespace.
-    let struct_chars = |l: &str| -> String {
-        l.chars()
-            .filter(|c| "⌂◆○◉◌⊗├╰┼─╮┬│╎»".contains(*c))
-            .collect()
-    };
-    let tokens = |l: &str| -> Vec<String> {
-        l.split_whitespace().map(|t| t.to_string()).collect()
-    };
-    let got: Vec<&str> = text.lines().collect();
+    // the spec draws exactly these rows
+    let spec = include_str!("../specs/tree.md");
+    assert!(
+        spec.contains(&format!("Rendered:\n\n```\n{}```", expected)),
+        "specs/tree.md's worked example is not\n{}",
+        expected
+    );
     // The legend follows the tree body after a blank line (§Legend). Split it
-    // off; the body must match the spec's rails graph, and the legend must
-    // explain exactly the symbols the body uses.
+    // off; the body must be the spec's rows, and the legend must explain
+    // exactly the symbols the body uses.
+    let got: Vec<&str> = text.lines().collect();
     let blank = got.iter().position(|l| l.trim().is_empty()).unwrap_or(got.len());
     let body = &got[..blank];
     let legend = &got[blank..];
-    let want: Vec<&str> = expected.lines().collect();
-    assert_eq!(body.len(), want.len(), "row count\n--- got ---\n{}\n--- want ---\n{}", text, expected);
-    for (g, w) in body.iter().zip(want.iter()) {
-        assert_eq!(struct_chars(g), struct_chars(w),
-            "rails graph\nrow got:  {}\nrow want: {}", g, w);
-        assert_eq!(tokens(g), tokens(w),
-            "content\nrow got:  {}\nrow want: {}", g, w);
-    }
+    assert_eq!(body.join("\n") + "\n", expected, "\n--- got ---\n{}", text);
     // legend explains the used symbols (only-used): ○ ◆ ◌ ⊗ ▶ ╎ ⋯ + ~ ✖ here
     // (no ⌂: the distant root folds into the run, §Option far root)
     let legend_text = legend.join("\n");
@@ -1001,6 +991,12 @@ fn tree_columns_line_up_on_every_row() {
             }
             if !data {
                 assert_eq!(age_col, block_col, "margin\n{}", ctx);
+            }
+            // the detail line: two columns into the id column
+            if detail == 2 {
+                let id_col = col_of(row_of(&text, "@wqzt"), "@wqzt");
+                let marks = row_of(&text, "✖ src/lexer.rs");
+                assert_eq!(col_of(marks, "✖"), id_col + 2, "detail line\n{}", ctx);
             }
         }
     }

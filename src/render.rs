@@ -2287,7 +2287,8 @@ fn draw_rows(
             dline.push_str("  ");
             dline.push_str(&color_rails(&dchars, &dlane0, pal, None));
             dline.push(' ');
-            dline.push_str(&" ".repeat(id_w + 2));
+            // the marks start two columns into the id column (§Step 4)
+            dline.push_str("  ");
             let marks: Vec<String> = c
                 .detail_marks
                 .iter()

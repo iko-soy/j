@@ -156,7 +156,7 @@ Columns, left to right, at fixed offsets:
    keeps the column blank; it is left out only when no row has a bar.
 6. **Message**: first line; nothing if empty; followed by `⋯ n` on a
    collapsed node.
-7. **Labels**: right-aligned column, present only if any rendered commit has
+7. **Labels**: left-aligned column, present only if any rendered commit has
    a label; names separated by two spaces.
 8. **Margin** (`margin = true`): age and author initials, as before, each
    right-aligned in its own column (a `9m` ends under a `13m`), so the margin
@@ -166,9 +166,13 @@ Columns, left to right, at fixed offsets:
    `author` shows the full author name. They appear in that order, grey,
    immediately before the margin in the same right-aligned block.
 
-Columns 4–8 start at the same offset on every row. When stdout is a terminal
-and a row would exceed its width, the message is cut and ends with `…` so that
-labels and the margin keep their columns; otherwise nothing is cut.
+Columns 4–8 start at the same offset on every row. Labels start two columns
+past the widest message, and the data columns and the margin start two
+columns past the widest label (past the widest message when there is no
+label column). Each data column, the age and the initials are as wide as
+their widest entry and two columns apart. When stdout is a terminal and a row
+would exceed its width, the message is cut and ends with `…` so that labels
+and the margin keep their columns; otherwise nothing is cut.
 
 **Rails characters.** For lane `i` on the row of node `n` placed in lane
 `ℓ`, character `2i` is, first rule that applies:
@@ -194,7 +198,8 @@ id column, which is widened if it cannot hold the rest.
 **Detail line** (`detail = 2`, focus only): one extra row directly under the
 focus. Its rails show `│` in every lane that holds a rail below the focus row
 (including the focus's own lane if it has children); the text starts two
-characters past the id column and lists the changed paths with a mark each:
+columns into the id column, under the focus's id, and lists the changed paths
+with a mark each:
 `+` added, `~` modified, `−` deleted, `✖` unresolved.
 
 #### Glyphs
@@ -299,20 +304,21 @@ Rendered:
 
 ```
   ╎ 14
-  ◆─╮    @aaaa ▅  add parser                 3w  mo
-  ◆ │    @kpqx ▅  release 1.2      main      2w  mo
-  │ ○    @mnrv ▂  fix lexer                  1w  mo
-▶ ├─⊗    @wqzt ▃  wip              feature   2d  mo
+  ◆─╮    @aaaa ▅  add parser            3w  mo
+  ◆ │    @kpqx ▅  release 1.2  main     2w  mo
+  │ ○    @mnrv ▂  fix lexer             1w  mo
+▶ ├─⊗    @wqzt ▃  wip          feature  2d  mo
   │ │      ✖ src/lexer.rs   ~ src/parser.rs   + tests/lexer.rs
-  ╰─┼─◌  @ptlm    docs  ⋯ 3                  1d  ak
-    ├─○  @qrst ▁  spike                      5h  mo
-    ○    @yxsk ▃                             1h  mo
+  ╰─┼─◌  @ptlm    docs  ⋯ 3             1d  ak
+    ├─○  @qrst ▁  spike                 5h  mo
+    ○    @yxsk ▃                        1h  mo
 ```
 
-Column offsets in this example: gutter 0–1, rails 2–7, id from 9. Lane 0 is
-`◆ ◆ │ ├ ╰` from `aaaa` to `ptlm` and then empty; the reservation for `mnrv`
-is drawn on `aaaa`'s row as `─╮` and consumed on `mnrv`'s row; `ptlm` forks
-to lane 2 across the live lane 1, hence `┼`.
+Column offsets in this example: gutter 0–1, rails 2–7, id from 9, size bar
+15, message from 18, labels from 31, margin from 40, and the detail line's
+marks from 11. Lane 0 is `◆ ◆ │ ├ ╰` from `aaaa` to `ptlm` and then empty;
+the reservation for `mnrv` is drawn on `aaaa`'s row as `─╮` and consumed on
+`mnrv`'s row; `ptlm` forks to lane 2 across the live lane 1, hence `┼`.
 
 The reference `config.j` defines `tree` with `detail = 1, margin = false,
 elide = false` (every commit, time-sorted), `treeCompact` with `elide = true`
