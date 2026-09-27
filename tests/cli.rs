@@ -833,6 +833,15 @@ fn replay_making_a_file_and_a_directory_of_one_path_refused() {
         let out = r.j(&[&format!("(show ({})) or \"caught\"", e)]).ok();
         assert_eq!(out.stdout.trim(), "caught");
     }
+    // jj merges `a` as one value, so the deletion of `a/z` onto a snapshot
+    // that made the directory `a` a file is refused too, where the in-memory
+    // merge goes path by path and gives the file (§7.3, §10)
+    let e = "replay [{ path = ./a, content = blob \"f\" }] \
+             ({ from = [{ path = ./a/y, content = blob \"y\" } { path = ./a/z, content = blob \"z\" }], \
+             to = [{ path = ./a/y, content = blob \"y\" }] })";
+    let out = r.j(&[&format!("show ({})", e)]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert!(out.stderr.contains(&format!("`a` {}", clash)), "{}", out.stderr);
 }
 
 #[test]

@@ -195,8 +195,8 @@ fn replay_refuses_a_path_both_a_file_and_a_directory() {
     // adding `a/b` onto a file `a` left both in the result: a snapshot that
     // the next replay (replayTree's, for a child) refused as malformed, and
     // one jj's merge makes into a single conflict at `a` whose directory
-    // side cannot be listed as entries. Both backends now crash, naming the
-    // path (§7.3, §10).
+    // side cannot be listed as entries. Replay now crashes, naming the path
+    // (§7.3, §10).
     let file = snap(vec![entry("a", "x")]);
     let dir = snap(vec![entry("a/b", "y")]);
     for (onto, to) in [(&file, &dir), (&dir, &file)] {
@@ -215,6 +215,28 @@ fn replay_refuses_a_path_both_a_file_and_a_directory() {
     assert_eq!(paths_of(&out), vec!["a/b"]);
     let out = simple_replay(&dir, &dir, &file).unwrap();
     assert_eq!(paths_of(&out), vec!["a"]);
+
+    // where a file meets a directory this merge goes path by path, and jj's
+    // takes the path as one value, so the backends may differ (§7.3, §10).
+    // The deletion of `a/z` onto a snapshot that made the directory `a` a
+    // file gives that file, where jj refuses
+    let yz = snap(vec![entry("a/y", "y"), entry("a/z", "z")]);
+    let out = simple_replay(&file, &yz, &snap(vec![entry("a/y", "y")])).unwrap();
+    assert_eq!(paths_of(&out), vec!["a"]);
+    // a file `a` made `a/b`, onto a snapshot without `a`, gives `a/b`, where
+    // jj keeps a conflict at `a` with the directory as a side
+    let out = simple_replay(&[], &file, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
+    // `a/b` added beside a conflict at `a` is refused, where jj carries the
+    // conflict with the directory as a side
+    let conflicted =
+        simple_replay(&[entry("a", "left")], &[entry("a", "base")], &[entry("a", "right")]).unwrap();
+    assert!(unresolved_at(&conflicted, "a"));
+    let e = simple_replay(&conflicted, &[], &dir).unwrap_err();
+    assert!(e.msg.contains("`a` would be a file"), "{}", e.msg);
+    // a child resolving that conflict into `a/b`, squashed into it, as on jj
+    let out = simple_replay(&dir, &conflicted, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
 }
 
 #[test]

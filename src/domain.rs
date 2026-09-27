@@ -165,8 +165,10 @@ pub fn file_and_directory<'a>(
 }
 
 /// The crash of a replay whose result would make `path` a file on one side
-/// and a directory on another: one entry cannot list the directory's
-/// entries, so both backends refuse the merge, naming the path (§7.3)
+/// and a directory on another, naming the path: one entry cannot list the
+/// directory's entries (§7.3). The jj backend merges such a path as one
+/// value and the in-memory one path by path, so they need not refuse the
+/// same merges (§10).
 pub fn file_directory_clash(path: &[String]) -> Crash {
     Crash::new(format!(
         "replay: `{}` would be a file on one side and a directory on another",
