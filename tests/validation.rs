@@ -593,6 +593,35 @@ fn config_binders_may_reuse_the_configs_own_top_level_names() {
 }
 
 #[test]
+fn a_let_binding_not_yet_evaluated_is_not_its_top_level_namesake() {
+    // §4.2: a config.j binder reusing a top-level name means the binder
+    // throughout its scope. Here `a` applies `f`, whose body needs the
+    // binding `bb`, which needs `a`: a crash, as on the command line. The
+    // lookup used to pass the block's unfilled `bb` by and find the
+    // definition, so `zz` was 1001
+    for block in [
+        "let a = f 1; f = \\x -> bb + x; bb = a in a",
+        // no value cycle, but `bb` reaches back to `a` and is not evaluated
+        // before the rest (§4.1): a crash is allowed, the definition is not
+        "let a = g 1; g = \\x -> h x; h = \\x -> bb + x; bb = c.v; c = { v = 5, back = \\y -> a } in a",
+    ] {
+        let src = format!("{}\n(+) : Int -> Int -> Int\nbb = 1000\nzz = {}\n", MINIMAL, block);
+        match eval_cfg(&src) {
+            Ok(_) => panic!("{}: config loads", block),
+            Err(e) => assert!(e.contains("unbound name `bb`"), "{}: {}", block, e),
+        }
+    }
+    // evaluated before it is used, the binding is what the name means
+    let i = eval_cfg(&format!(
+        "{}\nf = \\x -> 1000 + x\nzz = let a = f 1; f = \\x -> x in a\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    let v = i.globals.lookup("zz").expect("zz");
+    assert!(j::value::value_eq(&v, &Value::int(1)).unwrap());
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);

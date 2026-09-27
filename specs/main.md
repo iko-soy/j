@@ -377,8 +377,10 @@ enclose each of its expressions, since they are mutually recursive (§4.1), so
 exception is within `config.j`, whose binders may reuse the names of its own
 top-level definitions, as the reference config's `\files ->` and
 `\old new repo ->` do: within the binder's scope the name means the binder,
-for evaluation order (§4.1) as for lookup. Defining a top-level name twice, or
-defining a name that is also a builtin, is a configuration error.
+for evaluation order (§4.1) as for lookup, so a `let` binding used before it
+is evaluated is a crash there as anywhere, never the definition. Defining a
+top-level name twice, or defining a name that is also a builtin, is a
+configuration error.
 
 ### 4.3 Records
 

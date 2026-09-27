@@ -727,9 +727,10 @@ pub struct Frame {
 enum FrameKind {
     Small(Vec<(String, Value)>),
     Big(HashMap<String, Value>),
-    /// recursive let bindings: filled incrementally, read through the cell so
+    /// recursive let bindings: the names the block binds, and their values
+    /// in that order, filled incrementally and read through the cell so
     /// closures capturing the frame see later bindings (§4.1)
-    Rec(Rc<std::cell::RefCell<Vec<(String, Value)>>>),
+    Rec(Rc<[String]>, Rc<std::cell::RefCell<Vec<Value>>>),
 }
 
 impl Env {
@@ -755,13 +756,14 @@ impl Env {
         }
     }
 
-    /// extend with a recursive frame (for `let` blocks)
-    pub fn extend_rec(&self) -> (Env, Rc<std::cell::RefCell<Vec<(String, Value)>>>) {
-        let cell = Rc::new(std::cell::RefCell::new(Vec::new()));
+    /// extend with a recursive frame (for `let` blocks) binding `names`,
+    /// whose values are pushed to the returned cell in the same order
+    pub fn extend_rec(&self, names: Rc<[String]>) -> (Env, Rc<std::cell::RefCell<Vec<Value>>>) {
+        let cell = Rc::new(std::cell::RefCell::new(Vec::with_capacity(names.len())));
         (
             Env {
                 frame: Some(Rc::new(Frame {
-                    kind: FrameKind::Rec(cell.clone()),
+                    kind: FrameKind::Rec(names, cell.clone()),
                     parent: self.clone(),
                 })),
             },
@@ -780,11 +782,13 @@ impl Env {
                         }
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, v) in cell.borrow().iter().rev() {
-                        if n == name {
-                            return Some(v.clone());
-                        }
+                FrameKind::Rec(names, cell) => {
+                    // the frame binds its names before it holds their values:
+                    // one not evaluated yet is unbound here, not a same-named
+                    // definition further out, which config.j's binders may
+                    // reuse (§4.2)
+                    if let Some(i) = names.iter().rposition(|n| n == name) {
+                        return cell.borrow().get(i).cloned();
                     }
                 }
                 FrameKind::Big(m) => {
@@ -806,7 +810,7 @@ impl Env {
         while let Some(f) = cur {
             match &f.kind {
                 FrameKind::Small(_) => small_frames += 1,
-                FrameKind::Big(_) | FrameKind::Rec(_) => {}
+                FrameKind::Big(_) | FrameKind::Rec(..) => {}
             }
             cur = f.parent.frame.as_ref();
         }
@@ -822,8 +826,8 @@ impl Env {
                         out.insert(n.clone());
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, _) in cell.borrow().iter() {
+                FrameKind::Rec(names, _) => {
+                    for n in names.iter() {
                         out.insert(n.clone());
                     }
                 }

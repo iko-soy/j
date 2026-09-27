@@ -585,7 +585,8 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
     }
     // evaluate definitions in dependency order, through one recursive frame so
     // top-level definitions are mutually recursive (§4.1)
-    let (genv, cell) = interp.globals.extend_rec();
+    let names: Rc<[String]> = cfg.defs.iter().map(|(name, _)| name.clone()).collect();
+    let (genv, cell) = interp.globals.extend_rec(names);
     for (name, expr) in &cfg.defs {
         *interp.current_def.borrow_mut() = Some(name.clone());
         let v = interp.eval(expr, &genv)?;
@@ -598,14 +599,14 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
                 return Err(Crash::new(format!("contract: {}: {}", name, msg)));
             }
         }
-        cell.borrow_mut().push((name.clone(), v.clone()));
+        cell.borrow_mut().push(v.clone());
         // attach the definition's name and contract to its function value so
         // applications are checked (§4.13) and errors name the definition
         if let Some(ty) = cfg.sigs.get(name) {
             let contract = Rc::new(compile_contract(&interp.shapes, ty));
             let named = crate::value::attach_pending(&v, name, contract);
             let last = cell.borrow_mut().len() - 1;
-            cell.borrow_mut()[last] = (name.clone(), named);
+            cell.borrow_mut()[last] = named;
         }
     }
     interp.globals = genv;

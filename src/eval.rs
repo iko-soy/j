@@ -94,11 +94,11 @@ pub(crate) enum Cont {
     Arg(Rc<Expr>, Env, Rc<Cont>),
     Fun(Value, Rc<Cont>),
     If(Rc<Expr>, Rc<Expr>, Env, Rc<Cont>),
+    /// the bindings of a `let` block, in evaluation order, whose values so
+    /// far are in the block's frame
     LetRest {
-        names: Vec<String>,
         exprs: Vec<Rc<Expr>>,
-        acc: Vec<(String, Value)>,
-        cell: Rc<RefCell<Vec<(String, Value)>>>,
+        cell: Rc<RefCell<Vec<Value>>>,
         body: Rc<Expr>,
         env: Env,
         cont: Rc<Cont>,
@@ -742,18 +742,16 @@ impl Interp {
                     Some(order) => order,
                     None => return Run::Crash(Crash::new("let: a cycle among the bindings")),
                 };
-                let names: Vec<String> = order.iter().map(|&i| bs[i].0.clone()).collect();
+                let names: Rc<[String]> = order.iter().map(|&i| bs[i].0.clone()).collect();
                 let exprs: Vec<Rc<Expr>> = order.iter().map(|&i| bs[i].1.clone()).collect();
                 // one recursive frame shared by every binding and the body, so
                 // the block is mutually recursive (§4.1)
-                let (env2, cell) = env.extend_rec();
+                let (env2, cell) = env.extend_rec(names);
                 Run::Step(State::Eval(
                     exprs[0].clone(),
                     env2.clone(),
                     Cont::LetRest {
-                        names,
                         exprs,
-                        acc: Vec::new(),
                         cell,
                         body: body.clone(),
                         env: env2,
@@ -874,29 +872,26 @@ impl Interp {
                 ))),
             },
             Cont::LetRest {
-                names,
                 exprs,
-                mut acc,
                 cell,
                 body,
                 env,
                 cont,
             } => {
-                let idx = acc.len();
-                let pair = (names[idx].clone(), v);
-                cell.borrow_mut().push(pair.clone());
-                acc.push(pair);
-                if acc.len() == names.len() {
+                let filled = {
+                    let mut values = cell.borrow_mut();
+                    values.push(v);
+                    values.len()
+                };
+                if filled == exprs.len() {
                     Run::Step(State::Eval(body, env, (*cont).clone()))
                 } else {
-                    let next = exprs[acc.len()].clone();
+                    let next = exprs[filled].clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),
                         Cont::LetRest {
-                            names,
                             exprs,
-                            acc,
                             cell,
                             body,
                             env,
