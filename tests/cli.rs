@@ -1130,6 +1130,45 @@ fn replacing_a_file_with_a_directory_survives_persistence() {
 }
 
 #[test]
+fn editing_a_conflict_keeps_its_long_markers() {
+    // a conflict whose sides hold a 7-dash line (a markdown underline) is
+    // written with longer markers, and the working copy remembers their
+    // length. Checking out after a snapshot reset the state of every path
+    // the snapshot changed, forgetting it, and when the checkout did not
+    // rewrite the file the next run read it back with 7-character markers:
+    // the side's own `-------` broke the parse, so a conflict edited with its
+    // markers kept was recorded as resolved, markers and all (§7.3, §7.4)
+    let r = setup();
+    r.write("README.md", "Intro\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("README.md", "Intro\n\nUsage\n-------\nA text\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["prev"]).ok();
+    r.j(&["new"]).ok();
+    r.write("README.md", "Intro\n\nInstall\n-------\nB text\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["rebase (matching (\\c -> c.message == \"A\") all)"]).ok();
+    let text = r.read("README.md");
+    assert!(text.contains("\n<<<<<<<<<<< "), "not written with long markers:\n{}", text);
+    let conflicted = "\\r -> show (conflicted r.root.files)";
+    // a persisting run that leaves the edited file as the snapshot read it
+    r.write("README.md", &text.replace("B text\n", "B text, edited\n"));
+    r.j(&["describe \"B edited\""]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"README.md\"]]");
+    r.j(&["id"]).ok();
+    let content = "\\r -> show (contentAt [\"README.md\"] r.root.files)";
+    let stored = r.j(&[content]).ok().stdout;
+    assert!(stored.contains("unresolved") && stored.contains("B text, edited"), "{}", stored);
+    // one that moves the focus to a child with the same files
+    r.write("README.md", &text.replace("B text\n", "B text, edited twice\n"));
+    r.j(&["new"]).ok();
+    let status = r.j(&["\\r -> show [(status r).changed (status r).conflicts]"]).ok().stdout;
+    assert_eq!(status.trim(), "[[] [[\"README.md\"]]]");
+    assert!(r.read("README.md").contains("B text, edited twice\n"));
+}
+
+#[test]
 fn replay_carries_conflicts_through() {
     // replay unwrapped each input tree's ids as resolved, so every rebase,
     // squash or abandon that replayed a snapshot holding a conflict panicked

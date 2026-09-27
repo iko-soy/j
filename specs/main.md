@@ -848,6 +848,10 @@ directory.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
+  A later snapshot reads such a file back as the conflict its markers
+  describe, edits included, while they parse at the length they were written
+  with (longer than 7 when a side holds a marker-like line); once they do
+  not, the file is resolved to its text.
 
 Reserved commands never snapshot.
 

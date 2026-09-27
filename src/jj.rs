@@ -262,7 +262,8 @@ pub struct JjInner {
     /// persist so the snapshot and the expression's edits form one jj
     /// operation (§1.2); dropped uncommitted by printing runs. The
     /// working-copy lock is not held: its saved state is still the tree
-    /// recorded before the snapshot until `persist`'s checkout resets it
+    /// recorded before the snapshot until `persist`'s checkout scans the
+    /// directory again
     pending: Mutex<Option<PendingSnapshot>>,
     /// whether the workspace's filesystem folds case, probed on first use
     /// (`Backend::folds_case`)
@@ -282,6 +283,20 @@ struct PendingSnapshot {
     /// false when the wc commit is immutable: the snapshot then belongs to
     /// the focus's new child (§7.2), and the wc commit is kept as stored
     fold_into_wc: bool,
+}
+
+/// How every scan of the working directory reads it (§7.4): each file
+/// not ignored by the directory's own `.gitignore`s is tracked, whatever
+/// its size. `persist`'s checkout rescans with the same options and
+/// relies on getting the snapshot's tree back.
+fn snapshot_options() -> SnapshotOptions<'static> {
+    SnapshotOptions {
+        base_ignores: GitIgnoreFile::empty(),
+        progress: None,
+        start_tracking_matcher: &EverythingMatcher,
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size: u64::MAX,
+    }
 }
 
 #[derive(Clone)]
@@ -514,13 +529,7 @@ impl JjBackend {
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
-            progress: None,
-            start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &NothingMatcher,
-            max_new_file_size: u64::MAX,
-        };
+        let options = snapshot_options();
         let (new_tree, _stats) = locked_ws
             .locked_wc()
             .snapshot(&options)
@@ -571,8 +580,8 @@ impl JjBackend {
         // tree. The next run's incremental snapshot would then find nothing
         // to do and build the Repo from the stale tree — and a persisting run
         // would check that stale tree back out, destroying the edits. The
-        // state is advanced only by `persist`'s checkout, which first resets
-        // it to this snapshot and finishes against the operation that
+        // state is advanced only by `persist`'s checkout, which first scans
+        // the directory again and finishes against the operation that
         // actually recorded the tree (§7.4/§7.7).
         drop(locked_ws);
         let _ = op_id;
@@ -834,15 +843,30 @@ impl JjBackend {
         // one: a path whose recorded content equals the focus's would keep
         // the user's edit, a file created since would stay, and a file
         // replaced by a directory (or back) would leave state contradicting
-        // the tree. Reset the state to the snapshot first (it writes no file;
-        // the paths it changes are re-read by the next snapshot), so the
-        // checkout diffs from what is actually on disk (§7.4).
+        // the tree. Scan the directory again first, as `snapshot_repo` did,
+        // so the checkout diffs from what is actually on disk (§7.4). A scan
+        // keeps what the state knows of each file where a reset to the
+        // snapshot's tree would forget it: a conflict whose sides hold
+        // marker-like lines is materialized with longer markers, and a
+        // forgotten length makes the next snapshot read those markers back
+        // at 7 characters, fail to parse them and record the edited conflict
+        // as resolved text, markers and all (§7.4).
         if let Some(snapshot) = snapshot {
-            locked_ws
+            let (scanned, _stats) = locked_ws
                 .locked_wc()
-                .reset(snapshot)
+                .snapshot(&snapshot_options())
                 .await
-                .map_err(|e| Crash::new(format!("cannot record the snapshot: {}", e)))?;
+                .map_err(|e| Crash::new(format!("cannot snapshot the working copy: {}", e)))?;
+            if scanned.tree_ids() != snapshot.tree().tree_ids() {
+                // the directory changed while the expression ran: describe
+                // the snapshot that was recorded instead (a reset writes no
+                // file; the paths it changes are re-read by the next run)
+                locked_ws
+                    .locked_wc()
+                    .reset(snapshot)
+                    .await
+                    .map_err(|e| Crash::new(format!("cannot record the snapshot: {}", e)))?;
+            }
         }
         locked_ws
             .locked_wc()
@@ -1247,13 +1271,7 @@ impl JjBackend {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
-            progress: None,
-            start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &NothingMatcher,
-            max_new_file_size: u64::MAX,
-        };
+        let options = snapshot_options();
         let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
         let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
