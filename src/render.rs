@@ -403,9 +403,10 @@ const SIZE_BAR_TOP: usize = 1000;
 /// so, as git's xdiff does, it counts as changed up front, and the rest is
 /// searched unless `reorder_bound` already puts it past the cap. On most
 /// content a diagonal soon stops at a line that differs; a long file of a
-/// few lines repeating, with a change just under the cap, pays a pass for
-/// many of them: a million lines of two alternating, with 480 pairs of
-/// neighbours swapped, take some 5 × 10⁸ comparisons.
+/// few lines repeating pays a pass for many of them when the bounds cannot
+/// settle the change: one just under the cap, or one that leaves how many
+/// times each line occurs as it was. A million lines of two alternating,
+/// with 480 pairs of neighbours swapped, take some 5 × 10⁸ comparisons.
 fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
     use std::collections::HashMap;
     // the rounds of the first, short search
@@ -507,11 +508,13 @@ fn edit_distance<T: PartialEq>(a: &[T], b: &[T], max: usize) -> usize {
 
 /// A lower bound on the lines deleted plus inserted by any diff of `a` to
 /// `b` (lines numbered below `ids`), cheap where the search is dearest: a
-/// long file whose lines were reordered. A line that occurs once on each
-/// side can only be kept by pairing those two, and the pairs kept keep their
-/// order on both sides, so at most the longest sequence of them in the same
-/// order on both sides is kept (patience sorting finds its length); every
-/// other line kept pairs up lines of `a` and `b` that are not such lines.
+/// long file whose lines were reordered, or one of a few lines repeating
+/// that now occur a different number of times. A line that occurs once on
+/// each side can only be kept by pairing those two, and the pairs kept keep
+/// their order on both sides, so at most the longest sequence of them in the
+/// same order on both sides is kept (patience sorting finds its length); any
+/// other line is kept at most as many times as it occurs on the side where
+/// it occurs fewer times.
 fn reorder_bound(a: &[usize], b: &[usize], ids: usize) -> usize {
     // per line: its occurrences in `a` and in `b`, and where it is in `a`
     let mut seen = vec![(0usize, 0usize, 0usize); ids];
@@ -526,10 +529,8 @@ fn reorder_bound(a: &[usize], b: &[usize], ids: usize) -> usize {
     // `a`: `ends[i]` is the least last place of an increasing sequence of
     // `i + 1` of them
     let mut ends: Vec<usize> = Vec::new();
-    let mut once = 0;
     for l in b {
         if let (1, 1, i) = seen[*l] {
-            once += 1;
             let at = ends.partition_point(|e| *e < i);
             if at == ends.len() {
                 ends.push(i);
@@ -538,7 +539,12 @@ fn reorder_bound(a: &[usize], b: &[usize], ids: usize) -> usize {
             }
         }
     }
-    let kept = ends.len() + (a.len().min(b.len()) - once);
+    let others: usize = seen
+        .iter()
+        .filter(|(in_a, in_b, _)| (*in_a, *in_b) != (1, 1))
+        .map(|(in_a, in_b, _)| in_a.min(in_b))
+        .sum();
+    let kept = ends.len() + others;
     a.len() + b.len() - 2 * kept
 }
 
@@ -2924,18 +2930,23 @@ mod tests {
     fn changed_lines_is_exact_up_to_its_cap() {
         // the size bar is drawn from this count (§7.11 column 5), and no
         // shortcut may change it, whatever the machine or the content.
-        // A few lines repeating, disjoint adjacent pairs of them swapped (two
-        // lines each): no line occurs once on either side, and every diagonal
-        // the period divides runs along equal lines from one swap to the next
+        // A few lines repeating, disjoint adjacent pairs of them swapped, or
+        // one of each pair replaced by the other (two lines each): no line
+        // occurs once on either side, and every diagonal the period divides
+        // runs along equal lines from one change to the next. Replacing
+        // changes how many times each line occurs; swapping does not
         for period in [2, 3] {
-            let lines: Vec<String> = (0..4000).map(|i| format!("l{}\n", i % period)).collect();
-            for swaps in [1, 33, 499, 501] {
-                let mut swapped = lines.clone();
-                let step = 3990 / swaps;
-                for k in 0..swaps {
-                    swapped.swap(3 + step * k, 4 + step * k);
+            let lines: Vec<String> = (0..3000).map(|i| format!("l{}\n", i % period)).collect();
+            for changes in [1, 33, 499, 501] {
+                let (mut swapped, mut replaced) = (lines.clone(), lines.clone());
+                let step = 2990 / changes;
+                for k in 0..changes {
+                    let at = 3 + step * k;
+                    swapped.swap(at, at + 1);
+                    replaced[at] = lines[at + 1].clone();
                 }
                 check(&lines, &swapped, None);
+                check(&lines, &replaced, None);
             }
         }
         // runs of one line swapped: a shortest diff keeps the longer run
