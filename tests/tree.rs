@@ -1412,6 +1412,59 @@ fn the_worked_example_ends_lane_0_at_ptlm_on_fewer_lanes() {
     }
 }
 
+#[test]
+fn a_run_count_never_covers_a_rail() {
+    // the count was written from the character after the run's `╎`, over
+    // whatever lay there: a trunk run below a commit whose side children
+    // are newer than the run lost their reserved rails on its row. A dry
+    // run's `new` on an older trunk commit draws one, as minted commits
+    // come last.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let ids = ["kaaaaaaa", "kbbbbbbb", "kccccccc", "kddddddd", "keeeeeee", "kfffffff", "kggggggg"];
+    let trunk: Vec<Value> = ids
+        .iter()
+        .map(|id| own_commit(id, "", if *id == "kggggggg" { &["main"] } else { &[] }))
+        .collect();
+    let s = own_commit("ksssssss", "side", &[]);
+    let u = own_commit("kuuuuuuu", "later", &[]);
+    let w = own_commit("kwwwwwww", "wip", &[]);
+    let mut metas: Vec<(String, MetaInfo)> = vec![meta(ROOT_ID, "R", 1)];
+    for (k, id) in ids.iter().enumerate() {
+        metas.push(meta(id, "A", t - 100 + 10 * k as i64));
+    }
+    metas.push(meta("kwwwwwww", "A", t - 20));
+    metas.push(meta("ksssssss", "A", t - 10));
+    metas.push(meta("kuuuuuuu", "A", t - 5));
+    // a → b → c → d → e → f → g (main) → wip, and c's side children `side`
+    // and `later`: two runs, a–b and d–f, and c reserves lanes for both
+    let mut chain = subtree(trunk[6].clone(), vec![subtree(w, vec![])]);
+    for k in (3..6).rev() {
+        chain = subtree(trunk[k].clone(), vec![chain]);
+    }
+    chain = subtree(trunk[2].clone(), vec![chain, subtree(s, vec![]), subtree(u, vec![])]);
+    for k in (0..2).rev() {
+        chain = subtree(trunk[k].clone(), vec![chain]);
+    }
+    let repo = repo_of(root, vec![chain], None);
+    // the d–f run passes lanes 1 and 2 (lane 1 only at lanes = 2, where
+    // `later` overflows); its count follows the rightmost of them
+    for (lanes, run) in [(2, "  ╎ │ 3"), (3, "  ╎ │ │ 3"), (4, "  ╎ │ │ 3")] {
+        let (mut i, cfg) = make_interp(backend_with(metas.clone()));
+        let src = format!(
+            "treeWith ({{ detail = 0, margin = false, elide = true, icons = false, color = \"never\", lanes = {}, author = false, date = false, files = false }}) . by @kwww",
+            lanes
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "  ╎ 2", "lanes {}\n{}", lanes, text);
+        assert_eq!(lines[2], run, "lanes {}\n{}", lanes, text);
+        // the id column is where it is without the count
+        let id = col_of(row_of(&text, "@kggg"), "@kggg");
+        assert_eq!(id, 2 + 2 * lanes + 1, "lanes {}\n{}", lanes, text);
+    }
+}
+
 
 // ----------------------------------------------------------------------
 // terminal-width truncation (§Step 4). Only a tty has a width in the

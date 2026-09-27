@@ -193,9 +193,11 @@ and the margin keep their columns; otherwise nothing is cut.
 Character `2i+1` is `─` if it lies inside a horizontal segment (from a fork
 source to its target, or from a node to its rightmost reservation), else a
 space. On a run row the count follows the `╎`, written into the rails area
-and, if needed, into the empty id column. The count is never cut: what does
-not fit the rails area runs on, unbroken, through the space after it into the
-id column, which is widened if it cannot hold the rest.
+and, if needed, into the empty id column; when lanes to the right of the run
+hold rails, it follows the rightmost of them instead, so that it covers no
+rail. The count is never cut: what does not fit the rails area runs on,
+unbroken, through the space after it into the id column, which is widened if
+it cannot hold the rest.
 
 **Detail line** (`detail = 2`, focus only): one extra row directly under the
 focus. Its rails show `│` in every lane that holds a rail below the focus row

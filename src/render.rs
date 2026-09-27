@@ -2154,15 +2154,17 @@ fn draw_rows(
     term_w: Option<usize>,
 ) -> Result<String, Crash> {
     let rail_chars = 2 * lanes_n;
+    // each row's rails, drawn once; a run row's go on past the rails area
+    // when its count does not fit
+    let rails: Vec<(Vec<char>, Vec<bool>)> = (0..rows.len())
+        .map(|idx| rail_row(rows, placements, idx, lanes_n, opts))
+        .collect();
     // id column width: 4-char min prefix plus the `@` literal prefix, and
-    // what a run count past the rails area writes into it: ` n` is written
-    // from character 2l+1 and runs on through the space after the rails
+    // what a run count writes into it past the rails area and the space
+    // after it
     let mut id_w = 5usize;
-    for (idx, n) in rows.iter().enumerate() {
-        if let (Display::Run { count, .. }, Some(l)) = (n, placements[idx].lane) {
-            let end = 2 * l + 2 + count.to_string().len();
-            id_w = id_w.max(end.saturating_sub(rail_chars + 1));
-        }
+    for (chars, _) in &rails {
+        id_w = id_w.max(chars.len().saturating_sub(rail_chars + 1));
     }
     for n in rows {
         if let Some(c) = n.commit() {
@@ -2186,7 +2188,7 @@ fn draw_rows(
     for (idx, n) in rows.iter().enumerate() {
         let pl = &placements[idx];
         let t = &texts[idx];
-        let (chars, lane0) = rail_row(rows, placements, idx, lanes_n, opts);
+        let (chars, lane0) = &rails[idx];
         let mut line = String::new();
         line.push_str(&t.gutter);
         // the node glyph (on a commit row) is meaning-coloured; rails lane-coloured
@@ -2194,7 +2196,7 @@ fn draw_rows(
             (Display::Commit { info, .. }, Some(l)) => Some((2 * l, glyph_ansi(info))),
             _ => None,
         };
-        line.push_str(&color_rails(&chars, &lane0, pal, glyph));
+        line.push_str(&color_rails(chars, lane0, pal, glyph));
         line.push(' ');
         line.push_str(&t.id);
         if bar_col {
@@ -2581,11 +2583,15 @@ fn rail_row(
         chars[2 * i] = c;
         lane0[2 * i] = i == 0;
     }
-    // on a run row the count follows ╎, written into the rails area and, if
-    // needed, on through the space after it into the blank id column
+    // on a run row the count follows ╎, or the rightmost rail drawn right of
+    // it, so that it covers none; it is written into the rails area and, if
+    // needed, on through the space after it into the blank id column. A run
+    // reserves no lane and any fork on its row comes from its left, so the
+    // rightmost character drawn so far is ╎ or such a rail.
     if let (Display::Run { count, .. }, Some(l)) = (n, pl.lane) {
+        let from = chars.iter().rposition(|&c| c != ' ').unwrap_or(2 * l) + 1;
         for (k, d) in format!(" {}", count).chars().enumerate() {
-            let pos = 2 * l + 1 + k;
+            let pos = from + k;
             if pos == chars.len() {
                 chars.push(d);
                 lane0.push(l == 0);
