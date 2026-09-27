@@ -516,9 +516,9 @@ fn push_of_an_empty_list_pushes_nothing() {
 #[test]
 fn push_refuses_moving_an_immutable_bookmark() {
     // §7.6: a bookmark whose current target is immutable may only move to a
-    // descendant of that target, and may not be deleted. Nothing checked
-    // this: pushes rewound master to its parent, moved it onto a side line,
-    // and deleted a bookmark on master's history, all with exit 0
+    // descendant of that target, and may not be deleted while no bookmark
+    // left on origin reaches that target. Nothing checked this: pushes
+    // rewound master to its parent and moved it onto a side line with exit 0
     let env = setup();
     let seed = env.dir.join("seed");
     git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
@@ -545,9 +545,11 @@ fn push_refuses_moving_an_immutable_bookmark() {
     assert_eq!(out.code, 1, "moved master sideways");
     assert!(out.stderr.contains("immutable"), "{}", out.stderr);
     assert_eq!(refs(), before);
-    // deleted
-    let out = env.j(&dest, &["push (unlabel \"old\")"]);
-    assert_eq!(out.code, 1, "deleted an immutable bookmark");
+    // deleted while no other bookmark reaches its commit: `old` is on the
+    // parent (deletes another bookmark reaches are allowed:
+    // push_deletes_an_immutable_bookmark_another_one_reaches)
+    let out = env.j(&dest, &["push (unlabel \"master\")"]);
+    assert_eq!(out.code, 1, "deleted the only bookmark on an immutable commit");
     assert!(out.stderr.contains("immutable"), "{}", out.stderr);
     assert_eq!(refs(), before);
 
@@ -558,6 +560,75 @@ fn push_refuses_moving_an_immutable_bookmark() {
     let master = git(&env.remote, &["rev-parse", "master"]);
     assert_eq!(git(&env.remote, &["rev-parse", "old"]), master);
     assert_eq!(git(&env.remote, &["rev-parse", "side"]), master);
+
+    // each of the three names on "two" is reached by the other two, but a
+    // bookmark the push deletes reaches nothing after it: deleting all three
+    // at once is refused, and none of them is deleted
+    let before = refs();
+    let out = env.j(&dest, &["push (unlabel \"master\" ++ unlabel \"old\" ++ unlabel \"side\")"]);
+    assert_eq!(out.code, 1, "deleted every bookmark on an immutable commit");
+    assert!(out.stderr.contains("immutable"), "{}", out.stderr);
+    assert_eq!(refs(), before);
+}
+
+#[test]
+fn push_deletes_an_immutable_bookmark_another_one_reaches() {
+    // §7.6: a delete of a bookmark on an immutable commit is refused only
+    // while no bookmark left on origin after the push reaches that commit.
+    // Every such delete was refused, so config.j's `unlabel "feature"` after
+    // the merge failed whenever the merge kept feature's commit (a
+    // fast-forward or a merge commit), and a name ever put on trunk could
+    // never be deleted or renamed
+    let env = setup();
+    let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+
+    // `feature`, merged by fast-forwarding master onto it
+    std::fs::write(dest.join("f.txt"), "feat\n").unwrap();
+    env.j(&dest, &["describe \"feat\""]).ok();
+    env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    env.j(&dest, &["push (label \"master\" (labelled \"feature\"))"]).ok();
+    let out = env.j(&dest, &["push (unlabel \"feature\")"]);
+    assert_eq!(out.code, 0, "fast-forwarded feature: {}", out.stderr);
+
+    // `side`, merged on the remote with a merge commit
+    env.j(&dest, &["new . goto trunk"]).ok();
+    std::fs::write(dest.join("s.txt"), "side\n").unwrap();
+    env.j(&dest, &["describe \"side\""]).ok();
+    env.j(&dest, &["push (label \"side\" here)"]).ok();
+    let work = env.dir.join("work");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), work.to_str().unwrap()]);
+    git(&work, &["checkout", "-q", "master"]);
+    git(
+        &work,
+        &["-c", "user.email=t@t", "-c", "user.name=T", "merge", "-q", "--no-ff", "origin/side", "-m", "merge side"],
+    );
+    git(&work, &["push", "-q", "origin", "master"]);
+    env.j(&dest, &["fetch"]).ok();
+    let out = env.j(&dest, &["push (unlabel \"side\")"]);
+    assert_eq!(out.code, 0, "side merged with a merge commit: {}", out.stderr);
+
+    // a second name on trunk's commit, renamed and deleted
+    env.j(&dest, &["push (label \"x\" trunk)"]).ok();
+    let out = env.j(&dest, &["push (rename \"x\" \"y\")"]);
+    assert_eq!(out.code, 0, "renamed an alias of master: {}", out.stderr);
+    let out = env.j(&dest, &["push (unlabel \"y\")"]);
+    assert_eq!(out.code, 0, "deleted an alias of master: {}", out.stderr);
+    let merge = git(&env.remote, &["rev-parse", "master"]);
+    assert_eq!(refs(), format!("refs/heads/master {}", merge));
+
+    // master itself: deleting it leaves nothing reaching the merge, but a
+    // bookmark the same push creates there does (the remote's default
+    // branch becomes `main` first, so git would delete master)
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let out = env.j(&dest, &["push (unlabel \"master\")"]);
+    assert_eq!(out.code, 1, "deleted the only bookmark on trunk");
+    assert!(out.stderr.contains("immutable"), "{}", out.stderr);
+    assert_eq!(refs(), format!("refs/heads/master {}", merge));
+    let out = env.j(&dest, &["push (rename \"master\" \"main\")"]);
+    assert_eq!(out.code, 0, "renamed master: {}", out.stderr);
+    assert_eq!(refs(), format!("refs/heads/main {}", merge));
 }
 
 #[test]

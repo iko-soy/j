@@ -1875,8 +1875,9 @@ fn parse_push_records(
 }
 
 /// §7.6: refuse to move a bookmark whose current target is immutable to a
-/// commit that does not descend from that target, or to delete it; and
-/// refuse to send commits with unresolved files or empty descriptions
+/// commit that does not descend from that target, or to delete it while no
+/// bookmark left on `origin` after the push reaches that target; and refuse
+/// to send commits with unresolved files or empty descriptions
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
     repo: &Arc<ReadonlyRepo>,
@@ -1885,6 +1886,10 @@ fn check_push_records(
 ) -> Result<(), OpenError> {
     let store = repo.store().clone();
     let origin = RemoteName::new("origin");
+    // the targets of the bookmarks on `origin` after the push: those no
+    // record names, where they are as of the last fetch or push, and the
+    // records' new ones; computed for the first delete that needs them
+    let mut left_on_origin: Option<Vec<CommitId>> = None;
     for (name, target) in records {
         let Some(current) = repo
             .view()
@@ -1909,13 +1914,32 @@ fn check_push_records(
         }
         match target {
             None => {
-                return Err((
-                    1,
-                    format!(
-                        "push: `{}` is on the immutable commit `@{}` and cannot be deleted",
-                        name, change_id
-                    ),
-                ))
+                // a delete loses no history while another bookmark still
+                // reaches the commit: a merged feature, a second name
+                let heads = left_on_origin.get_or_insert_with(|| {
+                    let named: BTreeSet<&str> = records.iter().map(|(n, _)| n.as_str()).collect();
+                    repo.view()
+                        .remote_bookmarks(origin)
+                        .filter(|(n, _)| !named.contains(n.as_str()))
+                        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+                        .chain(records.iter().filter_map(|(_, t)| t.as_ref()))
+                        .cloned()
+                        .collect()
+                });
+                let unreached = ResolvedRevsetExpression::commits(vec![current.clone()])
+                    .intersection(&ResolvedRevsetExpression::commits(heads.clone()).ancestors())
+                    .evaluate(repo.as_ref())
+                    .and_then(|r| r.is_empty())
+                    .map_err(|e| (2, format!("cannot read the index: {}", e)))?;
+                if unreached {
+                    return Err((
+                        1,
+                        format!(
+                            "push: `{}` is on the immutable commit `@{}` and cannot be deleted while no bookmark left on origin reaches it",
+                            name, change_id
+                        ),
+                    ));
+                }
             }
             Some(new) => {
                 let descends = block_on(repo.index().is_ancestor(&current, new))

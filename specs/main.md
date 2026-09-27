@@ -947,13 +947,17 @@ language: `fetch` and `push` are the only things that change them.
     `fetch` or `push`; a delete sends none);
   - the bookmark's current target is in the immutable set (§7.5) and the
     record would move it to a commit that does not descend from it, or delete
-    it.
+    it while no bookmark left on `origin` after the push reaches that target
+    (those left are the bookmarks no record names, where they are as of the
+    last `fetch` or `push`, and the records' new targets).
 
   Targets and descent are commits as the remote has them: a target rewritten
   here since the last `fetch` or `push` is hidden, and not in the immutable
   set although the visible rewrite carries its change id and its label.
   Moving a bookmark whose current target is not immutable to an unrelated
-  commit is allowed; that is how a rewritten stack is re-pushed. After a
+  commit is allowed; that is how a rewritten stack is re-pushed. Deleting a
+  bookmark on an immutable commit that another bookmark still reaches loses
+  no history; that is how a merged feature's name is removed. After a
   successful push the labels reflect the new positions. It records one
   operation. An empty list sends nothing to the remote. If the remote
   accepts some of the updates and rejects others, that operation records the
