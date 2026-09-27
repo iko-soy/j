@@ -1239,6 +1239,91 @@ fn conflict_between_a_file_and_a_directory_resolved_in_a_child_squashes() {
 }
 
 #[test]
+fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
+    // the mirror of the test above: a conflict inside the directory `a`,
+    // resolved in a child by replacing `a` with a file. jj's scan keeps the
+    // directory's sides at `a` where a file is found there, and drops only
+    // the entries below it, so the file reached no tree: a debug build
+    // failed an assertion on every run that scanned (exit 101, `undo`
+    // included), and a release build recorded the child without `a` (§7.4)
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let paths = "\\r -> show (map (.path) (files r))";
+    let onto_l = "rebase (matching (\\c -> c.message == \"L\") all)";
+    // R, rebased onto its sibling L, conflicted at `path`
+    let conflict_at = |path: &str, beside: &[&str]| {
+        let r = setup();
+        let write = |content: &str| {
+            std::fs::create_dir_all(r.dir.join(path).parent().unwrap()).unwrap();
+            r.write(path, content);
+        };
+        write("base\n");
+        for p in beside {
+            r.write(p, "beside\n");
+        }
+        r.j(&["describe \"P\""]).ok();
+        r.j(&["new"]).ok();
+        write("left\n");
+        r.j(&["describe \"L\""]).ok();
+        r.j(&["new . goto parents"]).ok();
+        write("right\n");
+        r.j(&["describe \"R\""]).ok();
+        r.j(&[onto_l]).ok();
+        r.j(&["new"]).ok();
+        r
+    };
+
+    let r = conflict_at("a/b", &[]);
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
+    // a checkout that writes the file `a` over the conflicted directory
+    // and then fails is put back, which scans the file over that directory
+    let ops = r.j(&["ops"]).ok().stdout;
+    let edit = format!(
+        "\\r -> mapRoot (\\c -> c {{ files = [({{ path = ./a, content = blob \"f\" }}) \
+         ({{ path = [{}], content = blob \"deep\" }})] }}) r",
+        too_deep("d")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert!(r.read("a/b").contains("<<<<<<<"), "{}", r.read("a/b"));
+    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+    std::fs::remove_dir_all(r.dir.join("a")).unwrap();
+    r.write("a", "file\n");
+    // `undo` scans to refuse a working directory not recorded
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("working copy has changes not in @"), "{}", out.stderr);
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\"]]");
+    r.j(&["describe \"C\""]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    let content = "\\r -> show (contentAt [\"a\"] (files r))";
+    assert_eq!(r.j(&[content]).ok().stdout.trim(), "blob \"file\\n\"");
+    // R keeps its conflict; the child resolves it
+    let parent = "\\r -> show (conflicted (files (up r)))";
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
+    for m in ["everything", "(under ./a)"] {
+        let law = format!("\\r -> remove ((abandon . contract {m} . split {m}) r) == r");
+        assert_eq!(r.j(&[&law]).ok().stdout.trim(), "true", "{}", m);
+    }
+    r.j(&["tree . validate . squash"]).ok();
+    r.j(&["squash"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\"]]");
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[]");
+    assert_eq!(r.read("a"), "file\n");
+
+    // deeper down, beside a file the directory keeps
+    let r = conflict_at("a/x/b", &["a/c"]);
+    std::fs::remove_dir_all(r.dir.join("a/x")).unwrap();
+    r.write("a/x", "file\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\" \"c\"] [\"a\" \"x\"]]");
+    assert_eq!(r.read("a/x"), "file\n");
+}
+
+#[test]
 fn edit_applied_to_an_edit_is_a_contract_crash() {
     // `new new` gives `new` a function where its signature wants a Repo: a
     // contract crash (§4.13), so nothing is persisted (§1.2). It used to

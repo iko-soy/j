@@ -13,7 +13,7 @@ use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::{EverythingMatcher, FilesMatcher, NothingMatcher};
+use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::{MergedTree, TreeDiffEntry};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
@@ -304,6 +304,81 @@ fn snapshot_options() -> SnapshotOptions<'static> {
     }
 }
 
+/// Scan the working directory with `options`, as `wc.snapshot` does, where
+/// `base` is the tree the working copy's state records; return the tree
+/// scanned. jj's scan loses a file found where `base` has a directory
+/// holding a conflict: it takes the directory's differing sides for a
+/// conflict it cannot write a file into and keeps them at the path, while
+/// it removes the entries below, so the file reaches no tree (and a debug
+/// build fails an assertion). Such a file is first left untracked, which
+/// scans it as if it had been moved away and records the directory's
+/// removal; a second scan then records the file where nothing is, as a
+/// later run would once it was put back (§7.4).
+async fn scan(
+    wc: &mut dyn LockedWorkingCopy,
+    root: &std::path::Path,
+    base: &MergedTree,
+    options: &SnapshotOptions<'_>,
+) -> Result<MergedTree, String> {
+    let files = files_over_conflicts(root, base)?;
+    if !files.is_empty() {
+        let untracked = FilesMatcher::new(&files);
+        let start = DifferenceMatcher::new(options.start_tracking_matcher, &untracked);
+        let first = SnapshotOptions { start_tracking_matcher: &start, ..options.clone() };
+        let (removed, _stats) = wc.snapshot(&first).await.map_err(|e| e.to_string())?;
+        // a state that agrees with its tree tracks every entry below the
+        // directory, so none is left; were a conflict left below, the
+        // second scan would lose the file after all
+        if let Some(path) = files_over_conflicts(root, &removed)?.first() {
+            return Err(format!(
+                "cannot record the file `{}` in place of a directory holding a conflict",
+                path.as_internal_file_string()
+            ));
+        }
+    }
+    let (scanned, _stats) = wc.snapshot(options).await.map_err(|e| e.to_string())?;
+    Ok(scanned)
+}
+
+/// The paths where the working directory holds a regular file and `tree`
+/// a directory holding a conflict, that is one above a conflicted path: a
+/// directory's sides differ exactly when a conflict is below it, as jj
+/// writes no tree whose sides differ where every path resolves. Nothing is
+/// looked at when `tree` is resolved, and each directory above a conflict
+/// at most once, with one `lstat`.
+fn files_over_conflicts(
+    root: &std::path::Path,
+    tree: &MergedTree,
+) -> Result<Vec<RepoPathBuf>, String> {
+    let mut files = Vec::new();
+    // whether each directory looked at so far is one on disk
+    let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
+    for (path, value) in tree.conflicts() {
+        value.map_err(|e| e.to_string())?;
+        let parent = path.parent().expect("a conflicted path has a parent");
+        let above: Vec<&RepoPath> = parent.ancestors().take_while(|d| !d.is_root()).collect();
+        // from the top down, stopping at the first that is not a directory
+        for dir in above.into_iter().rev() {
+            let is_dir = match dirs.get(dir) {
+                Some(&is_dir) => is_dir,
+                None => {
+                    let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+                    if meta.as_ref().is_some_and(|m| m.is_file()) {
+                        files.push(dir.to_owned());
+                    }
+                    let is_dir = meta.is_some_and(|m| m.is_dir());
+                    dirs.insert(dir.to_owned(), is_dir);
+                    is_dir
+                }
+            };
+            if !is_dir {
+                break;
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// What the working directory holds along a checkout's footprint, the
 /// paths whose value differs between the tree it holds and the focus,
 /// recorded before the checkout runs so that one failing part way can be
@@ -411,7 +486,8 @@ async fn put_back(
         force_tracking_matcher: &matcher,
         ..snapshot_options()
     };
-    let (scanned, _stats) = wc.snapshot(&options).await.map_err(|e| e.to_string())?;
+    // the state records `on_disk`, which the checkout's own scan found
+    let scanned = scan(wc, root, &on_disk.tree(), &options).await?;
     let mut builder = MergedTreeBuilder::new(scanned);
     for (path, before) in paths {
         builder.set_or_remove(path, before);
@@ -693,16 +769,15 @@ impl JjBackend {
     ) -> Result<(Arc<ReadonlyRepo>, Option<PendingSnapshot>), OpenError> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let loader = ws_guard.repo_loader().clone();
+        let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = snapshot_options();
-        let (new_tree, _stats) = locked_ws
-            .locked_wc()
-            .snapshot(&options)
+        let old_tree = locked_ws.locked_wc().old_tree().clone();
+        let new_tree = scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options())
             .await
             .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
-        let changed = new_tree.tree_ids() != locked_ws.locked_wc().old_tree().tree_ids();
+        let changed = new_tree.tree_ids() != old_tree.tree_ids();
         if !changed {
             locked_ws
                 .finish(self.current_repo().operation().id().clone())
@@ -1045,8 +1120,9 @@ impl JjBackend {
         // checkout's footprint is recorded first, as only that is put back.
         let mut footprint = Err("it changed while the program ran".to_string());
         if let Some(on_disk) = on_disk {
-            match locked_ws.locked_wc().snapshot(&snapshot_options()).await {
-                Ok((scanned, _stats)) if scanned.tree_ids() == on_disk.tree().tree_ids() => {
+            let old_tree = locked_ws.locked_wc().old_tree().clone();
+            match scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()).await {
+                Ok(scanned) if scanned.tree_ids() == on_disk.tree().tree_ids() => {
                     footprint = Footprint::of(&root, &on_disk.tree(), &commit.tree()).await;
                 }
                 // the directory changed while the program ran, or can no
@@ -1544,10 +1620,11 @@ impl JjBackend {
         // snapshot the working directory (without persisting anything) and
         // compare against the focused commit's files (§7.7)
         let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = snapshot_options();
-        let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
+        let old_tree = locked_ws.locked_wc().old_tree().clone();
+        let new_tree = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
         let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
         if same {
