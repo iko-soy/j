@@ -170,6 +170,53 @@ fn init_over_git_records_the_heads_files() {
 }
 
 #[test]
+fn init_and_clone_are_not_undone() {
+    // §7.7: before `init` or `clone` there was no repository, so the
+    // operation each records is not undone. Undoing it restored jj's view
+    // from before, whose working-copy commit is an empty child of the root,
+    // and checking that out deleted every file of the head: right after the
+    // command, or once everything run since had been undone. An orphan HEAD
+    // keeps the working-copy commit jj created, and the refs init imports
+    // were an operation of their own, which undo took back.
+    let env = setup();
+    let ops = |dir: &PathBuf| env.j(dir, &["ops"]).ok().stdout.lines().count();
+    let refused = |dir: &PathBuf| {
+        let n = ops(dir);
+        let out = env.j(dir, &["undo"]);
+        assert_eq!(out.code, 1, "undo was recorded: {}", out.stderr);
+        assert!(out.stderr.contains("nothing to undo"), "{}", out.stderr);
+        assert_eq!(ops(dir), n);
+    };
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    env.j(&dir, &["init"]).ok();
+    refused(&dir);
+    env.j(&dir, &["describe \"x\""]).ok();
+    env.j(&dir, &["undo"]).ok();
+    refused(&dir);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "two\n");
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+
+    let orphan = env.dir.join("orphan");
+    git_repo_with_base(&orphan);
+    git(&orphan, &["switch", "-q", "--orphan", "fresh"]);
+    env.j(&orphan, &["init"]).ok();
+    refused(&orphan);
+    let out = env.j(&orphan, &["tree"]).ok().stdout;
+    assert!(out.contains("base"), "{}", out);
+
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    refused(&dest);
+    env.j(&dest, &["describe \"x\""]).ok();
+    env.j(&dest, &["undo"]).ok();
+    refused(&dest);
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
 fn clone_starts_on_the_remotes_default_bookmark() {
     // §7.8: the working-copy commit is a child of the target of the bookmark
     // the remote's HEAD names (master here), not of whichever bookmark sorts

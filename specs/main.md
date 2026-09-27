@@ -973,7 +973,8 @@ current operation is an undo, move to the operation it undid and then to that
 operation's parent; while it is a redo, move past the operation it reapplied.
 The first normal operation reached is undone by recording a new operation
 that restores its parent's view, marked as an undo of it. If none is found,
-exit 1 with `j: nothing to undo`.
+or the one found is the operation `init` or `clone` recorded (§7.8), before
+which there was no repository, exit 1 with `j: nothing to undo`.
 
 **`redo`** requires the head to be an undo (possibly reached through redos);
 it records an operation restoring the view of the operation that undo
@@ -1020,6 +1021,10 @@ that state, §7.2 applies.
   requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
+
+Besides jj's own record of the new workspace, `init` and `clone` each record
+at most one operation, described `init` and `clone URL`, holding what they
+imported and the working-copy commit; `undo` never undoes it (§7.7).
 
 ### 7.9 Identity
 

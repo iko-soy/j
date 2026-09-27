@@ -1217,6 +1217,13 @@ impl JjBackend {
                 }
             }
         }
+        // before the operation init or clone recorded there was no
+        // repository (§7.7); the view jj recorded then has an empty child of
+        // the root as the working-copy commit, and checking it out would
+        // delete every file of the head
+        if !redo && op_created_repo(cur.metadata()) {
+            return Err((1, "nothing to undo".to_string()));
+        }
         let target_op = block_on(loader.load_operation(&target_op_id))
             .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
         let target_view = block_on(
@@ -1381,9 +1388,11 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
             folds_case: OnceLock::new(),
         }),
     };
+    // the import and the working-copy commit are one operation, the one
+    // undo never undoes (§7.7)
+    let mut tx = backend.current_repo().start_transaction();
     if had_git {
         let import_options = backend.git_import_options()?;
-        let mut tx = backend.current_repo().start_transaction();
         block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
             .map_err(|e| (2, format!("cannot import the git history: {}", e)))?;
         // HEAD too: it is the head the working-copy commit starts on, and a
@@ -1396,17 +1405,16 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
         .map_err(|e| (2, format!("cannot import the git HEAD: {}", e)))?;
         block_on(tx.repo_mut().rebase_descendants())
             .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
-        let _ = block_on(backend.publish_tx(tx, "import git refs"))?;
     }
     // §7.8: the current head is git's HEAD (none on an unborn branch)
-    let head = backend
-        .current_repo()
+    let head = tx
+        .repo()
         .view()
         .git_head(&backend.inner.workspace_name)
         .as_resolved()
         .cloned()
         .flatten();
-    create_initial_wc_commit(&backend, cfg, "init", head, had_git)?;
+    create_initial_wc_commit(&backend, cfg, tx, "init", head, had_git)?;
     Ok(())
 }
 
@@ -1457,44 +1465,54 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
         .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
     block_on(tx.repo_mut().rebase_descendants())
         .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
-    let (_, repo) = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
     // §7.8: the default bookmark's target (none when the remote's HEAD names
     // no branch, or a branch it does not have)
     let head = default_branch.and_then(|name| {
-        repo.view()
+        tx.repo()
+            .view()
             .get_remote_bookmark(RefName::new(&name).to_remote_symbol(origin))
             .target
             .as_resolved()
             .cloned()
             .flatten()
     });
-    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url), head, false)?;
+    // the fetch and the working-copy commit are one operation, the one undo
+    // never undoes (§7.7)
+    create_initial_wc_commit(&backend, cfg, tx, &format!("clone {}", url), head, false)?;
     Ok(())
 }
 
 /// §7.8: after init/clone, create a working-copy commit as a child of
-/// `head` (the root commit when there is none) and check it out. The commit
-/// is empty: it holds its parent's files. `adopt` says the working directory
-/// already holds a checkout of the parent (init over an existing git
-/// repository): the working copy is then reset to the commit instead of
-/// written, so no file is touched and what the directory holds beyond the
-/// parent is the next snapshot's change.
+/// `head` (the root commit when there is none) and check it out, recording
+/// it in `tx` with what the command has imported. The commit is empty: it
+/// holds its parent's files. `adopt` says the working directory already
+/// holds a checkout of the parent (init over an existing git repository):
+/// the working copy is then reset to the commit instead of written, so no
+/// file is touched and what the directory holds beyond the parent is the
+/// next snapshot's change.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
+    mut tx: jj_lib::transaction::Transaction,
     description: &str,
     head: Option<CommitId>,
     adopt: bool,
 ) -> Result<(), OpenError> {
-    let base = backend.current_repo();
-    let store = base.store().clone();
+    let store = tx.base_repo().store().clone();
     let parent = head.unwrap_or_else(|| store.root_commit_id().clone());
     // jj's own init already created a working-copy commit; if it is already
     // a child of the target parent, keep it and just check it out
     let mut to_abandon: Option<CommitId> = None;
-    if let Ok(existing) = block_on(backend.wc_commit(&base)) {
+    let existing = tx.repo().view().get_wc_commit_id(&backend.inner.workspace_name).cloned();
+    if let Some(existing) = existing.and_then(|id| block_on(store.get_commit_async(&id)).ok()) {
         if existing.parent_ids().first() == Some(&parent) {
-            let op_id = base.operation().id().clone();
+            // jj's commit is an empty child of the root; record only what
+            // was imported, if anything
+            let op_id = if tx.repo().has_changes() {
+                block_on(backend.publish_tx(tx, &truncate_chars(description, 200)))?.0
+            } else {
+                tx.base_repo().operation().id().clone()
+            };
             block_on(backend.checkout(&existing, None, op_id)).map_err(|c| (1, c.msg))?;
             return Ok(());
         }
@@ -1508,7 +1526,6 @@ fn create_initial_wc_commit(
     let user_sig = backend
         .user_signature(cfg)
         .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
-    let mut tx = base.start_transaction();
     if let Some(old_wc) = &to_abandon {
         tx.repo_mut().record_abandoned_commit_with_parents(
             old_wc.clone(),
@@ -1708,6 +1725,14 @@ fn op_marker(meta: &jj_lib::op_store::OperationMetadata) -> Option<OpMarker> {
         }
     }
     None
+}
+
+/// Whether `meta` is the operation `init` or `clone` recorded (§7.7), by its
+/// description, `init` or `clone URL`: no expression is described so, both
+/// words being reserved (§1.1).
+fn op_created_repo(meta: &jj_lib::op_store::OperationMetadata) -> bool {
+    let desc = meta.description.trim();
+    desc == "init" || desc.starts_with("clone ")
 }
 
 /// a full-length (or prefix) hex operation id
