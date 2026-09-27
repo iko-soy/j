@@ -1880,6 +1880,10 @@ enum Rail {
 struct Placement {
     lane: Option<usize>,
     fork: Option<(usize, bool)>, // (source lane, source empties below)
+    // on a flattened last child of the trunk head (or of the root of an empty
+    // trunk): its parent's lane, which empties below this row though no fork
+    // is drawn (Step 3, §Overflow)
+    ends: Option<usize>,
     reservations: Vec<(usize, usize)>, // (lane, child uid)
     flattened: bool,
 }
@@ -1912,6 +1916,7 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
         let was_flat = flattened.contains(&n.uid());
         let mut lane: Option<usize> = None;
         let mut fork: Option<(usize, bool)> = None;
+        let mut ends: Option<usize> = None;
         if !was_flat {
             if idx == 0 {
                 lane = Some(0);
@@ -1937,7 +1942,18 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
                                 fork = Some((pl, false));
                             }
                         }
-                        None => mark_subtree(n, &mut flattened),
+                        None => {
+                            // overflow is rule 5 too: when n is p's last
+                            // child (p is then the trunk head or the root of
+                            // an empty trunk, as any other trunk commit
+                            // reserves lanes for its later side children),
+                            // p's lane empties below this row (Step 3)
+                            mark_subtree(n, &mut flattened);
+                            if is_last_child {
+                                rails[pl] = None;
+                                ends = Some(pl);
+                            }
+                        }
                     }
                 }
             } else {
@@ -1982,6 +1998,7 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
         out.push(Placement {
             lane: if now_flat { None } else { lane },
             fork: if now_flat { None } else { fork },
+            ends,
             reservations,
             flattened: now_flat,
         });
@@ -2480,6 +2497,9 @@ fn rail_state_below(
             if clears {
                 state[src] = None;
             }
+        }
+        if let Some(l) = p.ends {
+            state[l] = None;
         }
         if let Some(l) = p.lane {
             state[l] = if m.children().is_empty() {

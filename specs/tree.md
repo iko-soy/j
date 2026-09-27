@@ -113,6 +113,8 @@ After `n` is placed in lane `ℓ`:
 * If `n` was the last child of `p` and did not inherit `p`'s lane (rule 5 with
   `p` the trunk head, or `p` the root of an empty trunk), `p`'s lane becomes
   empty below this row: the fork on this row is drawn with `╰` instead of `├`.
+  When `n` finds no lane (§Overflow) no fork is drawn, but `p`'s lane empties
+  all the same; the rail that reaches `n`'s row is drawn there as `│`.
 
 **Reservations.** When a node `p ∈ T` is placed and has a trunk child `t`,
 every side child of `p` that comes *after* `t` in row order needs its own

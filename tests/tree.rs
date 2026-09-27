@@ -1162,19 +1162,23 @@ fn own_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
 /// The rows of the tree of `repo` (focused on the root) as (rails area,
 /// the rest as words), the legend left out.
 fn row_shapes(repo: Value, metas: Vec<(String, MetaInfo)>) -> Vec<(String, String)> {
+    row_shapes_at(repo, metas, 4)
+}
+
+/// `row_shapes` with `lanes` lanes.
+fn row_shapes_at(repo: Value, metas: Vec<(String, MetaInfo)>, lanes: usize) -> Vec<(String, String)> {
     let (mut i, cfg) = make_interp(backend_with(metas));
-    let text = tree_text(
-        &mut i,
-        &cfg,
-        "treeWith ({ detail = 0, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
-        repo,
+    let src = format!(
+        "treeWith ({{ detail = 0, margin = false, elide = false, icons = false, color = \"never\", lanes = {}, author = false, date = false, files = false }})",
+        lanes
     );
+    let text = tree_text(&mut i, &cfg, &src, repo);
     text.lines()
         .take_while(|l| !l.trim().is_empty())
         .map(|l| {
             // gutter 2, then 2 · lanes characters of rails
-            let rails: String = l.chars().skip(2).take(8).collect();
-            let rest: String = l.chars().skip(10).collect();
+            let rails: String = l.chars().skip(2).take(2 * lanes).collect();
+            let rest: String = l.chars().skip(2 + 2 * lanes).collect();
             let words: Vec<&str> = rest.split_whitespace().collect();
             (rails.trim_end().to_string(), words.join(" "))
         })
@@ -1319,6 +1323,92 @@ fn trunk_reservations_are_taken_in_row_order() {
         let kids = if newest_first { vec![h_t, y_t, x_t] } else { vec![h_t, x_t, y_t] };
         let repo = repo_of(root.clone(), vec![subtree(p.clone(), kids)], None);
         assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn a_flattened_last_child_of_the_trunk_head_ends_lane_0() {
+    // Step 3: the trunk head's last child empties lane 0 below its row. When
+    // that child found no lane (§Overflow), lane 0 ran on to the bottom, on
+    // the detail line too, and the rows flattened below it never showed `»`
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let v = own_commit("kvvvvvvv", "on-older", &[]);
+    let w = own_commit("kwwwwwww", "on-newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("khhhhhhh", "A", t - 50),
+            meta("kxxxxxxx", "A", t - 40),
+            meta("kyyyyyyy", "A", t - 30),
+            meta("kvvvvvvv", "A", t - 20),
+            meta("kwwwwwww", "A", t - 10),
+        ]
+    };
+    let x_t = subtree(x, vec![subtree(v, vec![])]);
+    let y_t = subtree(y, vec![subtree(w, vec![])]);
+    let repo = repo_of(root, vec![subtree(h, vec![x_t, y_t])], None);
+    // at lanes = 2 `newer` overflows, as `older` holds lane 1; at lanes = 1
+    // everything off the trunk does
+    let want = [
+        (1, shapes(&[
+            ("◆", "@khhh head main"),
+            ("│", "@kxxx older"),
+            ("│", "@kyyy newer"),
+            ("»", "@kvvv on-older"),
+            ("»", "@kwww on-newer"),
+        ])),
+        (2, shapes(&[
+            ("◆", "@khhh head main"),
+            ("├─○", "@kxxx older"),
+            ("│ │", "@kyyy newer"),
+            ("  ○", "@kvvv on-older"),
+            ("  »", "@kwww on-newer"),
+        ])),
+    ];
+    for (lanes, want) in want {
+        assert_eq!(row_shapes_at(repo.clone(), metas(), lanes), want, "lanes {}", lanes);
+    }
+    // the detail line under a flattened focus draws the rails below its row:
+    // lane 0 under `older`, nothing under `newer`
+    for (focus, rails) in [("@kxxx", "  │"), ("@kyyy", "")] {
+        let (mut i, cfg) = make_interp(backend_with(metas()));
+        let src = format!(
+            "treeWith ({{ detail = 2, margin = false, elide = false, icons = false, color = \"never\", lanes = 1, author = false, date = false, files = false }}) . by {}",
+            focus
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.contains(focus)).unwrap();
+        let detail = lines[at + 1];
+        assert!(detail.contains("+ k"), "no detail line under {}\n{}", focus, text);
+        assert_eq!(upto_col(detail, 4).trim_end(), rails, "{}\n{}", focus, text);
+    }
+}
+
+#[test]
+fn the_worked_example_ends_lane_0_at_ptlm_on_fewer_lanes() {
+    // `ptlm`, the trunk head's last child, overflows at lanes = 2 (lane 1 is
+    // `wqzt`'s) and at lanes = 1, and lane 0 went on past it to the bottom.
+    // It ends on `ptlm`'s row, "and then empty", as at lanes = 3.
+    let want: [(usize, [&str; 9]); 2] = [
+        (1, ["  ╎", "  ◆", "  ◆", "  │", "▶ │", "  │", "  │", "  »", "  »"]),
+        (2, ["  ╎ 14", "  ◆─╮", "  ◆ │", "  │ ○", "▶ ├─⊗", "  │ │", "  │ │", "    │", "    ○"]),
+    ];
+    for (lanes, want) in want {
+        let (repo, be) = worked_example();
+        let (mut i, cfg) = make_interp(be);
+        let src = format!("treeWith ({})", lanes_opts(lanes, false));
+        let text = tree_text(&mut i, &cfg, &src, repo);
+        let heads: Vec<String> = text
+            .lines()
+            .take(9)
+            .map(|l| upto_col(l, 2 + 2 * lanes).trim_end().to_string())
+            .collect();
+        assert_eq!(heads, want, "lanes {}\n{}", lanes, text);
     }
 }
 
