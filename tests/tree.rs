@@ -568,6 +568,27 @@ fn size_bar_counts_exactly_up_to_its_last_threshold() {
         let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
         assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
     }
+    // two lines alternating, 450 disjoint pairs of them swapped: 900 lines
+    // either way. Every other diagonal of the search is a long run of equal
+    // lines, so the deadline expired on it even on an idle machine and drew
+    // `▇`, where the moved blocks above only overran on a busy one
+    let alternating: Vec<String> = (0..60000).map(|i| format!("l{}\n", i % 2)).collect();
+    let mut swapped = alternating.clone();
+    for k in 0..450 {
+        swapped.swap(100 + 132 * k, 101 + 132 * k);
+    }
+    let p = |f: &[String]| vec![("p".to_string(), f.concat())];
+    let chain = vec![
+        ("alternating", p(&alternating)),
+        ("swaps900", p(&swapped)),
+        ("unswap900", p(&alternating)),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip([("swaps900", "▅"), ("unswap900", "▅")]) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
 }
 
 #[test]

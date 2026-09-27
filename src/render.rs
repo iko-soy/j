@@ -2845,3 +2845,137 @@ fn initials(name: &str) -> String {
         .collect::<String>()
         .to_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::BlobVal;
+    use std::collections::HashMap;
+
+    /// Lines deleted plus inserted by a shortest diff of `a` to `b`, uncapped
+    /// and found without anything `changed_lines` uses: both lengths less
+    /// twice a longest common subsequence, which Hyyrö's bit-parallel LCS
+    /// finds a machine word of `a` at a time.
+    fn exact(a: &[String], b: &[String]) -> usize {
+        let words = a.len().div_ceil(64);
+        // per line of `a`, a bit at each place it occurs in `a`
+        let mut masks: HashMap<&str, Vec<u64>> = HashMap::new();
+        for (i, l) in a.iter().enumerate() {
+            masks.entry(l.as_str()).or_insert_with(|| vec![0; words])[i / 64] |= 1 << (i % 64);
+        }
+        let absent = vec![0; words];
+        // after each line of `b`, the zero bits of `v` up to a place in `a`
+        // count a longest common subsequence of `a` up to there and `b` so
+        // far; the bits past the end of `a` stay ones
+        let mut v = vec![u64::MAX; words];
+        for l in b {
+            let m = masks.get(l.as_str()).unwrap_or(&absent);
+            let mut carry = false;
+            for (v, m) in v.iter_mut().zip(m) {
+                let (sum, c1) = v.overflowing_add(*v & m);
+                let (sum, c2) = sum.overflowing_add(carry as u64);
+                carry = c1 || c2;
+                *v = sum | (*v & !m);
+            }
+        }
+        let common: usize = v.iter().map(|w| w.count_zeros() as usize).sum();
+        a.len() + b.len() - 2 * common
+    }
+
+    /// `changed_lines` from `a` to `b` and back is the exact count, or the
+    /// cap if that is less: under the size bar's cap, caps on either side of
+    /// the first search's 64 rounds, `cap` if given, and the exact count plus
+    /// one, which leaves no room: a bound or a search stopped short that
+    /// overcounts at all returns the cap there.
+    fn check(a: &[String], b: &[String], cap: Option<usize>) {
+        let (va, vb) = (BlobVal::text_blob(&a.concat()), BlobVal::text_blob(&b.concat()));
+        let want = exact(a, b);
+        assert_eq!(want, exact(b, a));
+        let mut caps = vec![1, 64, 65, want + 1, SIZE_BAR_TOP];
+        caps.extend(cap);
+        caps.retain(|c| *c <= SIZE_BAR_TOP);
+        for cap in caps {
+            for (from, to) in [(&va, &vb), (&vb, &va)] {
+                let got = changed_lines(Some(from), Some(to), cap).unwrap();
+                assert_eq!(got, want.min(cap), "cap {}, {} and {} lines", cap, a.len(), b.len());
+            }
+        }
+    }
+
+    /// xorshift64*: the same numbers on every run
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as usize % n
+        }
+    }
+
+    #[test]
+    fn changed_lines_is_exact_up_to_its_cap() {
+        // the size bar is drawn from this count (§7.11 column 5), and no
+        // shortcut may change it, whatever the machine or the content.
+        // A few lines repeating, disjoint adjacent pairs of them swapped (two
+        // lines each): no line occurs once on either side, and every diagonal
+        // the period divides runs along equal lines from one swap to the next
+        for period in [2, 3] {
+            let lines: Vec<String> = (0..4000).map(|i| format!("l{}\n", i % period)).collect();
+            for swaps in [1, 33, 499, 501] {
+                let mut swapped = lines.clone();
+                let step = 3990 / swaps;
+                for k in 0..swaps {
+                    swapped.swap(3 + step * k, 4 + step * k);
+                }
+                check(&lines, &swapped, None);
+            }
+        }
+        // runs of one line swapped: a shortest diff keeps the longer run
+        let runs = |x: &str, n: usize, y: &str, m: usize| -> Vec<String> {
+            let run = |l: &str, n| std::iter::repeat_n(format!("{}\n", l), n);
+            run(x, n).chain(run(y, m)).collect()
+        };
+        check(&runs("a", 499, "b", 501), &runs("b", 501, "a", 500), None);
+        check(&runs("a", 500, "b", 501), &runs("b", 501, "a", 500), None);
+        // distinct lines, blocks moved past as many others: two lines per line
+        // moved, where only the lines that occur once on each side bound it
+        let lines: Vec<String> = (0..4000).map(|i| format!("line {}\n", i)).collect();
+        for lens in [&[90; 5][..], &[100, 100, 100, 100, 99], &[100; 5], &[250, 251], &[600]] {
+            let mut moved = lines.clone();
+            for (j, len) in lens.iter().enumerate() {
+                let at = 100 + 700 * j;
+                let block: Vec<String> = moved.drain(at..at + len).collect();
+                moved.splice(at + len..at + len, block);
+            }
+            check(&lines, &moved, None);
+        }
+        // random edits of random files, of two lines up to mostly distinct
+        // ones: lines inserted, removed, replaced, and blocks moved
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..40 {
+            let distinct = [2, 5, 50, 1 << 20][rng.below(4)];
+            let line = |rng: &mut Rng| format!("{}\n", rng.below(distinct));
+            let a: Vec<String> = (0..rng.below(800)).map(|_| line(&mut rng)).collect();
+            let mut b = a.clone();
+            for _ in 0..rng.below(300) {
+                let at = rng.below(b.len() + 1);
+                match rng.below(4) {
+                    0 => b.insert(at, line(&mut rng)),
+                    1 if at < b.len() => {
+                        b.remove(at);
+                    }
+                    2 if at < b.len() => b[at] = line(&mut rng),
+                    _ => {
+                        let end = (at + rng.below(40)).min(b.len());
+                        let block: Vec<String> = b.drain(at..end).collect();
+                        let to = rng.below(b.len() + 1);
+                        b.splice(to..to, block);
+                    }
+                }
+            }
+            check(&a, &b, Some(1 + rng.below(SIZE_BAR_TOP)));
+        }
+    }
+}
