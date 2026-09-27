@@ -255,6 +255,51 @@ fn clone_leaves_out_paths_a_checkout_cannot_create() {
 }
 
 #[test]
+fn clone_that_cannot_check_out_leaves_nothing_behind() {
+    // §7.8: clone checked the working-copy commit out after recording its
+    // operation, so a checkout that failed part way (a symlink target or a
+    // path longer than PATH_MAX here; a full disk) left a clone whose
+    // working-copy commit held files never written: `zz`, after the failing
+    // path, and the user's first `describe` recorded it as deleted. The
+    // deep path also left a chain of empty directories. Like `git clone`, a
+    // clone that fails now records nothing and leaves nothing behind.
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::write(other.join("zz"), "z\n").unwrap();
+    std::fs::write(env.dir.join("target"), "x".repeat(5000)).unwrap();
+    let target = git(&other, &["hash-object", "-w", env.dir.join("target").to_str().unwrap()]);
+    let link = format!("120000,{},m_link", target.trim());
+    git(&other, &["update-index", "--add", "--cacheinfo", &link]);
+    git(&other, &["add", "zz"]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "link"]);
+    git(&other, &["push", "-q", "origin", "master"]);
+    let clone = |dest: &PathBuf| {
+        let out = env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    };
+    let dest = env.dir.join("clone");
+    clone(&dest);
+    assert!(!dest.exists(), "the failed clone left {}", dest.display());
+    // a directory that was there, empty, stays so
+    std::fs::create_dir(&dest).unwrap();
+    clone(&dest);
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+
+    git(&other, &["rm", "-q", "--cached", "m_link"]);
+    let deep = vec!["d".repeat(250); 20].join("/");
+    let blob = git(&other, &["hash-object", "-w", "zz"]);
+    let info = format!("100644,{},{}", blob.trim(), deep);
+    git(&other, &["update-index", "--add", "--cacheinfo", &info]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "deep"]);
+    git(&other, &["push", "-q", "origin", "master"]);
+    let dest = env.dir.join("deep");
+    clone(&dest);
+    assert!(!dest.exists(), "the failed clone left {}", dest.display());
+}
+
+#[test]
 fn init_over_git_takes_a_directory_it_cannot_scan() {
     // §7.4, §7.8: init over an existing git working tree scans it before
     // checking out, and a directory that scan cannot read (one deeper than

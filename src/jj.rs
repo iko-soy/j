@@ -1486,17 +1486,44 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     } else if dir_path.exists() {
         return Err((2, format!("{} already exists and is not empty", dir)));
     }
+    let existed = dir_path.is_dir();
     std::fs::create_dir_all(&dir_path)
         .map_err(|e| (2, format!("cannot create {}: {}", dir, e)))?;
+    let cloned = clone_into(cfg, &settings, url, &dir_path);
+    if cloned.is_err() {
+        // like `git clone`, a clone that fails leaves nothing behind: its
+        // working-copy commit would claim files the checkout never wrote,
+        // and a later clone would refuse the directory (§7.8)
+        if !existed {
+            let _ = std::fs::remove_dir_all(&dir_path);
+        } else if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let _ = match entry.file_type() {
+                    Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()),
+                    _ => std::fs::remove_file(entry.path()),
+                };
+            }
+        }
+    }
+    cloned
+}
+
+/// `clone`'s work once `dir_path` exists and is empty (§7.8)
+fn clone_into(
+    cfg: &Config,
+    settings: &UserSettings,
+    url: &str,
+    dir_path: &std::path::Path,
+) -> Result<(), OpenError> {
     let (workspace, repo) = block_on(Workspace::init_colocated_git(
-        &settings,
-        &dir_path,
+        settings,
+        dir_path,
         gix::hash::Kind::Sha1,
     ))
     .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
     let backend = JjBackend {
         inner: Arc::new(JjInner {
-            workspace_root: dir_path.clone(),
+            workspace_root: dir_path.to_path_buf(),
             workspace: Mutex::new(workspace),
             repo: Mutex::new(repo),
             workspace_name: WorkspaceName::DEFAULT.to_owned(),
