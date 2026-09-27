@@ -12,14 +12,14 @@ use std::rc::Rc;
 const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)";
 
 fn err(status: u8, msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("j: {}", msg);
+    j::report!("j: {}", msg);
     ExitCode::from(status)
 }
 
 /// Report a failure that ends the process, keeping the status as a number so
 /// callers do not have to recover it from an `ExitCode`.
 fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
-    eprintln!("j: {}", msg);
+    j::report!("j: {}", msg);
     status
 }
 
@@ -38,11 +38,11 @@ fn print_output(s: &str) -> ExitCode {
 }
 
 fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
-    eprintln!("j: crash: {}", c.msg);
+    j::report!("j: crash: {}", c.msg);
     match (&c.def, expr_text) {
-        (Some(d), Some(e)) => eprintln!("   in {}, from {}", d, e),
-        (None, Some(e)) => eprintln!("   from {}", e),
-        (Some(d), None) => eprintln!("   in {}", d),
+        (Some(d), Some(e)) => j::report!("   in {}, from {}", d, e),
+        (None, Some(e)) => j::report!("   from {}", e),
+        (Some(d), None) => j::report!("   in {}", d),
         (None, None) => {}
     }
     ExitCode::from(1)
@@ -72,7 +72,7 @@ fn load_config_file() -> Result<(Config, String), u8> {
             if let Err(e) = write_default_config(&path) {
                 return Err(fail(3, format!("cannot create config at {}: {}", path, e)));
             }
-            eprintln!("j: created an editable default config at {}", path);
+            j::report!("j: created an editable default config at {}", path);
             match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => return Err(fail(3, format!("cannot read config at {}: {}", path, e))),
@@ -155,7 +155,7 @@ fn run() -> ExitCode {
     } else if !args.is_empty() {
         args.join(" ")
     } else {
-        eprintln!("{}", USAGE);
+        j::report!("{}", USAGE);
         return ExitCode::from(2);
     };
 
@@ -333,11 +333,11 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         Err(failures) => {
             let (prefix, candidates) = &failures[0];
             if candidates.is_empty() {
-                eprintln!("j: crash: `@{}` matches no commit", prefix);
+                j::report!("j: crash: `@{}` matches no commit", prefix);
             } else {
-                eprintln!("j: crash: `@{}` is ambiguous", prefix);
+                j::report!("j: crash: `@{}` is ambiguous", prefix);
                 for c in candidates {
-                    eprintln!("   {}", c);
+                    j::report!("   {}", c);
                 }
             }
             return ExitCode::from(1);

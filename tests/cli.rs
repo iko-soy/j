@@ -125,6 +125,26 @@ impl Repo {
         self.j_to(writer, args)
     }
 
+    /// Run `j` with stderr on a pipe whose reader has already exited, as in
+    /// `j … 2>&1 | head` once `head` has read all it wants; only the status
+    /// is left to look at.
+    fn j_closed_stderr(&self, args: &[&str]) -> i32 {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        Command::new(j_bin())
+            .args(args)
+            .current_dir(&self.dir)
+            .env("XDG_CONFIG_HOME", &self.cfg)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(writer)
+            .status()
+            .unwrap()
+            .code()
+            .unwrap_or(-1)
+    }
+
     fn write(&self, path: &str, content: &str) {
         std::fs::write(self.dir.join(path), content).unwrap();
     }
@@ -459,6 +479,40 @@ fn closed_stdout_ends_the_display_quietly() {
     assert_eq!(out.stderr, "");
     // and the lock was released
     assert!(r.j(&["ops"]).ok().stdout.contains("describe \"shown\""));
+}
+
+#[test]
+fn closed_stderr_keeps_the_exit_status() {
+    // §1.4: a message stderr cannot take is dropped, and the run keeps its
+    // status; every error writer used to panic on the closed pipe instead,
+    // and the run exited 101
+    use std::os::unix::io::AsRawFd;
+    let r = setup();
+    for (args, code) in [
+        (&["crash \"boom\""][..], 1), // crash and its `from` line
+        (&["by @kqzz"], 1),           // an unresolvable id
+        (&["1 +"], 3),                // parse error
+        (&["push"], 2),               // a reserved command's usage
+        (&[], 2),                     // no expression at all
+    ] {
+        assert_eq!(r.j_closed_stderr(args), code, "{:?}", args);
+    }
+    // the lock refusal is written by the backend
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(r.dir.join(".jj/j.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    assert_eq!(r.j_closed_stderr(&["tree"]), 2);
+    drop(lock);
+    // the notice for a default config written on first use is not an error
+    std::fs::remove_file(r.cfg.join("j/config.j")).unwrap();
+    assert_eq!(r.j_closed_stderr(&["1 + 1"]), 0);
+    assert!(r.cfg.join("j/config.j").exists());
+    // and a config error is still one
+    std::fs::write(r.cfg.join("j/config.j"), "x =\n").unwrap();
+    assert_eq!(r.j_closed_stderr(&["1 + 1"]), 3);
 }
 
 #[test]
