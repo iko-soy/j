@@ -852,15 +852,14 @@ impl JjBackend {
         // at 7 characters, fail to parse them and record the edited conflict
         // as resolved text, markers and all (§7.4).
         if let Some(snapshot) = snapshot {
-            let (scanned, _stats) = locked_ws
-                .locked_wc()
-                .snapshot(&snapshot_options())
-                .await
-                .map_err(|e| Crash::new(format!("cannot snapshot the working copy: {}", e)))?;
-            if scanned.tree_ids() != snapshot.tree().tree_ids() {
-                // the directory changed while the expression ran: describe
-                // the snapshot that was recorded instead (a reset writes no
-                // file; the paths it changes are re-read by the next run)
+            let scanned = locked_ws.locked_wc().snapshot(&snapshot_options()).await;
+            if !matches!(scanned, Ok((tree, _)) if tree.tree_ids() == snapshot.tree().tree_ids()) {
+                // the directory changed while the expression ran, or can no
+                // longer be scanned (an entry appeared, vanished or cannot
+                // be read; a failed scan leaves the state as it was):
+                // describe the snapshot that was recorded instead. A reset
+                // writes no file; the paths it changes are re-read by the
+                // next run.
                 locked_ws
                     .locked_wc()
                     .reset(snapshot)

@@ -594,6 +594,10 @@ fn unwritable_path_refused_before_anything_is_recorded() {
     r.j(&["describe \"after\""]).ok();
 }
 
+/// Each commit's message and content of `a`, top-down
+const CONTENT_OF_A: &str =
+    "\\r -> show (map (\\c -> [c.message (contentAt [\"a\"] c.files)]) (commits (top r)))";
+
 #[test]
 fn reserved_names_in_another_case_refused_where_the_filesystem_folds_case() {
     // on a case-folding filesystem (macOS, Windows) `.GIT` is `.git`, which
@@ -1402,6 +1406,58 @@ fn editing_a_conflict_keeps_its_long_markers() {
     let status = r.j(&["\\r -> show [(status r).changed (status r).conflicts]"]).ok().stdout;
     assert_eq!(status.trim(), "[[] [[\"README.md\"]]]");
     assert!(r.read("README.md").contains("B text, edited twice\n"));
+}
+
+#[test]
+fn a_directory_that_cannot_be_scanned_mid_run_does_not_fail_the_checkout() {
+    // §7.4, §7.7: persist's checkout scans the working directory again. An
+    // entry that appeared during evaluation and cannot be read (a directory
+    // deeper than PATH_MAX here; an unreadable mount, a temporary file that
+    // vanishes mid-scan) failed that scan after the operation had been
+    // published: the run crashed with it recorded and the working copy never
+    // advanced, and once the directory was gone the next run snapshotted the
+    // child's files into the new focus, its parent. The checkout now
+    // describes the snapshot instead, as it did before it rescanned.
+    let r = setup();
+    r.write("a", "p\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "x1\n");
+    r.j(&["describe \"X\""]).ok();
+    r.write("a", "x2\n");
+    // built outside the working directory: 20 levels of 250 bytes
+    let half: PathBuf = (0..10).map(|_| "d".repeat(250)).collect();
+    let deep = r.cfg.join("deep");
+    std::fs::create_dir_all(deep.join(&half)).unwrap();
+    std::fs::create_dir_all(r.cfg.join("more").join(&half)).unwrap();
+    std::fs::rename(r.cfg.join("more"), deep.join(&half).join("more")).unwrap();
+    let ops_dir = r.dir.join(".jj/repo/op_store/operations");
+    let count = || std::fs::read_dir(&ops_dir).unwrap().count();
+    let before = count();
+    let mut child = Command::new(j_bin())
+        .arg("\\r -> prev (describe (show (foldl (+) 0 (range 0 1000000))) r)")
+        .current_dir(&r.dir)
+        .env("XDG_CONFIG_HOME", &r.cfg)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the snapshot's operation is written before evaluation: move the
+    // directory in while the expression runs
+    while count() == before && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::fs::rename(&deep, r.dir.join("deep")).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(r.read("a"), "p\n");
+    std::fs::remove_dir_all(r.dir.join("deep")).unwrap();
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(
+        files.trim(),
+        r#"[["" (blob "")] ["P" (blob "p\n")] ["499999500000" (blob "x2\n")]]"#
+    );
 }
 
 #[test]

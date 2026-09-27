@@ -255,6 +255,28 @@ fn clone_leaves_out_paths_a_checkout_cannot_create() {
 }
 
 #[test]
+fn init_over_git_takes_a_directory_it_cannot_scan() {
+    // §7.4, §7.8: init over an existing git working tree scans it before
+    // checking out, and a directory that scan cannot read (one deeper than
+    // PATH_MAX here) crashed init after its operation was recorded. Init now
+    // takes the directory as it is: each run's snapshot refuses it, and
+    // records nothing, until it is removed.
+    let env = setup();
+    let dir = env.dir.join("repo");
+    git_repo_with_base(&dir);
+    let half: PathBuf = (0..10).map(|_| "d".repeat(250)).collect();
+    std::fs::create_dir_all(dir.join("deep").join(&half)).unwrap();
+    std::fs::create_dir_all(env.dir.join("more").join(&half)).unwrap();
+    std::fs::rename(env.dir.join("more"), dir.join("deep").join(&half).join("more")).unwrap();
+    env.j(&dir, &["init"]).ok();
+    assert_eq!(env.j(&dir, &["changed"]).code, 2);
+    std::fs::remove_dir_all(dir.join("deep")).unwrap();
+    assert_eq!(env.j(&dir, &["changed"]).ok().stdout.trim(), "none");
+    let ops = env.j(&dir, &["ops"]).ok().stdout;
+    assert!(ops.lines().next().unwrap_or("").contains("init"), "{}", ops);
+}
+
+#[test]
 fn clone_starts_on_the_remotes_default_bookmark() {
     // §7.8: the working-copy commit is a child of the target of the bookmark
     // the remote's HEAD names (master here), not of whichever bookmark sorts
