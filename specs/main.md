@@ -813,7 +813,9 @@ some other value in its place.
 - A path that is deleted and resolved has no entry. A path that is in a
   deletion conflict has an entry whose blob is unresolved. Each side of a
   conflict is either absent or content with its own file type, so a side
-  that deleted the path is not an empty file.
+  that deleted the path is not an empty file. In a conflict between a file
+  and a directory, which jj keeps as one path, a directory side reads as
+  empty content but is kept whole, and is written back as that directory.
 - `replay onto { from, to }` is jj's tree merge: for each path present in
   any of the three snapshots, the three-way merge of that path's values with
   `from` as the common ancestor, replaying the change from `from` to `to` on

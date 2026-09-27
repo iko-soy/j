@@ -177,6 +177,10 @@ pub enum BlobContent {
 pub struct ConflictSide {
     pub kind: BlobKind,
     pub bytes: Rc<Vec<u8>>,
+    /// a side on which jj holds a directory, in a conflict between a file
+    /// and a directory: the hex id of that tree, kept opaque so the side is
+    /// written back as the directory it was. Its `bytes` are empty (§7.3).
+    pub tree: Option<String>,
 }
 
 impl ConflictSide {
@@ -184,6 +188,7 @@ impl ConflictSide {
         ConflictSide {
             kind: BlobKind::Regular,
             bytes: Rc::new(bytes.to_vec()),
+            tree: None,
         }
     }
 }

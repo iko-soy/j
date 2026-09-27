@@ -254,6 +254,7 @@ pub fn simple_replay(
                             Value::Blob(b) => Ok(Some(ConflictSide {
                                 kind: b.kind.clone(),
                                 bytes: Rc::new(b.bytes()?),
+                                tree: None,
                             })),
                             _ => Ok(Some(ConflictSide::regular(&[]))),
                         }

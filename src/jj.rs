@@ -17,7 +17,7 @@ use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::backend::{CommitId, FileId};
+use jj_lib::backend::{CommitId, FileId, TreeId};
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
@@ -2191,15 +2191,21 @@ async fn blob_to_tree_value(store: &Arc<Store>, content: &Value) -> Result<Merge
                 return Err(Crash::new("persistence: malformed conflict blob"));
             }
             // jj order: [add, (remove, add)*] → Merge with interleaved adds
-            // and removes; each side keeps its absence or its own file type
-            // (§7.3), so the tree written is the one the conflict was read from
+            // and removes; each side keeps its absence, its own file type or
+            // its directory (§7.3), so the tree written is the one the
+            // conflict was read from
             let mut values: Vec<Option<TreeValue>> = Vec::new();
             for side in sides {
                 let Some(side) = side else {
                     values.push(None);
                     continue;
                 };
-                let value = if side.kind == BlobKind::Symlink {
+                let value = if let Some(hex) = &side.tree {
+                    TreeValue::Tree(
+                        TreeId::try_from_hex(hex)
+                            .ok_or_else(|| Crash::new("persistence: bad tree id"))?,
+                    )
+                } else if side.kind == BlobKind::Symlink {
                     let target = std::str::from_utf8(&side.bytes)
                         .map_err(|_| Crash::new("persistence: symlink target is not UTF-8"))?;
                     let id = store
@@ -2321,6 +2327,7 @@ async fn conflict_side(
                 BlobKind::Regular
             },
             bytes: read_file_bytes(store, path, id, cache).await?,
+            tree: None,
         })),
         Some(TreeValue::Symlink(id)) => {
             let target = store
@@ -2330,13 +2337,20 @@ async fn conflict_side(
             Ok(Some(ConflictSide {
                 kind: BlobKind::Symlink,
                 bytes: Rc::new(target.into_bytes()),
+                tree: None,
             }))
         }
-        // a directory or submodule side reads as an empty file, as a
-        // resolved one does in tree_value_to_blob (§12)
-        Some(TreeValue::Tree(_) | TreeValue::GitSubmodule(_)) => {
-            Ok(Some(ConflictSide::regular(&[])))
-        }
+        // a directory side, in a conflict between a file and a directory,
+        // reads as empty content but keeps its tree, so writing the conflict
+        // back cannot put an empty file where the directory was
+        Some(TreeValue::Tree(id)) => Ok(Some(ConflictSide {
+            kind: BlobKind::Regular,
+            bytes: Rc::new(Vec::new()),
+            tree: Some(id.hex()),
+        })),
+        // a submodule side reads as an empty file, as a resolved one does in
+        // tree_value_to_blob (§12)
+        Some(TreeValue::GitSubmodule(_)) => Ok(Some(ConflictSide::regular(&[]))),
     }
 }
 
@@ -2412,8 +2426,9 @@ async fn tree_value_to_blob(
                 content: BlobContent::Resolved(Rc::new(target.into_bytes())),
             })))
         }
-        // a conflicted directory is emitted without its children by
-        // MergedTree::entries; §12 puts such repairs out of scope
+        // MergedTree::entries recurses into a resolved directory, and a
+        // directory side of a conflict goes through conflict_side, so this is
+        // a submodule, which §12 puts out of scope
         TreeValue::Tree(_) | TreeValue::GitSubmodule(_) => Ok(Value::Blob(Rc::new(BlobVal {
             kind: BlobKind::Regular,
             content: BlobContent::Resolved(Rc::new(Vec::new())),

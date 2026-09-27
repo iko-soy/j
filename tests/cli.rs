@@ -607,6 +607,72 @@ fn file_and_directory_at_one_path_refused() {
 }
 
 #[test]
+fn conflict_directory_sides_kept_whole() {
+    // jj keeps a conflict between a file and a directory as one path whose
+    // side is the whole directory. Such a side was read as an empty file and
+    // written back as one: the directory was gone from the stored tree, and
+    // rebasing the commit back where its sides cancel left an empty file `a`
+    // in place of the user's `a/b` (§7.3).
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let paths = "\\r -> show (map (.path) (files r))";
+    let onto = |m: &str| format!("rebase (matching (\\c -> c.message == \"{}\") all)", m);
+
+    // R replaces the file `a` with a directory, L deletes it: R onto L is a
+    // conflict with R's directory as a side
+    let r = setup();
+    r.write("a", "base\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a", "other\n");
+    r.j(&["describe \"Q\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    std::fs::remove_file(r.dir.join("a")).unwrap();
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b", "deep\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&[&onto("L")]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    // a rewrite writes the conflict back as it was read
+    r.j(&["describe \"R again\""]).ok();
+    // onto Q's file `a`: the directory stays a side of R's conflict, now
+    // beside Q's file
+    r.j(&[&onto("Q")]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    // R back onto P: the sides cancel, leaving R's own directory
+    r.j(&[&onto("P")]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
+    assert_eq!(r.read("a/b"), "deep\n");
+
+    // both sides replace the directory `a` with a file: the base is the
+    // directory, and it cancels against P's when R goes back
+    let r = setup();
+    r.write("base.txt", "base\n");
+    std::fs::create_dir(r.dir.join("a")).unwrap();
+    r.write("a/b", "deep\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_dir_all(r.dir.join("a")).unwrap();
+    r.write("a", "left\n");
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    std::fs::remove_dir_all(r.dir.join("a")).unwrap();
+    r.write("a", "right\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&["rebase siblings"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    let back = "\\r -> show (conflicted (files (rebase (parents . prev) r)))";
+    assert_eq!(r.j(&[back]).ok().stdout.trim(), "[]");
+    r.j(&["rebase (parents . prev)"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), "[[\"a\"] [\"base.txt\"]]");
+    assert_eq!(r.read("a"), "right\n");
+}
+
+#[test]
 fn edit_applied_to_an_edit_is_a_contract_crash() {
     // `new new` gives `new` a function where its signature wants a Repo: a
     // contract crash (§4.13), so nothing is persisted (§1.2). It used to
