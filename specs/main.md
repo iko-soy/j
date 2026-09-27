@@ -1025,13 +1025,20 @@ language: `fetch` and `push` are the only things that change them.
   set although the visible rewrite carries its change id and its label.
   Moving a bookmark whose current target is not immutable to an unrelated
   commit is allowed; that is how a rewritten stack is re-pushed. Deleting a
-  bookmark on an immutable commit that another bookmark still reaches loses
-  no history; that is how a merged feature's name is removed. After a
-  successful push the labels reflect the new positions. It records one
-  operation. An empty list sends nothing to the remote. If the remote
-  accepts some of the updates and rejects others, that operation records the
-  accepted ones, whose labels move, and `push` exits 1 naming the rejected
-  bookmarks.
+  bookmark on an immutable commit that another bookmark still reaches is how
+  a merged feature's name is removed. It loses no history as long as that
+  other bookmark is still where the last `fetch` or `push` left it: `push`
+  does not ask the remote, so it does not notice a bookmark moved or deleted
+  there since. The remote applies each update of a git push on its own, so
+  when only records' new targets reach the commit, as when
+  `rename "master" "main"` renames trunk's only bookmark, the deletes wait:
+  the other updates are sent first, and the deletes in a second git push
+  only once the remote has accepted every one of them. After a successful
+  push the labels reflect the new positions. It records one operation, even
+  when it sends two git pushes. An empty list sends nothing to the remote.
+  If the remote accepts some of the updates and rejects others, that
+  operation records the accepted ones, whose labels move, and `push` exits 1
+  naming the rejected bookmarks and any deletes it did not send.
 
 Only the remote named `origin` is supported in this version; `fetch` and
 `push` exit 1 with `j: no remote origin` when it is not configured.

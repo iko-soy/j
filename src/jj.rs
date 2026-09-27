@@ -1064,8 +1064,8 @@ impl JjBackend {
         let base = self.head_repo()?;
         let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
-        check_push_records(&records, &base, &vis, &immutable)?;
-        let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
+        let deletes_wait = check_push_records(&records, &base, &vis, &immutable)?;
+        let _ = self.push_to_origin(&base, origin, &records, deletes_wait, expr_text)?;
         Ok(())
     }
 
@@ -1117,15 +1117,19 @@ impl JjBackend {
     }
 
     /// push the updates to `origin` and record the new remote-bookmark
-    /// positions as one operation (§7.6)
+    /// positions as one operation (§7.6); when `deletes_wait`, the deletes
+    /// go in a second git push, sent only once the remote has accepted every
+    /// other update
     fn push_to_origin(
         &self,
         base: &Arc<ReadonlyRepo>,
         origin: &RemoteName,
         records: &[(String, Option<CommitId>)],
+        deletes_wait: bool,
         description: &str,
     ) -> Result<Arc<ReadonlyRepo>, OpenError> {
         let mut targets = jj_lib::git::GitPushRefTargets::default();
+        let mut deletes = jj_lib::git::GitPushRefTargets::default();
         for (name, after) in records {
             let before = base
                 .view()
@@ -1134,7 +1138,10 @@ impl JjBackend {
                 .as_resolved()
                 .cloned()
                 .unwrap_or(None);
-            targets
+            // check_push_records sets `deletes_wait` only when some record
+            // sets a bookmark, so the first push is never empty
+            let batch = if deletes_wait && after.is_none() { &mut deletes } else { &mut targets };
+            batch
                 .bookmarks
                 .push((jj_lib::ref_name::RefNameBuf::from(name.clone()), Diff::new(before, after.clone())));
         }
@@ -1151,22 +1158,48 @@ impl JjBackend {
         }
         let subprocess_options = self.git_subprocess_options()?;
         let mut callback = QuietGitCallback;
-        let stats = jj_lib::git::push_refs(
-            tx.repo_mut(),
-            subprocess_options,
-            origin,
-            &targets,
-            &mut callback,
-            &jj_lib::git::GitPushOptions::default(),
-        )
-        .map_err(|e| match e {
-            jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
-            other => (1, format!("push failed: {}", other)),
-        })?;
+        let mut push = |tx: &mut jj_lib::transaction::Transaction, targets| {
+            jj_lib::git::push_refs(
+                tx.repo_mut(),
+                subprocess_options.clone(),
+                origin,
+                targets,
+                &mut callback,
+                &jj_lib::git::GitPushOptions::default(),
+            )
+            .map_err(|e| match e {
+                jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
+                other => (1, format!("push failed: {}", other)),
+            })
+        };
+        let mut stats = push(&mut tx, &targets)?;
         // git push is not atomic: the remote may accept some updates and
-        // reject others. push_refs has set the accepted ones in `tx`, and
-        // they are on the remote, so they are recorded before the rest is
-        // reported; a push the remote refused entirely records nothing
+        // reject others. When only a bookmark this push sets keeps a deleted
+        // bookmark's immutable commit reachable, the deletes go in a second
+        // push once the remote has accepted every update, and are not sent
+        // otherwise (§7.6)
+        let mut not_sent: Vec<String> = Vec::new();
+        let mut failed = None;
+        if !deletes.bookmarks.is_empty() {
+            if stats.all_ok() {
+                match push(&mut tx, &deletes) {
+                    Ok(more) => {
+                        stats.pushed.extend(more.pushed);
+                        stats.rejected.extend(more.rejected);
+                        stats.remote_rejected.extend(more.remote_rejected);
+                        stats.unexported_bookmarks.extend(more.unexported_bookmarks);
+                    }
+                    Err(e) => failed = Some(e),
+                }
+            } else {
+                for (name, _) in &deletes.bookmarks {
+                    not_sent.push(format!("refs/heads/{}", name.as_str()));
+                }
+            }
+        }
+        // push_refs has set the accepted updates in `tx`, and they are on the
+        // remote, so they are recorded before the rest is reported; a push
+        // the remote refused entirely records nothing
         let mut repo = base.clone();
         if stats.all_ok() || stats.some_exported() {
             let unpublished = block_on(tx.write(truncate_chars(description, 200)))
@@ -1174,6 +1207,9 @@ impl JjBackend {
             repo = block_on(unpublished.publish())
                 .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
             *self.inner.repo.lock().unwrap() = repo.clone();
+        }
+        if let Some((code, msg)) = failed {
+            return Err((code, format!("{}; the other bookmarks were pushed and recorded", msg)));
         }
         if !stats.all_ok() {
             let mut names: Vec<String> = Vec::new();
@@ -1186,6 +1222,9 @@ impl JjBackend {
                 names.push(format!("{} (pushed but not recorded)", symbol.name.as_str()));
             }
             let mut msg = format!("push rejected: {}", names.join(", "));
+            if !not_sent.is_empty() {
+                msg.push_str(&format!("; deletes not sent: {}", not_sent.join(", ")));
+            }
             if stats.some_exported() {
                 msg.push_str("; the other bookmarks were pushed and recorded");
             }
@@ -1966,19 +2005,24 @@ fn parse_push_records(
 /// §7.6: refuse to move a bookmark whose current target is immutable to a
 /// commit that does not descend from that target, or to delete it while no
 /// bookmark left on `origin` after the push reaches that target; and refuse
-/// to send commits with unresolved files or empty descriptions
+/// to send commits with unresolved files or empty descriptions. Returns
+/// whether such a delete is allowed only because a record's new target
+/// reaches it, so the deletes must wait for the updates (push_to_origin)
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
     repo: &Arc<ReadonlyRepo>,
     vis: &VisibleRepo,
     immutable: &BTreeSet<String>,
-) -> Result<(), OpenError> {
+) -> Result<bool, OpenError> {
     let store = repo.store().clone();
     let origin = RemoteName::new("origin");
-    // the targets of the bookmarks on `origin` after the push: those no
-    // record names, where they are as of the last fetch or push, and the
-    // records' new ones; computed for the first delete that needs them
-    let mut left_on_origin: Option<Vec<CommitId>> = None;
+    // the records' new targets, which the push sends and leaves on `origin`
+    let new_targets: Vec<CommitId> = records.iter().filter_map(|(_, t)| t.clone()).collect();
+    // the targets of the other bookmarks left on `origin` after the push:
+    // those no record names, where they are as of the last fetch or push;
+    // computed for the first delete that needs them
+    let mut unnamed: Option<Vec<CommitId>> = None;
+    let mut deletes_wait = false;
     for (name, target) in records {
         let Some(current) = repo
             .view()
@@ -2004,30 +2048,38 @@ fn check_push_records(
         match target {
             None => {
                 // a delete loses no history while another bookmark still
-                // reaches the commit: a merged feature, a second name
-                let heads = left_on_origin.get_or_insert_with(|| {
+                // reaches the commit: a merged feature, a second name. When
+                // only a bookmark this push sets reaches it (`rename`), the
+                // remote may reject that update and accept the delete, so
+                // the delete waits for the update to be accepted
+                let unnamed = unnamed.get_or_insert_with(|| {
                     let named: BTreeSet<&str> = records.iter().map(|(n, _)| n.as_str()).collect();
                     repo.view()
                         .remote_bookmarks(origin)
                         .filter(|(n, _)| !named.contains(n.as_str()))
                         .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
-                        .chain(records.iter().filter_map(|(_, t)| t.as_ref()))
                         .cloned()
                         .collect()
                 });
-                let unreached = ResolvedRevsetExpression::commits(vec![current.clone()])
-                    .intersection(&ResolvedRevsetExpression::commits(heads.clone()).ancestors())
-                    .evaluate(repo.as_ref())
-                    .and_then(|r| r.is_empty())
-                    .map_err(|e| (2, format!("cannot read the index: {}", e)))?;
-                if unreached {
-                    return Err((
-                        1,
-                        format!(
-                            "push: `{}` is on the immutable commit `@{}` and cannot be deleted while no bookmark left on origin reaches it",
-                            name, change_id
-                        ),
-                    ));
+                let reached = |heads: &[CommitId]| {
+                    ResolvedRevsetExpression::commits(vec![current.clone()])
+                        .intersection(&ResolvedRevsetExpression::commits(heads.to_vec()).ancestors())
+                        .evaluate(repo.as_ref())
+                        .and_then(|r| r.is_empty())
+                        .map(|empty| !empty)
+                        .map_err(|e| (2, format!("cannot read the index: {}", e)))
+                };
+                if !reached(unnamed)? {
+                    if !reached(&new_targets)? {
+                        return Err((
+                            1,
+                            format!(
+                                "push: `{}` is on the immutable commit `@{}` and cannot be deleted while no bookmark left on origin reaches it",
+                                name, change_id
+                            ),
+                        ));
+                    }
+                    deletes_wait = true;
                 }
             }
             Some(new) => {
@@ -2047,9 +2099,8 @@ fn check_push_records(
     }
     // the commits that would be sent: ancestors of the new targets that no
     // bookmark on the remote already reaches; a delete sends none
-    let heads: Vec<CommitId> = records.iter().filter_map(|(_, t)| t.clone()).collect();
-    if heads.is_empty() {
-        return Ok(());
+    if new_targets.is_empty() {
+        return Ok(deletes_wait);
     }
     let on_remote: Vec<CommitId> = repo
         .view()
@@ -2058,7 +2109,7 @@ fn check_push_records(
         .cloned()
         .collect();
     let sent = ResolvedRevsetExpression::commits(on_remote)
-        .range(&ResolvedRevsetExpression::commits(heads))
+        .range(&ResolvedRevsetExpression::commits(new_targets))
         .evaluate(repo.as_ref())
         .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
     let sent: Vec<Commit> = block_on(sent.stream().commits(&store).try_collect())
@@ -2075,7 +2126,7 @@ fn check_push_records(
             return Err((1, format!("push: commit `@{}` has an empty description", change_id)));
         }
     }
-    Ok(())
+    Ok(deletes_wait)
 }
 
 /// change-id closure of jj-parents from the seeds (all jj parents, not just

@@ -797,6 +797,64 @@ fn push_deletes_an_immutable_bookmark_another_one_reaches() {
 }
 
 #[test]
+fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
+    // §7.6: a delete of a bookmark on an immutable commit that only a
+    // bookmark the same push sets still reaches is sent after that update is
+    // accepted. Both went in one git push, which is not atomic: when the
+    // remote rejected `main`, `push (rename "master" "main")` deleted master
+    // anyway and left no bookmark on origin reaching trunk's history
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup();
+    let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let hook = env.remote.join("hooks/update");
+    let reject = |name: &str| {
+        let script = format!("#!/bin/sh\n[ \"$1\" = refs/heads/{} ] && exit 1\nexit 0\n", name);
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    let top_op = || env.j(&dest, &["ops"]).ok().stdout.lines().next().unwrap_or("").to_string();
+    let labelled = |label: &str| {
+        let tree = env.j(&dest, &["tree"]).ok().stdout;
+        tree.lines().any(|l| l.contains('◆') && l.contains("one") && l.contains(label))
+    };
+    // the remote's default branch is `main`, so git lets master be deleted
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    // the update is rejected: the delete is not sent, and nothing is recorded
+    reject("main");
+    let before = top_op();
+    let out = env.j(&dest, &["push (rename \"master\" \"main\")"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("refs/heads/main"), "{}", out.stderr);
+    assert!(out.stderr.contains("not sent: refs/heads/master"), "{}", out.stderr);
+    assert_eq!(refs(), format!("refs/heads/master {}\n", one));
+    assert_eq!(top_op(), before);
+    assert!(labelled("master"), "trunk's commit is no longer immutable");
+
+    // one update of two is accepted: it is recorded, the delete still waits
+    let out = env.j(&dest, &["push (\\r -> label \"keep\" trunk r ++ rename \"master\" \"main\" r)"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("not sent: refs/heads/master"), "{}", out.stderr);
+    assert_eq!(refs(), format!("refs/heads/keep {one}\nrefs/heads/master {one}\n"));
+    assert!(top_op().contains("label \"keep\""), "{}", top_op());
+    assert!(labelled("keep") && labelled("master"));
+
+    // every update is accepted and the delete rejected: the one operation
+    // records the update
+    env.j(&dest, &["push (unlabel \"keep\")"]).ok();
+    reject("master");
+    let out = env.j(&dest, &["push (rename \"master\" \"main\")"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("push rejected: refs/heads/master"), "{}", out.stderr);
+    assert_eq!(refs(), format!("refs/heads/main {one}\nrefs/heads/master {one}\n"));
+    assert!(top_op().contains("rename \"master\" \"main\""), "{}", top_op());
+    assert!(labelled("main") && labelled("master"));
+}
+
+#[test]
 fn push_moves_a_bookmark_whose_remote_commit_was_rewritten() {
     // §7.6: only the visible commit carrying a change id is in the immutable
     // set. Bookmarks pushed at a commit that was then amended here, and the
