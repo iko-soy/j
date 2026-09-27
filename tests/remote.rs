@@ -816,6 +816,7 @@ fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
     env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
     let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
     let top_op = || env.j(&dest, &["ops"]).ok().stdout.lines().next().unwrap_or("").to_string();
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
     let labelled = |label: &str| {
         let tree = env.j(&dest, &["tree"]).ok().stdout;
         tree.lines().any(|l| l.contains('◆') && l.contains("one") && l.contains(label))
@@ -825,13 +826,13 @@ fn push_deletes_an_immutable_bookmark_only_after_the_update_that_reaches_it() {
 
     // the update is rejected: the delete is not sent, and nothing is recorded
     reject("main");
-    let before = top_op();
+    let before = ops();
     let out = env.j(&dest, &["push (rename \"master\" \"main\")"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("refs/heads/main"), "{}", out.stderr);
     assert!(out.stderr.contains("not sent: refs/heads/master"), "{}", out.stderr);
     assert_eq!(refs(), format!("refs/heads/master {}\n", one));
-    assert_eq!(top_op(), before);
+    assert_eq!(ops(), before);
     assert!(labelled("master"), "trunk's commit is no longer immutable");
 
     // one update of two is accepted: it is recorded, the delete still waits
