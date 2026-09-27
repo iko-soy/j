@@ -622,6 +622,27 @@ fn a_let_binding_not_yet_evaluated_is_not_its_top_level_namesake() {
 }
 
 #[test]
+fn label_literal_depends_on_a_let_binding_named_labelled() {
+    // §4.11: `%main` is `labelled "main"`, so in the scope of a config.j
+    // binding `labelled` (§4.2) it is ordered after that binding (§4.1) and
+    // applies it, wherever the block lists it. `a` used to be evaluated
+    // first, before the binding: the top-level `labelled` gave `[]` where
+    // `labelled "main"` in its place gave "main"
+    for block in [
+        "let a = %main; labelled = \\n r -> n in a 0",
+        "let a = labelled \"main\"; labelled = \\n r -> n in a 0",
+        "let labelled = \\n r -> n; a = %main in a 0",
+        "let b = { f = (let c = 1 in %main) }; labelled = \\n r -> n in b.f 0",
+        "let a = \\u -> %main; labelled = \\n r -> n in a 1 0",
+    ] {
+        let i = eval_cfg(&format!("{}\nzz = {}\n", MINIMAL, block))
+            .unwrap_or_else(|e| panic!("{}: {}", block, e));
+        let v = i.globals.lookup("zz").expect("zz");
+        assert!(j::value::value_eq(&v, &Value::text("main")).unwrap(), "{}", block);
+    }
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);

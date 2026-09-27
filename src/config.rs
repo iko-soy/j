@@ -388,6 +388,13 @@ fn binding_refs(
                 out.push((j, !in_lambda));
             }
         }
+        // `%main` is `labelled "main"` (§4.11), and in config.j a block may
+        // bind `labelled` (§4.2)
+        Expr::LabelLit(_) => {
+            if let Some(j) = bs.iter().position(|(b, _)| b == "labelled") {
+                out.push((j, !in_lambda));
+            }
+        }
         Expr::Lambda(_, body, _) => binding_refs(body, bs, true, out),
         Expr::If(a, b, c) => {
             sub(a);
@@ -421,14 +428,12 @@ fn binding_refs(
                 sub(e);
             }
         }
-        // `%main` refers to `labelled`, a top-level name, never a binding
         Expr::TypeName(_)
         | Expr::Int(_)
         | Expr::Text(_)
         | Expr::IdLit(_)
         | Expr::Id(_)
         | Expr::NewId
-        | Expr::LabelLit(_)
         | Expr::PathLit(_)
         | Expr::Bool(_)
         | Expr::SelectorFun(_)

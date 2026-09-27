@@ -508,10 +508,12 @@ renders a minted id like any other.
 
 ### 4.11 Label literals
 
-`%main` denotes `labelled "main"`, a `Revset`. It is a function, evaluated
-when applied, so it never fails at parse time: a name the remote does not have
-yields `[]`, and `goto %nope` crashes with "expected one revision, got 0" as
-any revset would.
+`%main` denotes `labelled "main"`, a `Revset`, as if written out where it
+stands: in the scope of a `config.j` binder named `labelled` (§4.2) it applies
+the binder, and it is a reference to it for evaluation order (§4.1). It is a
+function, evaluated when applied, so it never fails at parse time: a name the
+remote does not have yields `[]`, and `goto %nope` crashes with "expected one
+revision, got 0" as any revset would.
 
 ### 4.12 Shapes as values, and `extract`
 
