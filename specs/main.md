@@ -890,24 +890,31 @@ some other value in its place.
   would be).
 - A path that is a file in one of the three snapshots and a directory in
   another is merged as one value, as jj does, the directory with everything
-  below it: when at most one of `onto` and `to` changed it from `from`, or
-  both made the same change, that value is taken whole, and otherwise the
-  result is a conflict at the path, its directory sides kept whole. `replay`
-  crashes, naming the path, when that conflict would have a file on one side
-  and on another a directory that `onto` or `to` holds, as replaying the
-  addition of `./a/b` onto a file `./a` would: one entry cannot list the
-  directory's entries. It does not crash where one of the three already
-  holds a conflict at that path (an unresolved blob there, not one below
-  it): the sides came in with that conflict and are carried like any others,
-  so a child that resolves such a conflict can be squashed into it. The
-  in-memory backend of §10 merges such a path file by file, like any other,
-  keeps no directory as a side, and crashes when its result would hold both
-  `./a` and `./a/b`. So here, as where jj merges lines, the two backends may
-  differ: it resolves some merges that jj keeps as a conflict or refuses (a
-  change from a file `./a` to `./a/b` replayed onto a snapshot without
-  `./a` gives `./a/b`; the deletion of `./a/z` replayed onto a snapshot
-  where `./a` is a file gives that file), and it may crash where jj carries
-  a conflict that one of the three held at `./a`.
+  below it. When at most one of `onto` and `to` changed it from `from`, that
+  value is taken whole. When both did and none of the three holds a
+  conflict at or below the path, the result is their value taken whole if
+  they made the same change, and otherwise a conflict at the path, its
+  directory sides kept whole. A conflict one of the three holds there takes
+  part with all its sides, as above, so the result is a conflict at the path
+  unless sides cancel, even where both made the same change: a child that
+  resolves a conflict at `./a` into `./a/b`, replayed with `from` that
+  conflict onto the same resolution, keeps a conflict at `./a`. `replay`
+  crashes, naming the path, when its result would be a conflict at the path
+  with a file on one side and on another a directory that `onto` or `to`
+  holds, as replaying the addition of `./a/b` onto a file `./a` would: one
+  entry cannot list the directory's entries. It does not crash where one of
+  the three already holds a conflict at that path (an unresolved blob there,
+  not one below it): the sides came in with that conflict and are carried
+  like any others, so a child that resolves such a conflict can be squashed
+  into it. The in-memory backend of §10 merges such a path file by file,
+  like any other, keeps no directory as a side, and crashes when its result
+  would hold both `./a` and `./a/b`. So here, as where jj merges lines, the
+  two backends may differ: it resolves some merges that jj keeps as a
+  conflict or refuses (a change from a file `./a` to `./a/b` replayed onto a
+  snapshot without `./a` gives `./a/b`, and so does one from a conflict at
+  `./a` to `./a/b` replayed onto `./a/b`; the deletion of `./a/z` replayed
+  onto a snapshot where `./a` is a file gives that file), and it may crash
+  where jj carries a conflict that one of the three held at `./a`.
 - `unresolved`, `blob`, and `text` are as in §4.9. `blob` produces a regular
   file. File type (executable, symlink) travels with a `Blob` but cannot be
   changed in the language. `text` of a symlink is its target; `text` of a
