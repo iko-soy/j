@@ -1009,7 +1009,7 @@ impl JjBackend {
         let base = self.head_repo()?;
         let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
-        check_push_records(&records, &base, &immutable)?;
+        check_push_records(&records, &base, &vis, &immutable)?;
         let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
         Ok(())
     }
@@ -1880,6 +1880,7 @@ fn parse_push_records(
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
     repo: &Arc<ReadonlyRepo>,
+    vis: &VisibleRepo,
     immutable: &BTreeSet<String>,
 ) -> Result<(), OpenError> {
     let store = repo.store().clone();
@@ -1899,7 +1900,11 @@ fn check_push_records(
             .map_err(|e| (2, format!("cannot read a commit: {}", e)))?
             .change_id()
             .reverse_hex();
-        if !immutable.contains(&change_id) {
+        // the immutable set holds visible commits: a target rewritten here
+        // since the last fetch or push is hidden, and not in it although the
+        // visible rewrite carries its change id (and its label)
+        let visible = vis.commits.get(&change_id).is_some_and(|c| c.commit.id() == &current);
+        if !visible || !immutable.contains(&change_id) {
             continue;
         }
         match target {

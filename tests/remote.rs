@@ -561,6 +561,43 @@ fn push_refuses_moving_an_immutable_bookmark() {
 }
 
 #[test]
+fn push_moves_a_bookmark_whose_remote_commit_was_rewritten() {
+    // §7.6: only the visible commit carrying a change id is in the immutable
+    // set. Bookmarks pushed at a commit that was then amended here, and the
+    // amended commit put on trunk, still point at the hidden original on
+    // the remote. The check found their change id in the immutable set and
+    // tested descent from the hidden commit, which nothing descends from:
+    // they could never be moved or deleted again
+    let env = setup();
+    let rev = |name: &str| git(&env.remote, &["rev-parse", name]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "two\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    let expr = "push (\\r -> label \"feature\" here r ++ label \"other\" here r ++ label \"gone\" here r)";
+    env.j(&dest, &[expr]).ok();
+    let pushed = rev("feature");
+    env.j(&dest, &["describe \"work v2\""]).ok();
+    env.j(&dest, &["push (label \"master\" here)"]).ok();
+    assert_ne!(rev("master"), pushed);
+
+    // onto a child of the amended commit
+    std::fs::write(dest.join("b.txt"), "three\n").unwrap();
+    env.j(&dest, &["describe \"next\""]).ok();
+    let out = env.j(&dest, &["push (label \"other\" here)"]);
+    assert_eq!(out.code, 0, "moved onto a child: {}", out.stderr);
+    assert_eq!(git(&env.remote, &["rev-parse", "other^"]), rev("master"));
+    // deleted
+    let out = env.j(&dest, &["push (unlabel \"gone\")"]);
+    assert_eq!(out.code, 0, "deleted: {}", out.stderr);
+    assert!(!git(&env.remote, &["branch"]).contains("gone"));
+    // onto the amended commit itself
+    let out = env.j(&dest, &["push relabel"]);
+    assert_eq!(out.code, 0, "relabelled: {}", out.stderr);
+    assert_eq!(rev("feature"), rev("master"));
+}
+
+#[test]
 fn push_checks_only_the_commits_it_sends() {
     // §7.6: the unresolved-file and empty-description refusals are about
     // commits that would be sent. The check walked every ancestor of the new

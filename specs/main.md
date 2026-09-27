@@ -949,6 +949,9 @@ language: `fetch` and `push` are the only things that change them.
     record would move it to a commit that does not descend from it, or delete
     it.
 
+  Targets and descent are commits as the remote has them: a target rewritten
+  here since the last `fetch` or `push` is hidden, and not in the immutable
+  set although the visible rewrite carries its change id and its label.
   Moving a bookmark whose current target is not immutable to an unrelated
   commit is allowed; that is how a rewritten stack is re-pushed. After a
   successful push the labels reflect the new positions. It records one
