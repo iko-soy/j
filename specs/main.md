@@ -730,7 +730,7 @@ use: `show` writes no stand-in for the part.
 | unresolved `Blob` | `{- unresolved -} blob "…"` with the conflict-marker rendering |
 | builtin | its declared name, operators parenthesised: `map`, `(++)` |
 | selector | the selector itself: `.id` |
-| top-level definition | its name |
+| top-level definition with a signature whose value is a function | its name |
 | revset from a label literal | `%name` |
 | shape | its type name: `Commit`, `Id` |
 | lambda closure | its source text, exactly as written |
@@ -740,10 +740,13 @@ A lambda's source text runs from its `\` to the last token of its body,
 comments within it included, and a section's is the section itself, which
 unlike a lambda is an atom: `map (+ 1)`, `(\x y -> x + y) 1`.
 
-A top-level definition renders as its name whatever its value is built from,
-and its partial application as its name followed by the arguments it was
-given, never by those its value holds: `prev`, not `prev (parents)` (with
-`prev = goto parents`), `tree`, not `treeWith ({ … })`, and `addT 1` (§4.13).
+A top-level definition with a signature whose value is a function renders as
+its name whatever that function is built from, and its partial application
+as its name followed by the arguments it was given, never by those its value
+holds: `prev`, not `prev (parents)` (with `prev = goto parents`), `tree`, not
+`treeWith ({ … })`, and `addT 1` (§4.13). Any other definition renders as its
+value: `user` as its record, and without signatures `inc = \x -> x + 1` as
+`\x -> x + 1` and `incAll = map inc` as `map (\x -> x + 1)`.
 
 Line breaking: one line if it fits in 80 columns (display width, as in §5.1);
 otherwise the outermost list or record breaks one element per line, two-space

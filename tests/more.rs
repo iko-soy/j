@@ -264,8 +264,9 @@ constT = const (\y -> y)
 
 #[test]
 fn a_signed_definition_shows_as_its_name_and_its_own_arguments() {
-    // §5.2: a top-level definition renders as its name, and a partial
-    // application as the function followed by the arguments it was given.
+    // §5.2: a top-level definition with a signature whose value is a
+    // function renders as its name, and its partial application as its name
+    // followed by the arguments it was given; any other renders as its value.
     // A signed definition bound to a lambda's partial application showed
     // the arguments baked into its value as its own: `show prev` was
     // `prev (parents)`, and `show (addTwo 2)` was `addTwo 1 2`, which is an
@@ -304,6 +305,10 @@ ff = foldl
 
 k4 : a
 k4 = foldl (+)
+
+incU = \x -> x + 1
+
+incAll = map incU
 "#,
     );
     for (src, want) in [
@@ -340,9 +345,21 @@ k4 = foldl (+)
         ("show ((+) 1)", "(+) 1"),
         ("show (const 1)", "const 1"),
         ("show map", "map"),
+        // and any other definition renders as its value
+        ("show sum3", "\\a b -> \\c -> a + b + c"),
+        ("show (sum3 1)", "(\\a b -> \\c -> a + b + c) 1"),
+        ("show incU", "\\x -> x + 1"),
+        ("show incAll", "map (\\x -> x + 1)"),
     ] {
         assert_value(&mut i, &cfg, src, Value::text(want));
     }
+    // `user` too, as it is not a function, though it has a signature
+    assert_value(
+        &mut i,
+        &cfg,
+        "show user == show ({ name = user.name, email = user.email })",
+        Value::bool(true),
+    );
     // the arguments are still numbered by the signature, and applied
     assert_value(&mut i, &cfg, "addTwo 2 3", Value::int(6));
     assert_value(&mut i, &cfg, "plus 1 2", Value::int(3));
