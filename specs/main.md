@@ -1053,8 +1053,9 @@ language: `fetch` and `push` are the only things that change them.
     (those left are the bookmarks no record names, where they are as of the
     last `fetch` or `push`, and the records' new targets);
   - the deletes would wait (below) and a bookmark it sets and one it deletes
-    are a name and a name under it, such as `master` and `master/legacy`:
-    git cannot hold both, so the first git push could not succeed.
+    are a name and a name under it, such as `master` and `master/legacy`
+    (not `master2`): git cannot hold both, so the first git push could not
+    succeed.
 
   Targets and descent are commits as the remote has them: a target rewritten
   here since the last `fetch` or `push` is hidden, and not in the immutable
