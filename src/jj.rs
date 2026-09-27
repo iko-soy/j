@@ -1531,15 +1531,49 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
         return Err((2, format!("{} already exists and is not empty", dir)));
     }
     let existed = dir_path.is_dir();
-    std::fs::create_dir_all(&dir_path)
-        .map_err(|e| (2, format!("cannot create {}: {}", dir, e)))?;
+    // the directories this run creates, in order: a clone that fails
+    // removes these, or an existing DIR's entries, and nothing else (§7.8).
+    // Each is made by `create_dir`, whose success proves it new. The checks
+    // above read DIR as written, before its missing parents exist; once
+    // they do, `new/..` or `new/../keep` names a directory that was there,
+    // so DIR's own `create_dir` failing, AlreadyExists included, refuses it
+    // as `git clone` does
+    let mut created: Vec<&std::path::Path> = Vec::new();
+    if !existed {
+        // DIR and its missing parents, DIR first ("" is the current
+        // directory, which exists)
+        let missing: Vec<&std::path::Path> = dir_path
+            .ancestors()
+            .enumerate()
+            .take_while(|(i, p)| *i == 0 || !(p.as_os_str().is_empty() || p.exists()))
+            .map(|(_, p)| p)
+            .collect();
+        for p in missing.into_iter().rev() {
+            match std::fs::create_dir(p) {
+                Ok(()) => created.push(p),
+                // a parent reached again through `..`
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && p != dir_path
+                        && p.is_dir() => {}
+                Err(e) => {
+                    for p in created.iter().rev() {
+                        let _ = std::fs::remove_dir(p);
+                    }
+                    return Err((2, format!("cannot create {}: {}", dir, e)));
+                }
+            }
+        }
+    }
     let cloned = clone_into(cfg, &settings, url, &dir_path);
     if cloned.is_err() {
         // like `git clone`, a clone that fails leaves nothing behind: its
         // working-copy commit would claim files the checkout never wrote,
         // and a later clone would refuse the directory (§7.8)
         if !existed {
-            let _ = std::fs::remove_dir_all(&dir_path);
+            for p in created.iter().rev() {
+                let _ = std::fs::remove_dir_all(p);
+            }
         } else if let Ok(entries) = std::fs::read_dir(&dir_path) {
             for entry in entries.flatten() {
                 let _ = match entry.file_type() {

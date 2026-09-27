@@ -398,6 +398,60 @@ fn clone_that_cannot_check_out_leaves_nothing_behind() {
 }
 
 #[test]
+fn failed_clone_removes_only_the_directories_it_created() {
+    // §7.8: the emptiness checks ran on DIR as written, so `newdir/..` (or
+    // `new/../keep`) passed them while `newdir` did not exist yet; creating
+    // it made DIR the existing, non-empty working directory (or `keep`).
+    // The clone went into it, and when it failed its cleanup removed
+    // everything there. A failed clone into `a/b/c` left `a/b`. A DIR that
+    // exists only once its parents are created is now refused, and a failed
+    // clone removes the directories it created, DIR's missing parents
+    // included, and nothing else.
+    let env = setup();
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(work.join("keep")).unwrap();
+    std::fs::create_dir_all(work.join("inner/src")).unwrap();
+    std::fs::write(work.join("notes.txt"), "n\n").unwrap();
+    std::fs::write(work.join("keep/notes.txt"), "k\n").unwrap();
+    std::fs::write(work.join("inner/src/main.rs"), "m\n").unwrap();
+    let listing = |dir: &PathBuf| {
+        let mut all = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                all.push(p.strip_prefix(dir).unwrap().display().to_string());
+                if p.is_dir() {
+                    stack.push(p);
+                }
+            }
+        }
+        all.sort();
+        all
+    };
+    let before = listing(&work);
+    let missing = env.dir.join("nowhere.git");
+    for (cwd, dest) in [
+        (&work, "newdir/.."),
+        (&work, "new/../keep"),
+        (&work.join("inner"), "x/../.."),
+    ] {
+        for url in [&env.remote, &missing] {
+            let out = env.j(cwd, &["clone", url.to_str().unwrap(), dest]);
+            assert_eq!(out.code, 2, "clone into {}: {}", dest, out.stderr);
+            assert_eq!(listing(&work), before, "clone into {}", dest);
+        }
+    }
+    for dest in ["a/b/c", "new/../fresh"] {
+        let out = env.j(&work, &["clone", missing.to_str().unwrap(), dest]);
+        assert_eq!(out.code, 1, "clone into {}: {}", dest, out.stderr);
+        assert_eq!(listing(&work), before, "clone into {}", dest);
+    }
+    env.j(&work, &["clone", env.remote.to_str().unwrap(), "new/../fresh"]).ok();
+    assert_eq!(std::fs::read_to_string(work.join("fresh/a.txt")).unwrap(), "one\n");
+}
+
+#[test]
 fn init_over_git_takes_a_directory_it_cannot_scan() {
     // §7.4, §7.8: init over an existing git working tree scans it before
     // checking out, and a directory that scan cannot read (one deeper than

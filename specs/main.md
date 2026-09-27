@@ -1120,14 +1120,16 @@ that state, §7.2 applies.
   becomes the working-copy commit's change. It exits 2 if the directory is
   already inside a jj repository, or if `.git` exists but is not a directory
   (a git worktree or submodule). It requires `user` (§7.9).
-- **`clone URL [DIR]`** creates `DIR` (exit 2 if it exists and is non-empty),
+- **`clone URL [DIR]`** creates `DIR` and its missing parents (exit 2 if
+  `DIR` exists and is non-empty, or cannot be created, which includes a `DIR`
+  such as `new/..` that names an existing directory once its parents exist),
   clones `URL` into it as a colocated repository, sets `origin` to `URL`,
   fetches, and creates a working-copy commit as a child of the remote's
   default bookmark target (or of the root commit if the remote has none),
   holding that target's files (see below), and checks it out. The default
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
-  checkout included, records nothing and removes what it created, leaving
-  `DIR` as it found it. It requires `user`.
+  checkout included, records nothing and removes the directories it created,
+  or empties the `DIR` it found empty, and nothing else. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
