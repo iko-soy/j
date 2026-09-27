@@ -378,7 +378,7 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
     if let Some(old) = &old {
         validate_immutable(old, new, &immutable)?;
     }
-    validate_path_names(old.as_ref(), new, &immutable)?;
+    validate_path_names(old.as_ref(), new, &immutable, i.backend.folds_case())?;
     // focus mutable (§7.5 step 6)
     let focus_id = id_of(&new.field("root")?)?;
     if focus_id == ROOT_ID || immutable.contains(&focus_id) {
@@ -467,7 +467,8 @@ const NAME_MAX: usize = 255;
 /// checks out. jj stores any name that is not empty and has no `/`, but its
 /// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
 /// over `NAME_MAX`, after the operation is recorded; a git tree cannot hold
-/// a NUL.
+/// a NUL. Where the filesystem folds case, `.GIT` is the file `.git`, which
+/// the checkout refuses by its file identity.
 ///
 /// A commit that keeps the files it has in `old` is checked only as the
 /// focus: persisting at most rewrites it with the tree jj already stored and
@@ -478,6 +479,7 @@ fn validate_path_names(
     old: Option<&Value>,
     new: &Value,
     immutable: &BTreeSet<String>,
+    folds_case: bool,
 ) -> Result<(), Crash> {
     let focus = id_of(&new.field("root")?)?;
     let stored: BTreeMap<String, Value> = match old {
@@ -491,6 +493,7 @@ fn validate_path_names(
         matches!(comp, "" | "." | ".." | ".git" | ".jj")
             || comp.contains(['/', '\0'])
             || comp.len() > NAME_MAX
+            || (folds_case && (comp.eq_ignore_ascii_case(".git") || comp.eq_ignore_ascii_case(".jj")))
     };
     for c in all_commits(new)? {
         let id = id_of(&c)?;

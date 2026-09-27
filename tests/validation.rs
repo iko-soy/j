@@ -238,6 +238,32 @@ fn immutable_commits_keep_stored_path_components() {
 }
 
 #[test]
+fn case_folding_filesystem_refuses_reserved_names_in_any_case() {
+    // where the filesystem folds case, `.GIT` is the name `.git`, which jj's
+    // checkout refuses at every depth, after the operation was recorded
+    let old = two_commit_repo(&[]);
+    let mut b = backend_with(&["kaaaaaaa", "kbbbbbbb"]);
+    b.folds_case = true;
+    let mut i = make_interp(b);
+    *i.old_repo.borrow_mut() = Some(old.clone());
+    for bad in [
+        &[".GIT", "hooks", "post-checkout"][..],
+        &["sub", ".Jj", "x"][..],
+        &[".JJ"][..],
+        &[".git"][..],
+        &[".."][..],
+    ] {
+        let new = focus_with_files(vec![entry_at(bad, "pwn")]);
+        let e = j::repo::validate_repo(&mut i, &new).unwrap_err();
+        assert!(e.msg.contains("path component"), "{:?}: {}", bad, e.msg);
+    }
+    for ok in [&["..."][..], &[".Gitignore"][..], &[".JJconfig", ".GIT.d"][..], &["GIT"][..]] {
+        let new = focus_with_files(vec![entry_at(ok, "fine")]);
+        assert!(j::repo::validate_repo(&mut i, &new).is_ok(), "{:?}", ok);
+    }
+}
+
+#[test]
 fn unchanged_mutable_commits_keep_stored_path_components() {
     // git stores `.jj/x`, so a fetched branch can hold it; the branch is
     // mutable and labelled, so it cannot be abandoned. Refusing its names

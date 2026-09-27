@@ -532,6 +532,32 @@ fn unwritable_path_refused_before_anything_is_recorded() {
 }
 
 #[test]
+fn reserved_names_in_another_case_refused_where_the_filesystem_folds_case() {
+    // on a case-folding filesystem (macOS, Windows) `.GIT` is `.git`, which
+    // jj's checkout refuses after the operation is recorded; elsewhere it is
+    // an ordinary name the snapshot tracks
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"stable\""]).ok();
+    let folds = r.dir.join(".JJ").exists();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let edit = r#"mapRoot (\c -> c { files = c.files ++ [{ path = ["sub" ".GIT" "x"], content = blob "x" }] })"#;
+    let dry = r.j(&[&format!("tree . validate . {}", edit)]);
+    let out = r.j(&[edit]);
+    if folds {
+        assert_eq!(dry.code, 1, "validate accepted it: {}", dry.stdout);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("path component"), "{}", out.stderr);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    } else {
+        assert_eq!(dry.code, 0, "{}", dry.stderr);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(r.read("sub/.GIT/x"), "x");
+    }
+    r.j(&["describe \"after\""]).ok();
+}
+
+#[test]
 fn root_path_entry_is_a_crash_not_a_panic() {
     // jj's tree builder asserts a path is not the root: exit 101 and a Rust
     // panic, which `or` could not catch

@@ -60,6 +60,12 @@ pub trait Backend {
     /// parent of a merge, not only the first (§7.5 step 3).
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String>;
 
+    /// True if the working directory's filesystem folds case, so `.GIT`
+    /// names `.git` and jj's checkout refuses it (§7.5 step 1).
+    fn folds_case(&self) -> bool {
+        false
+    }
+
     /// jj tree merge (§7.3): replay the change from->to onto `onto`.
     fn replay(
         &self,
@@ -287,6 +293,9 @@ pub struct MemBackend {
     pub conflicts: HashMap<String, bool>,
     /// id -> the commit's tree equals its first parent's
     pub empties: HashMap<String, bool>,
+    /// what `folds_case` answers: a working directory on a case-folding
+    /// filesystem, which no test machine need have
+    pub folds_case: bool,
 }
 
 impl MemBackend {
@@ -344,6 +353,9 @@ impl Backend for MemBackend {
             return None;
         }
         Some(self.empties.get(id).copied().unwrap_or(false))
+    }
+    fn folds_case(&self) -> bool {
+        self.folds_case
     }
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();

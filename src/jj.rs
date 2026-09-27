@@ -34,7 +34,7 @@ use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn block_on<F: Future>(f: F) -> F::Output {
     pollster::block_on(f)
@@ -264,6 +264,9 @@ pub struct JjInner {
     /// working-copy lock is not held: its saved state is still the tree
     /// recorded before the snapshot until `persist`'s checkout resets it
     pending: Mutex<Option<PendingSnapshot>>,
+    /// whether the workspace's filesystem folds case, probed on first use
+    /// (`Backend::folds_case`)
+    folds_case: OnceLock<bool>,
 }
 
 /// holding the file keeps the flock
@@ -324,6 +327,7 @@ impl JjBackend {
                 visible: Mutex::new(None),
                 lock_guard: Mutex::new(None),
                 pending: Mutex::new(None),
+                folds_case: OnceLock::new(),
             }),
         })
     }
@@ -1356,6 +1360,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
             visible: Mutex::new(None),
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
+            folds_case: OnceLock::new(),
         }),
     };
     if had_git {
@@ -1419,6 +1424,7 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
             visible: Mutex::new(None),
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
+            folds_case: OnceLock::new(),
         }),
     };
     let origin = RemoteName::new("origin");
@@ -1969,6 +1975,23 @@ impl Backend for JjBackend {
             let rec = v.commits.get(id)?;
             let parent = v.commits.get(parent)?;
             Some(rec.commit.tree_ids() == parent.commit.tree_ids())
+        })
+    }
+
+    fn folds_case(&self) -> bool {
+        // jj's checkout refuses a name whose file identity is that of
+        // `.git` or `.jj` in the same directory (local_working_copy.rs), so
+        // where `.JJ` is the workspace's own `.jj` it refuses `.GIT` too
+        *self.inner.folds_case.get_or_init(|| {
+            use jj_lib::file_util::FileIdentity;
+            let root = &self.inner.workspace_root;
+            match (
+                FileIdentity::from_symlink_path(root.join(".jj")),
+                FileIdentity::from_symlink_path(root.join(".JJ")),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
         })
     }
 
