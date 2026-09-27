@@ -681,7 +681,9 @@ j: crash: expected one revision, got 0
 value except closures, unresolved blobs, and values nested past the parser's
 bound (§3.4: a list 40,000 deep, a record about 20,000), `show v` parses and
 evaluates to a value equal to `v` under the same `config.j`. It never uses
-colour and never truncates.
+colour and never truncates. A value holding a part the store cannot supply (a
+`files` list or a file's content, §7.2) crashes `show` as it crashes any other
+use: `show` writes no stand-in for the part.
 
 | kind | rendering |
 |---|---|

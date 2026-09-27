@@ -33,7 +33,7 @@ fn ok(interp: &mut Interp, cfg: &config::Config, src: &str) -> Value {
 
 fn crash(interp: &mut Interp, cfg: &config::Config, src: &str) -> String {
     match ev(interp, cfg, src) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v).unwrap()),
         Err(m) => m,
     }
 }
@@ -45,8 +45,8 @@ macro_rules! check {
             value_eq(&got, &$want).unwrap_or(false),
             "{} => {}, want {}",
             $src,
-            j::show::show(&$i, &got),
-            j::show::show(&$i, &$want)
+            j::show::show(&$i, &got).unwrap(),
+            j::show::show(&$i, &$want).unwrap()
         );
     }};
 }
@@ -447,7 +447,7 @@ fn crash_in(interp: &mut Interp, cfg: &config::Config, src: &str) -> (String, Op
     let e = config::resolve_ids(&e, interp).unwrap_or_else(|_| panic!("{}: ids", src));
     let env = interp.global_env();
     match interp.eval(&Rc::new(e), &env) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v).unwrap()),
         Err(c) => (c.msg, c.def),
     }
 }
@@ -716,7 +716,7 @@ fn or_caught_crash_yields_rhs_id() {
         &cfg,
         "((\\_ -> let discard = @ in crash \"boom\") 0) or @",
     );
-    assert!(matches!(v, Value::Id(_)), "got {}", j::show::show(&i, &v));
+    assert!(matches!(v, Value::Id(_)), "got {}", j::show::show(&i, &v).unwrap());
 }
 
 #[test]

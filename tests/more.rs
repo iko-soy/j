@@ -114,7 +114,7 @@ fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
         value_eq(&got, &want).unwrap(),
         "{} gave {}",
         src,
-        j::show::show(i, &got)
+        j::show::show(i, &got).unwrap()
     );
 }
 

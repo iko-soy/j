@@ -208,7 +208,7 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
         }
         // a lambda renders as its source (§5.2), which may run over several
         // lines and hold comments; the line form keeps only the first
-        Value::Fun(_) => Ok(first_line(&crate::show::show(&Interp::dummy(), v))),
+        Value::Fun(_) => Ok(first_line(&crate::show::show(&Interp::dummy(), v)?)),
         Value::Shape(s) => Ok(s.name.clone()),
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
@@ -550,7 +550,7 @@ fn display_block(
         // all of a lambda's source, of which the line form keeps the first
         // line (§5.1), each line under the block's indent
         Value::Fun(_) => {
-            for l in crate::show::show(&Interp::dummy(), v).lines() {
+            for l in crate::show::show(&Interp::dummy(), v)?.lines() {
                 out.push_str(&pad);
                 out.push_str(l);
                 out.push('\n');

@@ -817,6 +817,13 @@ fn an_unreadable_file_list_crashes_every_time() {
         "length (repo.root.files or []) + length repo.root.files",
         "[(show repo.root.files or \"\") (show repo.root.files)]",
         "[(null (files repo) or true) (null (files repo))]",
+        // `show` crashes as any other use does, and does not stand `<lazy>`
+        // (which does not parse) in for the list: a record, first rendered
+        // on one line and then again broken over lines, a list, a function
+        "show repo.root",
+        "[(show repo.root or \"\") (show repo.root)]",
+        "show [repo.root]",
+        "show (const repo.root)",
     ] {
         let (repo, be) = unreadable_repo(unreadable_files());
         let (mut i, cfg) = make_interp(be);
@@ -825,13 +832,6 @@ fn an_unreadable_file_list_crashes_every_time() {
             Err(msg) => assert!(msg.contains(UNREADABLE), "{}: crashed with {:?}", src, msg),
             Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
         }
-    }
-    // `show` renders a record on one line first and again broken over lines
-    // when that is too wide: the second rendering saw the stand-in `false`
-    let (repo, be) = unreadable_repo(unreadable_files());
-    let (mut i, cfg) = make_interp(be);
-    if let Ok(out) = try_eval_and_display(&mut i, &cfg, "(\\repo -> show repo.root)", repo) {
-        assert!(!out.contains("false"), "{}", out);
     }
 }
 
@@ -844,6 +844,14 @@ fn an_unreadable_blob_crashes_every_time() {
         // the tree's size bar counts the lines of every touched file and
         // swallowed the failure, so a later `text` read the file as empty
         "[(tree repo) (text (contentAt [\"f.txt\"] (files repo)))]",
+        // `show` crashes too: `blob "<unreadable>"` is the literal of
+        // another blob, one holding that text (§5.2)
+        "show (contentAt [\"f.txt\"] (files repo))",
+        "let b = contentAt [\"f.txt\"] (files repo) in [(text b or \"x\") (show b)]",
+        "show (const (contentAt [\"f.txt\"] (files repo)))",
+        "[(show (files repo)) (show (files repo))]",
+        // and so does displaying a function holding it, rendered by `show`
+        "const (contentAt [\"f.txt\"] (files repo))",
     ] {
         let (repo, be) = unreadable_repo(unreadable_blob_files());
         let (mut i, cfg) = make_interp(be);
@@ -853,16 +861,9 @@ fn an_unreadable_blob_crashes_every_time() {
             Ok(out) => panic!("{}: the second look did not crash:\n{}", src, out),
         }
     }
-    // the same pure expression twice in one run agrees with itself
+    // the crash is an ordinary one, which `or` catches
     let (repo, be) = unreadable_repo(unreadable_blob_files());
     let (mut i, cfg) = make_interp(be);
-    let src = "(\\repo -> [(show (files repo)) (show (files repo))])";
-    match try_eval_and_display(&mut i, &cfg, src, repo) {
-        Ok(out) => {
-            let lines: Vec<&str> = out.lines().collect();
-            assert_eq!(lines.len(), 2, "{}", out);
-            assert_eq!(lines[0], lines[1], "{}", out);
-        }
-        Err(msg) => assert!(msg.contains(UNREADABLE), "crashed with {:?}", msg),
-    }
+    let src = "(\\repo -> show (contentAt [\"f.txt\"] (files repo)) or \"caught\")";
+    assert_eq!(try_eval_and_display(&mut i, &cfg, src, repo), Ok("caught\n".to_string()));
 }

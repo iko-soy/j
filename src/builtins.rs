@@ -265,7 +265,7 @@ fn b_ge(_i: &mut Interp, args: &[Value]) -> BResult {
 }
 
 fn b_show(i: &mut Interp, args: &[Value]) -> BResult {
-    Ok(Value::text(crate::show::show(i, &args[0])))
+    Ok(Value::text(crate::show::show(i, &args[0])?))
 }
 
 fn b_cons(_i: &mut Interp, args: &[Value]) -> BResult {

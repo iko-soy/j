@@ -28,7 +28,7 @@ fn eval_str(interp: &mut Interp, cfg: &config::Config, src: &str) -> Result<Valu
 }
 
 fn show_of(i: &Interp, v: &Value) -> String {
-    j::show::show(i, v)
+    j::show::show(i, v).unwrap()
 }
 
 #[track_caller]
