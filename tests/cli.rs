@@ -724,18 +724,19 @@ fn undo_whose_checkout_fails_records_nothing() {
     std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
     std::fs::rename(&aside, &moved).unwrap();
     let r = Repo { dir: moved, cfg: r.cfg.clone() };
-    let ops = r.j(&["ops"]).ok().stdout;
+    // `ops` prints each operation's age, so count them rather than compare
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let out = r.j(&["undo"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout, ops, "the failed undo was recorded");
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops, "the failed undo was recorded");
     // the checkout wrote `a` before it failed; it is put back, so the
     // working directory still equals the focus and there is nothing to record
     assert_eq!(r.read("a"), "two\n");
     // nor is any of the directories it made on the way to `f`
     assert!(!r.dir.join("d".repeat(250)).exists());
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
 }
 
 /// Path components, in the language's syntax, of a path under `first` far
@@ -1288,7 +1289,7 @@ fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
     assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
     // a checkout that writes the file `a` over the conflicted directory
     // and then fails is put back, which scans the file over that directory
-    let ops = r.j(&["ops"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let edit = format!(
         "\\r -> mapRoot (\\c -> c {{ files = [({{ path = ./a, content = blob \"f\" }}) \
          ({{ path = [{}], content = blob \"deep\" }})] }}) r",
@@ -1299,7 +1300,7 @@ fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
     assert!(!out.stderr.contains("put back"), "{}", out.stderr);
     assert!(r.read("a/b").contains("<<<<<<<"), "{}", r.read("a/b"));
-    assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
     std::fs::remove_dir_all(r.dir.join("a")).unwrap();
     r.write("a", "file\n");
     // `undo` scans to refuse a working directory not recorded
