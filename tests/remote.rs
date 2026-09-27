@@ -191,6 +191,42 @@ fn clone_starts_on_the_remotes_default_bookmark() {
 }
 
 #[test]
+fn fetched_branch_with_a_reserved_name_does_not_block_persisting() {
+    // git stores `.jj` paths, so a branch on the remote can hold one. It is
+    // mutable (not an ancestor of trunk) and labelled, so it cannot be
+    // abandoned, and refusing its names crashed every persisting run in the
+    // clone (`describe`, `new`, `j id`), though none of them writes or
+    // checks it out (§7.5 step 1)
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    git(&other, &["checkout", "-qb", "feature"]);
+    std::fs::create_dir_all(other.join("fixture/.jj")).unwrap();
+    std::fs::write(other.join("fixture/.jj/repo"), "vendored\n").unwrap();
+    git(&other, &["add", "-f", "fixture"]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "feat"]);
+    git(&other, &["push", "-q", "origin", "feature"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    let before = ops();
+    env.j(&dest, &["tree . validate . describe \"x\""]).ok();
+    env.j(&dest, &["describe \"hello\""]).ok();
+    env.j(&dest, &["new"]).ok();
+    std::fs::write(dest.join("new.txt"), "hi\n").unwrap();
+    env.j(&dest, &["id"]).ok();
+    // rewriting it keeps the files jj stored
+    env.j(&dest, &["at %feature (describe \"renamed\")"]).ok();
+    assert_eq!(ops(), before + 4);
+    // checking it out is still refused, and records nothing
+    let out = env.j(&dest, &["goto %feature"]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert!(out.stderr.contains("path component"), "{}", out.stderr);
+    assert_eq!(ops(), before + 4);
+    assert!(!dest.join("fixture").exists());
+}
+
+#[test]
 fn init_over_git_starts_on_head() {
     // §7.8: init over an existing git repository creates the working-copy
     // commit as a child of git's HEAD: not of the bookmark that sorts first,

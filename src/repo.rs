@@ -378,7 +378,7 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
     if let Some(old) = &old {
         validate_immutable(old, new, &immutable)?;
     }
-    validate_path_names(new, &immutable)?;
+    validate_path_names(old.as_ref(), new, &immutable)?;
     // focus mutable (§7.5 step 6)
     let focus_id = id_of(&new.field("root")?)?;
     if focus_id == ROOT_ID || immutable.contains(&focus_id) {
@@ -458,16 +458,40 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
     Ok(())
 }
 
-/// Path components (§7.5 step 1) of every commit persisting may write or
-/// check out. jj stores any name that is not empty and has no `/`, but its
+/// Path components (§7.5 step 1) of every commit persisting writes anew or
+/// checks out. jj stores any name that is not empty and has no `/`, but its
 /// checkout refuses `.`, `..`, `.git` and `.jj` — after the operation is
-/// recorded — and a git tree cannot hold a NUL. An immutable commit is kept
-/// exactly as stored (step 3), so a name its history already holds is not
-/// refused.
-fn validate_path_names(new: &Value, immutable: &BTreeSet<String>) -> Result<(), Crash> {
+/// recorded — and a git tree cannot hold a NUL.
+///
+/// A commit that keeps the files it has in `old` is checked only as the
+/// focus: persisting at most rewrites it with the tree jj already stored and
+/// never checks it out, and a fetched branch can hold `.jj`, so refusing its
+/// names would stop every persist for a commit the script did not touch.
+/// Immutable commits are such commits (step 3).
+fn validate_path_names(
+    old: Option<&Value>,
+    new: &Value,
+    immutable: &BTreeSet<String>,
+) -> Result<(), Crash> {
+    let focus = id_of(&new.field("root")?)?;
+    let stored: BTreeMap<String, Value> = match old {
+        Some(old) => all_commits(old)?
+            .into_iter()
+            .map(|c| id_of(&c).map(|id| (id, c)))
+            .collect::<Result<_, _>>()?,
+        None => BTreeMap::new(),
+    };
     for c in all_commits(new)? {
-        if immutable.contains(&id_of(&c)?) {
+        let id = id_of(&c)?;
+        if immutable.contains(&id) {
             continue;
+        }
+        if id != focus {
+            if let Some(o) = stored.get(&id) {
+                if same_files(o, &c)? {
+                    continue;
+                }
+            }
         }
         let files = c.field("files")?;
         for e in files.as_list()? {
@@ -484,6 +508,22 @@ fn validate_path_names(new: &Value, immutable: &BTreeSet<String>) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Whether commit `new` holds the files commit `old` does. A commit record,
+/// or a lazy `files`, the two share is the same without the tree being read.
+fn same_files(old: &Value, new: &Value) -> Result<bool, Crash> {
+    if let (Value::Record(a), Value::Record(b)) = (old, new) {
+        if std::rc::Rc::ptr_eq(a, b) {
+            return Ok(true);
+        }
+        if let (Some(Value::Thunk(x)), Some(Value::Thunk(y))) = (a.get("files"), b.get("files")) {
+            if std::rc::Rc::ptr_eq(x, y) {
+                return Ok(true);
+            }
+        }
+    }
+    snapshot_eq(&old.field("files")?, &new.field("files")?)
 }
 
 fn label_set(repo: &Value) -> Result<BTreeSet<(String, String)>, Crash> {

@@ -226,6 +226,67 @@ fn immutable_commits_keep_stored_path_components() {
 }
 
 #[test]
+fn unchanged_mutable_commits_keep_stored_path_components() {
+    // git stores `.jj/x`, so a fetched branch can hold it; the branch is
+    // mutable and labelled, so it cannot be abandoned. Refusing its names
+    // stopped every persist in the clone, though persisting neither checks
+    // it out nor writes any name of it jj has not already stored
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let feature_files = j::domain::lazy_files("kfffffff", vec![entry(".jj/x", "fixture")]);
+    let with_files = |id: &str, msg: &str, labels: &[&str], files: Value| {
+        let c = commit(id, msg, labels, vec![]);
+        let Value::Record(m) = c else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("files".to_string(), files);
+        Value::Record(Rc::new(m))
+    };
+    let feature = with_files("kfffffff", "feat", &["feature"], feature_files.clone());
+    // `focus` beside `other`, both children of the root
+    let beside = |focus: Value, other: Value, kids: Vec<Value>| {
+        Value::record(&[
+            ("children", Value::list(kids)),
+            (
+                "context",
+                Value::list(vec![Value::record(&[
+                    ("left", Value::list(vec![])),
+                    ("parent", root.clone()),
+                    ("right", Value::list(vec![subtree(other, vec![])])),
+                ])]),
+            ),
+            ("root", focus),
+        ])
+    };
+    let a = commit("kaaaaaaa", "", &[], vec![]);
+    let old = beside(a.clone(), feature.clone(), vec![]);
+    let mut i = make_interp(backend_with(&["kaaaaaaa", "kfffffff"]));
+    *i.old_repo.borrow_mut() = Some(old.clone());
+    let mut check = |new: &Value| j::repo::validate_repo(&mut i, new).map(|_| ()).map_err(|c| c.msg);
+    // left as stored, or rewritten with its stored files: accepted
+    assert_eq!(check(&old), Ok(()));
+    let described = beside(commit("kaaaaaaa", "hello", &[], vec![]), feature.clone(), vec![]);
+    assert_eq!(check(&described), Ok(()));
+    let renamed = with_files("kfffffff", "renamed", &["feature"], feature_files.clone());
+    assert_eq!(check(&beside(a.clone(), renamed, vec![])), Ok(()));
+    let relisted = commit("kfffffff", "feat", &["feature"], vec![entry(".jj/x", "fixture")]);
+    assert_eq!(check(&beside(a.clone(), relisted, vec![])), Ok(()));
+    // checked out, written with new files, or new: refused
+    let refused = |r: Result<(), String>| {
+        let e = r.unwrap_err();
+        assert!(e.contains("path component"), "{}", e);
+    };
+    refused(check(&beside(feature.clone(), a.clone(), vec![])));
+    let edited = commit(
+        "kfffffff",
+        "feat",
+        &["feature"],
+        vec![entry(".jj/x", "fixture"), entry("b", "more")],
+    );
+    refused(check(&beside(a.clone(), edited, vec![])));
+    let copy = commit("knnnnnnn", "", &[], vec![entry(".jj/x", "fixture")]);
+    refused(check(&beside(a.clone(), feature.clone(), vec![subtree(copy, vec![])])));
+}
+
+#[test]
 fn labels_cannot_change() {
     let old = two_commit_repo(&["feat"]);
     let stripped = {
