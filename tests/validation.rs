@@ -165,9 +165,9 @@ fn unwritable_path_components_rejected() {
     // `.jj` recorded the operation before the checkout refused it, wedging
     // the repository; the rest crashed only when the tree was written.
     let old = two_commit_repo(&[]);
-    // longer than a filesystem's name limit (NAME_MAX, 255 bytes), which the
+    // longer than ext4's name limit (NAME_MAX, 255 bytes), which the
     // checkout found only after the operation was recorded; bytes, not
-    // characters
+    // characters, on the in-memory backend's filesystem (`name_fits`)
     let (long, wide, longest) = ("x".repeat(256), "é".repeat(128), "x".repeat(255));
     for bad in [
         &["..", "evil"][..],
@@ -199,6 +199,61 @@ fn unwritable_path_components_rejected() {
         let new = focus_with_files(vec![entry_at(ok, "fine")]);
         assert!(validate_with(&old, &new).is_ok(), "{:?}", ok);
     }
+}
+
+#[test]
+fn names_the_working_directory_holds_are_not_refused_for_length() {
+    // 255 bytes is the name limit of ext4, but exFAT, NTFS and APFS count
+    // 255 UTF-16 units or characters and hold these names. Once one was in
+    // the working directory every persisting run was refused for it, `j id`
+    // included, though the checkout never creates a name the directory
+    // already holds (§7.5 step 1)
+    let (wide, accented) = ("日".repeat(100), "é".repeat(128));
+    let on_disk = vec![
+        entry("a.txt", "x"),
+        entry_at(&[&wide], "y"),
+        entry_at(&[&accented, "x"], "z"),
+    ];
+    // the repository as loaded, and as the snapshot of the directory found it
+    let loaded = two_commit_repo(&[]);
+    let snapshot = focus_with_files(on_disk.clone());
+    let mut i = make_interp(backend_with(&["kaaaaaaa", "kbbbbbbb"]));
+    *i.old_repo.borrow_mut() = Some(loaded);
+    *i.given_repo.borrow_mut() = Some(snapshot.clone());
+    let mut check = |new: &Value| j::repo::validate_repo(&mut i, new).map(|_| ()).map_err(|c| c.msg);
+    assert_eq!(check(&snapshot), Ok(()));
+    let with = |extra: Value| {
+        let mut files = on_disk.clone();
+        files.push(extra);
+        focus_with_files(files)
+    };
+    assert_eq!(check(&with(entry_at(&[&accented, "new"], "w"))), Ok(()));
+    // `new`: a child of the snapshot holding the same names
+    let frame = |parent: Value| {
+        Value::record(&[
+            ("left", Value::list(vec![])),
+            ("parent", parent),
+            ("right", Value::list(vec![])),
+        ])
+    };
+    let child = Value::record(&[
+        ("children", Value::list(vec![])),
+        (
+            "context",
+            Value::list(vec![
+                frame(snapshot.field("root").unwrap()),
+                frame(commit(ROOT_ID, "", &[], vec![])),
+            ]),
+        ),
+        ("root", commit("knnnnnnn", "", &[], on_disk.clone())),
+    ]);
+    assert_eq!(check(&child), Ok(()));
+    // a long name the directory does not hold is asked of the backend,
+    // which here holds 255 bytes
+    let e = check(&with(entry_at(&["日".repeat(101).as_str()], "v"))).unwrap_err();
+    assert!(e.contains("path component"), "{}", e);
+    // `validate` with no snapshot reads the loaded focus
+    assert_eq!(validate_with(&snapshot, &snapshot), Ok(()));
 }
 
 #[test]

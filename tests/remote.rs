@@ -286,6 +286,36 @@ fn clone_leaves_out_paths_a_checkout_cannot_create() {
 }
 
 #[test]
+fn clone_keeps_long_names_the_filesystem_holds() {
+    // §7.8: the working-copy commit clone starts on left out every name
+    // over 255 bytes, though exFAT, NTFS and APFS hold one of 100 `日`
+    // (300 bytes): the clone's first change was that file's removal, which
+    // a push would publish. It is left out only where the filesystem does
+    // not hold it.
+    let env = setup();
+    let other = env.dir.join("other");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    let wide = format!("wide/{}", "日".repeat(100));
+    let blob = git(&other, &["hash-object", "-w", "a.txt"]);
+    let info = format!("100644,{},{}", blob.trim(), wide);
+    git(&other, &["update-index", "--add", "--cacheinfo", &info]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "wide"]);
+    git(&other, &["push", "-q", "origin", "master"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let holds = std::fs::write(env.dir.join("日".repeat(100)), "").is_ok();
+    let changed = env.j(&dest, &["changed"]).ok().stdout;
+    if holds {
+        assert_eq!(std::fs::read_to_string(dest.join(&wide)).unwrap(), "one\n");
+        assert_eq!(changed.trim(), "none");
+    } else {
+        assert!(!dest.join("wide").exists());
+        assert_eq!(changed.trim(), wide);
+    }
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
 fn clone_leaves_out_git_in_another_case_where_the_filesystem_folds_case() {
     // §7.5 step 1, §7.8: where the filesystem folds case, `.GIT` is the
     // clone's own `.git`. exfat-fuse gives each spelling its own inode

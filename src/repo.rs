@@ -1,7 +1,7 @@
 //! Repo-zipper operations, the reference `by` walk (§10), and the
 //! persistence validation shared by `validate` and the jj backend (§7.5).
 
-use crate::domain::ROOT_ID;
+use crate::domain::{Backend, ROOT_ID};
 use crate::eval::Interp;
 use crate::value::{value_eq, Crash, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -378,7 +378,8 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
     if let Some(old) = &old {
         validate_immutable(old, new, &immutable)?;
     }
-    validate_path_names(old.as_ref(), new, &immutable, i.backend.folds_case())?;
+    let given = i.given_repo.borrow().clone().or_else(|| old.clone());
+    validate_path_names(old.as_ref(), given.as_ref(), new, &immutable, i.backend.as_ref())?;
     // focus mutable (§7.5 step 6)
     let focus_id = id_of(&new.field("root")?)?;
     if focus_id == ROOT_ID || immutable.contains(&focus_id) {
@@ -458,24 +459,27 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
     Ok(())
 }
 
-/// The longest name a filesystem holds (NAME_MAX), in bytes: 255 on ext4,
-/// xfs, btrfs and tmpfs; the others allow 255 characters or UTF-16 units,
-/// which 255 bytes of UTF-8 never exceed. One with a lower limit (encfs,
-/// eCryptfs) refuses the rest at checkout, which then records nothing
-/// (§7.5 step 7).
-const NAME_MAX: usize = 255;
+/// The name limit of ext4, xfs, btrfs and tmpfs (NAME_MAX), in bytes.
+/// exFAT, NTFS, HFS+ and APFS count 255 UTF-16 units or characters instead,
+/// so they hold longer names, and pathconf answers 255 on each: whether a
+/// longer name fits is asked of the backend (`Backend::name_fits`). A
+/// filesystem with a lower limit (encfs, eCryptfs) refuses a shorter name
+/// at checkout, which then records nothing (§7.5 step 7).
+pub const NAME_MAX: usize = 255;
 
 /// Whether a checkout cannot create the path component `comp` (§7.5 step
 /// 1). jj stores any name that is not empty and has no `/`, but its
 /// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
-/// over `NAME_MAX`, part way through writing the focus; a git tree cannot
+/// it cannot hold, part way through writing the focus; a git tree cannot
 /// hold a NUL. Where the filesystem folds case, `.GIT` is the file `.git`,
-/// which the checkout refuses by its file identity.
-pub fn checkout_refuses(comp: &str, folds_case: bool) -> bool {
+/// which the checkout refuses by its file identity or, where that does not
+/// show it, writes into. `fits` says whether a name longer than `NAME_MAX`
+/// bytes is one the filesystem holds.
+pub fn checkout_refuses(comp: &str, folds_case: bool, fits: impl FnOnce(&str) -> bool) -> bool {
     matches!(comp, "" | "." | ".." | ".git" | ".jj")
         || comp.contains(['/', '\0'])
-        || comp.len() > NAME_MAX
         || (folds_case && (comp.eq_ignore_ascii_case(".git") || comp.eq_ignore_ascii_case(".jj")))
+        || (comp.len() > NAME_MAX && !fits(comp))
 }
 
 /// Path components (§7.5 step 1) of every commit persisting writes anew or
@@ -486,12 +490,22 @@ pub fn checkout_refuses(comp: &str, folds_case: bool) -> bool {
 /// never checks it out, and a fetched branch can hold `.jj`, so refusing its
 /// names would stop every persist for a commit the script did not touch.
 /// Immutable commits are such commits (step 3).
+///
+/// A name longer than `NAME_MAX` is one the filesystem holds if the
+/// working directory holds it, as the focus of `given` (its snapshot, §7.4)
+/// shows: the checkout, which diffs from what is on disk, does not create
+/// such a file again. Any other is asked of the backend.
 fn validate_path_names(
     old: Option<&Value>,
+    given: Option<&Value>,
     new: &Value,
     immutable: &BTreeSet<String>,
-    folds_case: bool,
+    backend: &dyn Backend,
 ) -> Result<(), Crash> {
+    let folds_case = backend.folds_case();
+    // the long names the working directory holds, read on first need: the
+    // snapshot's file list is the whole tree
+    let mut held: Option<BTreeSet<String>> = None;
     let focus = id_of(&new.field("root")?)?;
     let stored: BTreeMap<String, Value> = match old {
         Some(old) => all_commits(old)?
@@ -517,7 +531,14 @@ fn validate_path_names(
             let path = e.field("path")?;
             for comp in path.as_list()? {
                 let comp = comp.as_text()?;
-                if checkout_refuses(comp, folds_case) {
+                if comp.len() > NAME_MAX && held.is_none() {
+                    held = Some(match given {
+                        Some(given) => long_names(&given.field("root")?.field("files")?)?,
+                        None => BTreeSet::new(),
+                    });
+                }
+                let on_disk = |c: &str| held.as_ref().is_some_and(|h| h.contains(c));
+                if checkout_refuses(comp, folds_case, |c| on_disk(c) || backend.name_fits(c)) {
                     return Err(Crash::new(format!(
                         "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
                         comp
@@ -527,6 +548,20 @@ fn validate_path_names(
         }
     }
     Ok(())
+}
+
+/// The path components of snapshot `files` longer than `NAME_MAX` bytes.
+fn long_names(files: &Value) -> Result<BTreeSet<String>, Crash> {
+    let mut out = BTreeSet::new();
+    for e in files.as_list()? {
+        for comp in e.field("path")?.as_list()? {
+            let comp = comp.as_text()?;
+            if comp.len() > NAME_MAX {
+                out.insert(comp.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether commit `new` holds the files commit `old` does. A commit record,

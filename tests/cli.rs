@@ -594,6 +594,44 @@ fn unwritable_path_refused_before_anything_is_recorded() {
     r.j(&["describe \"after\""]).ok();
 }
 
+#[test]
+fn names_the_filesystem_holds_are_accepted_at_any_length() {
+    // §7.5 step 1: 255 bytes is ext4's name limit, but exFAT, NTFS and APFS
+    // count 255 UTF-16 units or characters and hold a name of 100 `日`
+    // (300 bytes). With one in the working directory, every persisting run
+    // was refused for it, though the checkout never creates a name the
+    // directory holds, and a name the checkout would create was refused
+    // though the filesystem holds it. Where it does not, the name is still
+    // refused before anything is recorded.
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"stable\""]).ok();
+    let wide = "日".repeat(100);
+    let edit = |name: &str| {
+        format!(
+            "mapRoot (\\c -> c {{ files = c.files ++ [{{ path = [\"d\" \"{}\"], content = blob \"new\\n\" }}] }})",
+            name
+        )
+    };
+    if std::fs::write(r.dir.join(&wide), "on disk\n").is_ok() {
+        r.j(&["describe \"wide\""]).ok();
+        r.j(&["new"]).ok();
+        let wider = "日".repeat(101);
+        r.j(&[&format!("tree . validate . {}", edit(&wider))]).ok();
+        r.j(&[&edit(&wider)]).ok();
+        assert_eq!(r.read(&format!("d/{}", wider)), "new\n");
+        assert_eq!(r.read(&wide), "on disk\n");
+    } else {
+        let ops = r.j(&["ops"]).ok().stdout.lines().count();
+        let out = r.j(&[&edit(&wide)]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("path component"), "{}", out.stderr);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+        assert!(!r.dir.join("d").exists());
+    }
+    r.j(&["describe \"after\""]).ok();
+}
+
 /// Each commit's message and content of `a`, top-down
 const CONTENT_OF_A: &str =
     "\\r -> show (map (\\c -> [c.message (contentAt [\"a\"] c.files)]) (commits (top r)))";

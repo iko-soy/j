@@ -269,6 +269,9 @@ pub struct JjInner {
     /// whether the workspace's filesystem folds case, probed on first use
     /// (`Backend::folds_case`)
     folds_case: OnceLock<bool>,
+    /// whether the workspace's filesystem holds each name longer than
+    /// `NAME_MAX` asked about so far (`Backend::name_fits`)
+    long_names: Mutex<HashMap<String, bool>>,
 }
 
 /// holding the file keeps the flock
@@ -353,6 +356,7 @@ impl JjBackend {
                 lock_guard: Mutex::new(None),
                 pending: Mutex::new(None),
                 folds_case: OnceLock::new(),
+                long_names: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -1439,6 +1443,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
             folds_case: OnceLock::new(),
+            long_names: Mutex::new(HashMap::new()),
         }),
     };
     // the import and the working-copy commit are one operation, the one
@@ -1531,6 +1536,7 @@ fn clone_into(
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
             folds_case: OnceLock::new(),
+            long_names: Mutex::new(HashMap::new()),
         }),
     };
     let origin = RemoteName::new("origin");
@@ -1607,7 +1613,7 @@ fn create_initial_wc_commit(
     let parent_tree = block_on(store.get_commit_async(&parent))
         .map_err(|e| (1, format!("cannot read the parent commit: {}", e)))?
         .tree();
-    let wc_tree = block_on(checkout_tree(parent_tree, backend.folds_case()))?;
+    let wc_tree = block_on(checkout_tree(parent_tree, backend))?;
     let user_sig = backend
         .user_signature(cfg)
         .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
@@ -1643,16 +1649,19 @@ fn create_initial_wc_commit(
 
 /// `tree` without the files at a path a checkout cannot create (§7.5 step
 /// 1), which a git branch can hold: a `.jj` directory committed by mistake,
-/// a name no filesystem takes. jj's checkout stops at the first such path,
-/// failing the whole clone, so the working-copy commit init or clone starts
-/// on leaves them out, and their removal is its change (§7.8).
-async fn checkout_tree(tree: MergedTree, folds_case: bool) -> Result<MergedTree, OpenError> {
+/// a name the workspace's filesystem does not hold. jj's checkout stops at
+/// the first such path, failing the whole clone, so the working-copy commit
+/// init or clone starts on leaves them out, and their removal is its change
+/// (§7.8).
+async fn checkout_tree(tree: MergedTree, backend: &JjBackend) -> Result<MergedTree, OpenError> {
+    let folds_case = backend.folds_case();
     let refused: Vec<RepoPathBuf> = tree
         .entries()
         .map(|(path, _)| path)
         .filter(|path| {
-            path.components()
-                .any(|c| crate::repo::checkout_refuses(c.as_internal_str(), folds_case))
+            path.components().any(|c| {
+                crate::repo::checkout_refuses(c.as_internal_str(), folds_case, |name| backend.name_fits(name))
+            })
         })
         .collect();
     if refused.is_empty() {
@@ -2180,6 +2189,37 @@ impl Backend for JjBackend {
                     !entries.any(|e| e.is_ok_and(|e| e.file_name() == ".JJ"))
                 })
         })
+    }
+
+    fn name_fits(&self, name: &str) -> bool {
+        if name.len() <= crate::repo::NAME_MAX {
+            return true;
+        }
+        // a component, never a path: one with `/` would be created elsewhere
+        if name.contains(['/', '\0']) {
+            return false;
+        }
+        // no call tells whether the limit counts bytes (ext4) or UTF-16
+        // units or characters (exFAT, NTFS, APFS), so the name is tried:
+        // created in a directory of its own under `.jj`, which is then
+        // removed, once per name and run
+        let mut known = self.inner.long_names.lock().unwrap();
+        if let Some(fits) = known.get(name) {
+            return *fits;
+        }
+        let fits = match tempfile::Builder::new()
+            .prefix("name-")
+            .tempdir_in(self.inner.workspace_root.join(".jj"))
+        {
+            Ok(dir) => {
+                let fits = std::fs::File::create(dir.path().join(name)).is_ok();
+                drop(dir);
+                fits
+            }
+            Err(_) => false,
+        };
+        known.insert(name.to_string(), fits);
+        fits
     }
 
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {

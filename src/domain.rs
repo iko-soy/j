@@ -66,6 +66,14 @@ pub trait Backend {
         false
     }
 
+    /// True if the working directory's filesystem holds a file named
+    /// `name`, a path component longer than `repo::NAME_MAX` bytes that a
+    /// checkout would create (§7.5 step 1). A filesystem that counts its
+    /// limit in bytes, as ext4 does, holds none.
+    fn name_fits(&self, name: &str) -> bool {
+        name.len() <= crate::repo::NAME_MAX
+    }
+
     /// jj tree merge (§7.3): replay the change from->to onto `onto`.
     fn replay(
         &self,
