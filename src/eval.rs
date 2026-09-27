@@ -140,8 +140,9 @@ pub(crate) enum Cont {
         cexpr: Rc<crate::shape::ContractExpr>,
         cont: Rc<Cont>,
     },
-    /// the function a signed definition's body returned when its lambda ran
-    /// out of parameters before its signature: make it the named partial
+    /// the function a signed definition's value returned when it ran out of
+    /// parameters before its signature (a lambda's body, or a builtin or a
+    /// composition given its last argument): make it the named partial
     /// application of `args` (§5.2), checked against the rest of `cexpr`
     NamePartial {
         name: String,
@@ -1167,6 +1168,30 @@ impl Interp {
                             name != "(.)"
                                 || matches!(**c, crate::shape::ContractExpr::Known { .. })
                         });
+                        // a signed definition's builtin or composition that
+                        // consumes fewer arguments than its signature lists
+                        // (`addT = (+) . inc` under `Int -> Int -> Text`)
+                        // returns a function, which becomes the named partial
+                        // application `addT 1` under the rest of the
+                        // signature, as a lambda that runs out of parameters
+                        // first does (§4.13, §5.2)
+                        let k = match &check {
+                            Some(c)
+                                if !c.is_exhausted()
+                                    && self.builtin_def(name, &cname).is_some() =>
+                            {
+                                // the arguments the definition was given, not
+                                // those baked into its value
+                                let own = c.position().unwrap_or(0).min(all.len());
+                                Cont::NamePartial {
+                                    name: cname.clone(),
+                                    cexpr: c.clone(),
+                                    args: all[all.len() - own..].to_vec(),
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
                         if applies_functions(name) {
                             // the result is checked once the functions have
                             // run, and a crash while they run is blamed as

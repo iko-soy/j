@@ -539,15 +539,18 @@ supplied, against the corresponding parameter type, and the result once the
 application is complete (yields a non-function), against the result type.
 Lambdas without a signature and the command-line expression are unchecked
 except through the functions they call. A signature covers all the arguments
-it lists, however the definition's lambda is curried: `describe : Text -> Edit`
+it lists, however the definition's value is curried: `describe : Text -> Edit`
 is `\m -> mapRoot …`, and the `Repo` that `describe m` is then applied to is
-checked as its second argument, and the result against `Repo`. A signature
-only adds checks and never changes when a body is evaluated (§4.1):
-`describe m` evaluates `mapRoot …` at once, so an `or` around it catches a
-crash there (§4.6); the value must be a function, since the signature lists
-a further argument, and shows as `describe m` (§5.2). Arguments are
-numbered as the signature lists them, even when the definition's value is a
-partial application or a composition holding arguments of its own (`tree 5`
+checked as its second argument, and the result against `Repo`; with
+`addT : Int -> Int -> Text` and `addT = (+) . (\x -> x + 1)`, the `5` of
+`addT 1 5` is checked as its second argument, and the `7` against `Text`. A
+signature only adds checks and never changes when a body is evaluated
+(§4.1): `describe m` evaluates `mapRoot …` at once, so an `or` around it
+catches a crash there (§4.6); the value must be a function, since the
+signature lists a further argument, and shows as `describe m` (§5.2);
+`addT 1` likewise shows as `addT 1`, not as the `(+) 2` it holds. Arguments
+are numbered as the signature lists them, even when the definition's value is
+a partial application or a composition holding arguments of its own (`tree 5`
 is a violation at argument 1); when the value is an `or` of functions (§4.6),
 the check is around the lifted function, so a result that violates the
 signature is a crash, not a reason to try the other side. A signature on
