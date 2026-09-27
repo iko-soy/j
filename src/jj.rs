@@ -2162,17 +2162,23 @@ impl Backend for JjBackend {
     fn folds_case(&self) -> bool {
         // jj's checkout refuses a name whose file identity is that of
         // `.git` or `.jj` in the same directory (local_working_copy.rs), so
-        // where `.JJ` is the workspace's own `.jj` it refuses `.GIT` too
+        // where `.JJ` is the workspace's own `.jj` it refuses `.GIT` too.
+        // Where each spelling of a name gets its own inode number
+        // (exfat-fuse) the identities differ and the checkout writes
+        // `.GIT/x` into `.git`, so folding is told by how names resolve:
+        // `.JJ` resolves, but the directory does not list it under that
+        // spelling. A directory that cannot be listed is taken to fold
+        // case, the answer that refuses more.
         *self.inner.folds_case.get_or_init(|| {
             use jj_lib::file_util::FileIdentity;
             let root = &self.inner.workspace_root;
-            match (
-                FileIdentity::from_symlink_path(root.join(".jj")),
-                FileIdentity::from_symlink_path(root.join(".JJ")),
-            ) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            }
+            let Ok(upper) = FileIdentity::from_symlink_path(root.join(".JJ")) else {
+                return false;
+            };
+            FileIdentity::from_symlink_path(root.join(".jj")).is_ok_and(|lower| lower == upper)
+                || std::fs::read_dir(root).map_or(true, |mut entries| {
+                    !entries.any(|e| e.is_ok_and(|e| e.file_name() == ".JJ"))
+                })
         })
     }
 

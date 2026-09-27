@@ -923,10 +923,10 @@ Within it:
    common filesystems; where a filesystem's is lower, or a whole path
    outgrows the system's limit, the checkout of step 7 refuses it instead),
    and without `/` or NUL; where the working directory's filesystem folds
-   case, `.git` and `.jj` are refused in any letter case. (Any other commit
-   that keeps its files is neither checked out nor written with a name jj
-   has not already stored, and a fetched branch can hold any name git can.)
-   Violations crash with a message naming the rule.
+   case (`.JJ` names its `.jj`), `.git` and `.jj` are refused in any letter
+   case. (Any other commit that keeps its files is neither checked out nor
+   written with a name jj has not already stored, and a fetched branch can
+   hold any name git can.) Violations crash with a message naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.

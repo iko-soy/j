@@ -63,6 +63,37 @@ fn git(dir: &PathBuf, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// `git` with `input` on its standard input
+fn git_stdin(dir: &PathBuf, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Whether `dir`'s filesystem folds case, judged as the backend judges it:
+/// `.JJ` names the workspace's `.jj`, which the directory does not list
+/// under that spelling
+fn folds_case(dir: &std::path::Path) -> bool {
+    dir.join(".JJ").symlink_metadata().is_ok()
+        && !std::fs::read_dir(dir).unwrap().any(|e| e.unwrap().file_name() == ".JJ")
+}
+
 fn setup() -> Env {
     let dir = uniq("env");
     let remote = uniq("remote.git");
@@ -252,6 +283,43 @@ fn clone_leaves_out_paths_a_checkout_cannot_create() {
     env.j(&dest, &["describe \"x\""]).ok();
     env.j(&dest, &["new"]).ok();
     assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "none");
+}
+
+#[test]
+fn clone_leaves_out_git_in_another_case_where_the_filesystem_folds_case() {
+    // §7.5 step 1, §7.8: where the filesystem folds case, `.GIT` is the
+    // clone's own `.git`. exfat-fuse gives each spelling its own inode
+    // number, so judged by file identity it did not fold case, and the
+    // checkout of a default branch holding `.GIT/hooks/post-checkout`
+    // installed a hook the next `git checkout` ran. Run with TMPDIR on such
+    // a mount to take the first branch.
+    let env = setup();
+    // git refuses `.GIT` in an index, so the tree is built by hand
+    let hook = env.dir.join("hook");
+    std::fs::write(&hook, "#!/bin/sh\necho hooked\n").unwrap();
+    let blob = git(&env.remote, &["hash-object", "-w", hook.to_str().unwrap()]);
+    let mktree = |entries: String| git_stdin(&env.remote, &["mktree"], &entries).trim().to_string();
+    let hooks = mktree(format!("100755 blob {}\tpost-checkout\n", blob.trim()));
+    let dot_git = mktree(format!("040000 tree {}\thooks\n", hooks));
+    let top = git(&env.remote, &["ls-tree", "master"]);
+    let tree = mktree(format!("{}040000 tree {}\t.GIT\n", top, dot_git));
+    let commit = git(
+        &env.remote,
+        &["-c", "user.email=t@t", "-c", "user.name=T", "commit-tree", &tree, "-p", "master", "-m", "hook"],
+    );
+    git(&env.remote, &["update-ref", "refs/heads/master", commit.trim()]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    assert!(!dest.join(".git/hooks/post-checkout").exists());
+    let changed = env.j(&dest, &["changed"]).ok().stdout;
+    if folds_case(&dest) {
+        assert_eq!(changed.trim(), ".GIT/hooks/post-checkout");
+    } else {
+        let kept = std::fs::read_to_string(dest.join(".GIT/hooks/post-checkout")).unwrap();
+        assert_eq!(kept, "#!/bin/sh\necho hooked\n");
+        assert_eq!(changed.trim(), "none");
+    }
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "one\n");
 }
 
 #[test]
