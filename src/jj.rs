@@ -7,15 +7,15 @@ use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
 use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, Value};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::matchers::{EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
-use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree::{MergedTree, TreeDiffEntry};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::backend::{CommitId, FileId, MergedTreeValueExt, TreeId};
 use jj_lib::object_id::ObjectId;
@@ -30,7 +30,7 @@ use jj_lib::transaction::UnpublishedOperation;
 use jj_lib::working_copy::{LockedWorkingCopy, SnapshotOptions};
 use jj_lib::workspace::Workspace;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -292,7 +292,8 @@ struct PendingSnapshot {
 /// How every scan of the working directory reads it (§7.4): each file
 /// not ignored by the directory's own `.gitignore`s is tracked, whatever
 /// its size. `persist`'s checkout rescans with the same options and
-/// relies on getting the snapshot's tree back.
+/// relies on getting the snapshot's tree back; only `put_back` chooses
+/// which untracked files its scan tracks.
 fn snapshot_options() -> SnapshotOptions<'static> {
     SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
@@ -303,13 +304,163 @@ fn snapshot_options() -> SnapshotOptions<'static> {
     }
 }
 
-/// Put back what a checkout that failed part way wrote: scan what it left
-/// (the state still describes `on_disk`, so each path it changed reads as
-/// changed), then check `on_disk` out over that.
-async fn put_back(wc: &mut dyn LockedWorkingCopy, on_disk: &Commit) -> Result<(), String> {
-    wc.snapshot(&snapshot_options()).await.map_err(|e| e.to_string())?;
-    wc.check_out(on_disk).await.map_err(|e| e.to_string())?;
-    Ok(())
+/// What the working directory holds along a checkout's footprint, the
+/// paths whose value differs between the tree it holds and the focus,
+/// recorded before the checkout runs so that one failing part way can be
+/// put back (§7.5 step 7), and nothing else with it
+struct Footprint {
+    /// the directories the checkout may create: each parent of a path the
+    /// focus adds that is not a directory yet
+    new_dirs: BTreeSet<RepoPathBuf>,
+    /// each path the focus adds that already holds something other than a
+    /// directory (an ignored file), by device and inode: the checkout
+    /// leaves that alone
+    occupied: HashMap<RepoPathBuf, (u64, u64)>,
+}
+
+/// The device and inode of what `path` holds, unless it is a directory
+fn file_identity(root: &std::path::Path, path: &RepoPath) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = path.to_fs_path(root).ok()?.symlink_metadata().ok()?;
+    (!meta.is_dir()).then(|| (meta.dev(), meta.ino()))
+}
+
+impl Footprint {
+    /// Look on disk along the paths `focus` adds to `on_disk`: one `lstat`
+    /// per directory they pass through, and one per path added to a
+    /// directory that exists. The diff is the checkout's own.
+    async fn of(
+        root: &std::path::Path,
+        on_disk: &MergedTree,
+        focus: &MergedTree,
+    ) -> Result<Footprint, String> {
+        let is_dir_now = |path: &RepoPath| {
+            path.to_fs_path(root)
+                .is_ok_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
+        };
+        let mut new_dirs = BTreeSet::new();
+        let mut occupied = HashMap::new();
+        // whether each directory looked at so far is one on disk
+        let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
+        let mut diff = on_disk.diff_stream(focus, &EverythingMatcher);
+        while let Some(TreeDiffEntry { path, values }) = diff.next().await {
+            let Diff { before, after } = values.map_err(|e| e.to_string())?;
+            if !(before.is_absent() && after.is_present()) {
+                continue;
+            }
+            // the parents not looked at yet, deepest first, below one that
+            // was (or the root)
+            let parent = path.parent().expect("a file path has a parent");
+            let mut unseen: Vec<&RepoPath> = parent
+                .ancestors()
+                .take_while(|d| !d.is_root() && !dirs.contains_key(*d))
+                .collect();
+            let seen = unseen.last().map_or(parent, |d| d.parent().unwrap());
+            let mut is_dir = seen.is_root() || dirs[seen];
+            while let Some(d) = unseen.pop() {
+                // nothing below a non-directory is a directory
+                is_dir = is_dir && is_dir_now(d);
+                if !is_dir {
+                    new_dirs.insert(d.to_owned());
+                }
+                dirs.insert(d.to_owned(), is_dir);
+            }
+            if is_dir {
+                if let Some(id) = file_identity(root, &path) {
+                    occupied.insert(path, id);
+                }
+            }
+        }
+        Ok(Footprint { new_dirs, occupied })
+    }
+}
+
+/// Put back what a checkout from `on_disk` to `focus` that failed part way
+/// wrote (§7.5 step 7): remove the directories it created while they are
+/// empty, scan the directory, and check out what the scan found with the
+/// paths of the checkout's footprint as `on_disk` holds them. The scan
+/// starts tracking only those paths, ignored or not, so a file created
+/// elsewhere meanwhile, or one a `.gitignore` the checkout wrote no longer
+/// ignores, is not touched, and a file edited elsewhere meanwhile keeps
+/// its edit. A path the focus adds that still holds what it held before
+/// (`Footprint::occupied`) is left out, since the checkout did not write
+/// it. A path something is in the way of fails the put-back.
+async fn put_back(
+    wc: &mut dyn LockedWorkingCopy,
+    root: &std::path::Path,
+    on_disk: &Commit,
+    focus: &Commit,
+    footprint: &Footprint,
+) -> Result<(), String> {
+    remove_new_dirs(root, &footprint.new_dirs);
+    // the paths, recomputed rather than kept through a checkout that
+    // succeeds, each with what the directory held there
+    let mut paths = Vec::new();
+    let mut diff = on_disk.tree().diff_stream(&focus.tree(), &EverythingMatcher);
+    while let Some(TreeDiffEntry { path, values }) = diff.next().await {
+        let before = values.map_err(|e| e.to_string())?.before;
+        let kept = footprint.occupied.get(&path);
+        if kept.is_none() || kept.copied() != file_identity(root, &path) {
+            paths.push((path, before));
+        }
+    }
+    // tracked even where a `.gitignore` the checkout wrote ignores them
+    let matcher = FilesMatcher::new(paths.iter().map(|(path, _)| path));
+    let options = SnapshotOptions {
+        start_tracking_matcher: &matcher,
+        force_tracking_matcher: &matcher,
+        ..snapshot_options()
+    };
+    let (scanned, _stats) = wc.snapshot(&options).await.map_err(|e| e.to_string())?;
+    let mut builder = MergedTreeBuilder::new(scanned);
+    for (path, before) in paths {
+        builder.set_or_remove(path, before);
+    }
+    let (tree_ids, labels) = builder
+        .write_tree()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_tree_ids_and_labels();
+    // a checkout reads only the commit's tree; this one is never written
+    let target = Commit::new(
+        on_disk.store().clone(),
+        on_disk.id().clone(),
+        Arc::new(jj_lib::backend::Commit {
+            root_tree: tree_ids,
+            conflict_labels: labels.into_merge(),
+            ..on_disk.store_commit().as_ref().clone()
+        }),
+    );
+    let stats = wc.check_out(&target).await.map_err(|e| e.to_string())?;
+    match stats.skipped_files {
+        0 => Ok(()),
+        1 => Err("something is in the way of 1 path".to_string()),
+        n => Err(format!("something is in the way of {} paths", n)),
+    }
+}
+
+/// Remove the directories of `dirs` (`Footprint::new_dirs`) that are
+/// directories now, deepest first, each only while it is empty. One whose
+/// parent is also in `dirs` is looked at only once that parent is a
+/// directory, so no path is followed through a symlink found there.
+fn remove_new_dirs(root: &std::path::Path, dirs: &BTreeSet<RepoPathBuf>) {
+    let mut found: HashSet<&RepoPath> = HashSet::new();
+    let mut remove = Vec::new();
+    // parents come first
+    for dir in dirs {
+        let parent = dir.parent().expect("a directory below the root has a parent");
+        if dirs.contains(parent) && !found.contains(parent) {
+            continue;
+        }
+        let Ok(path) = dir.to_fs_path(root) else { continue };
+        if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            found.insert(dir);
+            remove.push(path);
+        }
+    }
+    for path in remove.iter().rev() {
+        let _ = std::fs::remove_dir(path);
+    }
 }
 
 #[derive(Clone)]
@@ -843,7 +994,8 @@ impl JjBackend {
     /// that fails publishes nothing (§7.5 step 7, §7.7), and leaves the
     /// saved state as it was, so the next run snapshots the directory into
     /// the commit it came from; what the checkout had already written is
-    /// put back first, when the directory held exactly `on_disk`.
+    /// put back first (`put_back`), when the directory held exactly
+    /// `on_disk`.
     async fn checkout(
         &self,
         commit: &Commit,
@@ -851,6 +1003,7 @@ impl JjBackend {
         op: Option<UnpublishedOperation>,
     ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
@@ -869,12 +1022,13 @@ impl JjBackend {
         // at 7 characters, fail to parse them and record the edited conflict
         // as resolved text, markers and all (§7.4). The scan also tells
         // whether the directory still holds `on_disk`, which a failed
-        // checkout is put back to.
-        let mut restorable = false;
+        // checkout is put back to: then what the directory holds along the
+        // checkout's footprint is recorded first, as only that is put back.
+        let mut footprint = Err("it changed while the program ran".to_string());
         if let Some(on_disk) = on_disk {
             match locked_ws.locked_wc().snapshot(&snapshot_options()).await {
                 Ok((scanned, _stats)) if scanned.tree_ids() == on_disk.tree().tree_ids() => {
-                    restorable = true;
+                    footprint = Footprint::of(&root, &on_disk.tree(), &commit.tree()).await;
                 }
                 // the directory changed while the program ran, or can no
                 // longer be scanned (an entry appeared, vanished or cannot
@@ -911,10 +1065,9 @@ impl JjBackend {
                 // saving, so the state still describes the tree recorded at
                 // the head, as it did before the run.
                 if let Some(on_disk) = on_disk {
-                    let restored = if restorable {
-                        put_back(locked_ws.locked_wc(), on_disk).await
-                    } else {
-                        Err("it changed while the program ran".to_string())
+                    let restored = match &footprint {
+                        Ok(f) => put_back(locked_ws.locked_wc(), &root, on_disk, commit, f).await,
+                        Err(e) => Err(e.clone()),
                     };
                     if let Err(e) = restored {
                         msg.push_str(&format!(

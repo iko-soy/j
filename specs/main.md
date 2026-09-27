@@ -993,9 +993,17 @@ Within it:
    is written `new . goto trunk`.)
 7. Perform the checkout of §7.4, then commit the operation. A checkout
    that fails (a path the filesystem cannot hold, a full disk) crashes
-   without committing it, so nothing is recorded, and puts back what it had
-   written, as far as it can, unless the working directory changed while
-   the program ran.
+   without committing it, so nothing is recorded. Unless the working
+   directory changed while the program ran, what the checkout wrote is
+   then put back: each path at which the focus differs from the working
+   directory gets back what the directory held there, and each directory
+   the checkout created is removed while empty. No other path is touched: a
+   file created or edited elsewhere meanwhile keeps its content, and an
+   ignored file stays, even where a `.gitignore` the checkout wrote no
+   longer ignores it or where the focus adds a file of that name (the
+   checkout does not write over it). When something is in the way of a
+   path, the crash says the directory could not be put back, and the next
+   run records what it holds.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
@@ -1088,8 +1096,8 @@ discarded, marked as a redo. Otherwise exit 1 with `j: nothing to redo`.
 Both refuse, before doing anything, if the working directory differs from the
 focused commit's files: `j: working copy has changes not in @; run \`j id\`
 to record them or discard them`. Both check out the restored focus before
-recording their operation, and record nothing if that checkout fails
-(§7.5 step 7).
+recording their operation; when that checkout fails they record nothing,
+and what it wrote is put back as §7.5 step 7 says.
 Undoing a `push` restores the recorded labels and leaves the remote untouched.
 
 **`ops`** prints the operation log, newest first, one line each: relative

@@ -688,6 +688,10 @@ fn a_checkout_that_fails_records_nothing() {
     assert_eq!(r.j(&["log"]).ok().stdout, log);
     // the checkout wrote P's `a` before it failed; the edit is put back
     assert_eq!(r.read("a"), "x2\n");
+    // and the directories it made for the deep path are gone: left empty,
+    // they grew past PATH_MAX once the workspace moved deeper, and every
+    // run failed to scan them
+    assert!(!r.dir.join("d".repeat(250)).exists());
     // and recorded where it was made
     r.j(&["id"]).ok();
     let files = r.j(&[CONTENT_OF_A]).ok().stdout;
@@ -728,8 +732,214 @@ fn undo_whose_checkout_fails_records_nothing() {
     // the checkout wrote `a` before it failed; it is put back, so the
     // working directory still equals the focus and there is nothing to record
     assert_eq!(r.read("a"), "two\n");
+    // nor is any of the directories it made on the way to `f`
+    assert!(!r.dir.join("d".repeat(250)).exists());
     r.j(&["id"]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout, ops);
+}
+
+/// Path components, in the language's syntax, of a path under `first` far
+/// longer than PATH_MAX, each a name a checkout can create (§7.5 step 1)
+fn too_deep(first: &str) -> String {
+    format!("\"{}\" {}", first, vec![format!("\"{}\"", "d".repeat(250)); 20].join(" "))
+}
+
+#[test]
+fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
+    // §7.5 step 7: the put-back scanned the whole directory, tracking every
+    // file the `.gitignore` the failed checkout had just written did not
+    // ignore, and checked the run's starting tree out over that. A file
+    // that `.gitignore` had stopped ignoring was deleted though nothing had
+    // written it, even one at a path the focus adds, which the checkout
+    // leaves alone; a file the checkout wrote that it newly ignored stayed,
+    // and the next run recorded it.
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("secret.env", "API_KEY=hunter2\n");
+    r.write("local.env", "mine\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // written in path order: `.gitignore`, `build/out`, `local.env`
+    // (skipped: already there), then the deep path fails
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\".gitignore\"]) c.files ++ [\
+         {{ path = [\".gitignore\"], content = blob \"build/\\n\" }} \
+         {{ path = [\"build\" \"out\"], content = blob \"built\\n\" }} \
+         {{ path = [\"local.env\"], content = blob \"committed\\n\" }} \
+         {{ path = [{}], content = blob \"deep\" }}] }})",
+        too_deep("zz")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read(".gitignore"), "*.env\n");
+    assert_eq!(r.read("secret.env"), "API_KEY=hunter2\n");
+    assert_eq!(r.read("local.env"), "mine\n");
+    assert!(!r.dir.join("build").exists());
+    assert!(!r.dir.join("zz").exists());
+    // the working directory is as it was, so there is nothing to record
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+/// Run `edit`, whose checkout writes `m/0` … `m/<n-1>` and then fails, and
+/// call `meanwhile` with the process stopped while it writes them, after
+/// the scan it starts from and before its put-back scans again
+#[cfg(target_os = "linux")]
+fn stopped_mid_checkout(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce()) -> Out {
+    let mut child = Command::new(j_bin())
+        .arg(edit)
+        .current_dir(&r.dir)
+        .env("XDG_CONFIG_HOME", &r.cfg)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    // `m` is written in path order, `0` then `1`, each file created empty
+    // and removed once before it is written
+    let (first, second) = (r.dir.join("m").join("0"), r.dir.join("m").join("1"));
+    while !second.exists() {
+        assert!(child.try_wait().unwrap().is_none(), "exited before writing m/1");
+        std::thread::yield_now();
+    }
+    let mut status = 0;
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+        assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
+    }
+    assert!(libc::WIFSTOPPED(status), "exited before it was stopped");
+    // all of `m` is written before the checkout fails, and the put-back
+    // removes `m/0` first: this is before the checkout failed
+    let written = std::fs::read_dir(r.dir.join("m")).unwrap().count();
+    let in_time = first.exists() && written < n;
+    let done = if in_time {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(meanwhile))
+    } else {
+        Ok(())
+    };
+    unsafe { libc::kill(pid, if in_time { libc::SIGCONT } else { libc::SIGKILL }) };
+    let out = child.wait_with_output().unwrap();
+    assert!(in_time, "stopped too late: {} of {} written", written, n);
+    if let Err(e) = done {
+        std::panic::resume_unwind(e);
+    }
+    Out {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+/// An edit giving the focus `files` (the language's syntax, over the focus
+/// `c`), `m/0` … `m/<n-1>`, and a path the checkout fails on after those
+#[cfg(target_os = "linux")]
+fn slow_failing_edit(files: &str, n: usize) -> String {
+    format!(
+        "mapRoot (\\c -> c {{ files = {} ++ map (\\i -> {{ path = [\"m\" (show i)], content = blob \"m\\n\" }}) (range 0 {}) ++ [{{ path = [{}], content = blob \"deep\" }}] }})",
+        files,
+        n,
+        too_deep("zz")
+    )
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failed_checkout_keeps_what_changed_meanwhile() {
+    // §7.5 step 7: the put-back rescanned the whole directory, so a file
+    // edited or created while the checkout ran was recorded in its scan,
+    // then reverted or deleted by checking the starting tree out over it,
+    // though the focus did not touch that path
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    let out = stopped_mid_checkout(&r, &slow_failing_edit("c.files", n), n, || {
+        r.write("keep.txt", "edited meanwhile\n");
+        r.write("mine.txt", "mine\n");
+        std::fs::create_dir(r.dir.join("notes")).unwrap();
+        r.write("notes/todo.md", "my notes\n");
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("keep.txt"), "edited meanwhile\n");
+    assert_eq!(r.read("mine.txt"), "mine\n");
+    assert_eq!(r.read("notes/todo.md"), "my notes\n");
+    assert!(!r.dir.join("m").exists());
+    assert!(!r.dir.join("zz").exists());
+    // the next run records them into the commit they were made on
+    r.j(&["id"]).ok();
+    let paths = r.j(&["\\r -> show (map (\\e -> e.path) (files r))"]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["keep.txt"] ["mine.txt"] ["notes" "todo.md"]]"#);
+    let texts = r.j(&["\\r -> show (map (\\e -> text e.content) (files r))"]).ok().stdout;
+    assert_eq!(texts.trim(), r#"["edited meanwhile\n" "mine\n" "my notes\n"]"#);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_put_back_that_something_blocks_says_so() {
+    // §7.5 step 7: jj's checkout skips a path something is in the way of
+    // without failing, and the put-back did not look, so where it could not
+    // write a file back the crash said nothing and the next run recorded
+    // the file as deleted. Here what is in the way is a file created
+    // meanwhile in the directory the failed checkout made of `a`, which
+    // the put-back used to delete.
+    let r = setup();
+    r.write("a", "precious\n");
+    r.j(&["describe \"base\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `a` becomes a directory holding `a/x`, then `m` is written
+    let files = "filter (\\e -> e.path /= [\"a\"]) c.files ++ [{ path = [\"a\" \"x\"], content = blob \"x\\n\" }]";
+    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
+        r.write("a/mine", "mine\n");
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
+    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    // what it wrote is gone, and what is in the way of `a` is kept
+    assert!(!r.dir.join("a/x").exists());
+    assert!(!r.dir.join("m").exists());
+    assert!(!r.dir.join("zz").exists());
+    assert_eq!(r.read("a/mine"), "mine\n");
+}
+
+#[test]
+fn a_file_a_failed_checkout_replaced_by_a_directory_comes_back() {
+    // §7.5 step 7: the checkout removed the file `zz`, uncommitted edit and
+    // all, and made directories for a path under it until the path grew
+    // too long. The put-back's scan does not see empty directories, and jj
+    // skipped writing the file over them without an error, so the crash
+    // said nothing and the next run recorded `zz` as deleted.
+    let r = setup();
+    r.write("zz", "precious\n");
+    r.write("a", "k\n");
+    r.j(&["describe \"W\""]).ok();
+    r.write("zz", "edited, not yet recorded\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\"zz\"]) c.files ++ [{{ path = [{}], content = blob \"deep\" }}] }})",
+        too_deep("zz")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("zz"), "edited, not yet recorded\n");
+    r.j(&["id"]).ok();
+    let files = r.j(&["\\r -> show (map (\\c -> [c.message (contentAt [\"zz\"] c.files)]) (commits (top r)))"]).ok().stdout;
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["W" (blob "edited, not yet recorded\n")]]"#);
 }
 
 /// Whether `dir`'s filesystem folds case, judged as the backend judges it:
