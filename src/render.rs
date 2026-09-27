@@ -196,14 +196,7 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
         Value::Thunk(_) => unreachable!("forced never returns a thunk"),
         Value::Int(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
-        Value::Text(t) => {
-            let first = t.lines().next().unwrap_or("");
-            if t.lines().count() > 1 {
-                Ok(format!("{}…", first))
-            } else {
-                Ok(first.to_string())
-            }
-        }
+        Value::Text(t) => Ok(first_line(t)),
         Value::Id(id) => Ok(display_id(interp, id, pal)),
         Value::Blob(b) => {
             let size = human_size(b.size());
@@ -213,7 +206,9 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
                 Ok(format!("‹{}›", size))
             }
         }
-        Value::Fun(f) => Ok(crate::show::show(&Interp::dummy(), &Value::Fun(f.clone()))),
+        // a lambda renders as its source (§5.2), which may run over several
+        // lines and hold comments; the line form keeps only the first
+        Value::Fun(_) => Ok(first_line(&crate::show::show(&Interp::dummy(), v))),
         Value::Shape(s) => Ok(s.name.clone()),
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
@@ -244,6 +239,18 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
             Ok(format!("{{ {} }}", names.join(", ")))
         }
         Value::List(xs) => list_line(interp, xs, pal),
+    }
+}
+
+/// The line form of text that may run over several lines (§5.1): its first
+/// line, `…` if there are more.
+fn first_line(s: &str) -> String {
+    let mut lines = s.lines();
+    let first = lines.next().unwrap_or("");
+    if lines.next().is_some() {
+        format!("{}…", first)
+    } else {
+        first.to_string()
     }
 }
 
@@ -534,10 +541,20 @@ fn display_block(
             out.push_str(&indent_multiline(&content, indent));
             return Ok(());
         }
-        Value::Int(_) | Value::Bool(_) | Value::Id(_) | Value::Fun(_) | Value::Shape(_) => {
+        Value::Int(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) => {
             out.push_str(&pad);
             out.push_str(&display_line(interp, v, pal)?);
             out.push('\n');
+            return Ok(());
+        }
+        // all of a lambda's source, of which the line form keeps the first
+        // line (§5.1), each line under the block's indent
+        Value::Fun(_) => {
+            for l in crate::show::show(&Interp::dummy(), v).lines() {
+                out.push_str(&pad);
+                out.push_str(l);
+                out.push('\n');
+            }
             return Ok(());
         }
         Value::List(xs) => return display_list_block(interp, xs, pal, indent, out),

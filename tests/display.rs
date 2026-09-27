@@ -262,6 +262,31 @@ fn functions_display_as_written() {
 }
 
 #[test]
+fn lambda_over_several_lines_is_one_line_in_line_form() {
+    // a lambda's source (§5.2) may run over several lines and hold comments;
+    // its line form is the first line, `…` if there are more, as a Text's is
+    // (§5.1), so a record keeps one line per field and a column table one
+    // line per row, aligned. Its block form is all of the source.
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let f = "\\x -> x -- note\n      + 1";
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ f = {}, g = 2 }}", f), repo.clone());
+    assert_eq!(out, "f  \\x -> x -- note…\ng  2\n");
+    let out = eval_and_display(
+        &mut i,
+        &cfg,
+        &format!("[({{ f = {}, g = 2 }}) ({{ f = \\y -> y, g = (1 +) 2 }})]", f),
+        repo.clone(),
+    );
+    assert_eq!(out, "f                  g\n\\x -> x -- note…   2\n\\y -> y            3\n");
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ fs = [({}) (\\y -> y)] }}", f), repo.clone());
+    assert_eq!(out, "fs  \n    \\x -> x -- note\n          + 1\n\n    \\y -> y\n");
+    // a partial application whose argument runs over lines is cut the same way
+    let out = eval_and_display(&mut i, &cfg, &format!("{{ m = map ({}) }}", f), repo);
+    assert_eq!(out, "m  map (\\x -> x -- note…\n");
+}
+
+#[test]
 fn conflicts_table() {
     // a repo where the focus has an unresolved file
     let (repo, be) = sample_repo();

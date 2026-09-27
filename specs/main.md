@@ -595,7 +595,7 @@ Shapes are recognised by their exact field set, as in §4.12: `Commit`, `Entry`,
 | `Text` | raw, first line, `…` if truncated | raw, all of it, trailing newline added if absent |
 | `Id` | shortest unique prefix (bold), remainder (dim) | same |
 | `Blob` | `‹214 B›`, `‹✖ 3.1 KB›` if unresolved | its content, raw (markers if unresolved) |
-| function | name, lambda source, or `f arg …` | same |
+| function | name, lambda source, or `f arg …`; first line, `…` if truncated | same, all of it |
 | `Shape` | its type name | same |
 | `Commit` | `glyph id  message  labels` — a `tree` line without rails | that line, then `author · age · n files`, then one changed path per line with `+ ~ − ✖` marks |
 | `Entry` | `path  size`, `✖` prefix if unresolved | same |
