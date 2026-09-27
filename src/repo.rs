@@ -458,10 +458,16 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
     Ok(())
 }
 
+/// The longest name a filesystem holds (NAME_MAX), in bytes: 255 on ext4,
+/// xfs, btrfs and tmpfs; the others allow 255 characters or UTF-16 units,
+/// which 255 bytes of UTF-8 never exceed.
+const NAME_MAX: usize = 255;
+
 /// Path components (§7.5 step 1) of every commit persisting writes anew or
 /// checks out. jj stores any name that is not empty and has no `/`, but its
-/// checkout refuses `.`, `..`, `.git` and `.jj` — after the operation is
-/// recorded — and a git tree cannot hold a NUL.
+/// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
+/// over `NAME_MAX`, after the operation is recorded; a git tree cannot hold
+/// a NUL.
 ///
 /// A commit that keeps the files it has in `old` is checked only as the
 /// focus: persisting at most rewrites it with the tree jj already stored and
@@ -481,6 +487,11 @@ fn validate_path_names(
             .collect::<Result<_, _>>()?,
         None => BTreeMap::new(),
     };
+    let reserved = |comp: &str| {
+        matches!(comp, "" | "." | ".." | ".git" | ".jj")
+            || comp.contains(['/', '\0'])
+            || comp.len() > NAME_MAX
+    };
     for c in all_commits(new)? {
         let id = id_of(&c)?;
         if immutable.contains(&id) {
@@ -498,7 +509,7 @@ fn validate_path_names(
             let path = e.field("path")?;
             for comp in path.as_list()? {
                 let comp = comp.as_text()?;
-                if matches!(comp, "" | "." | ".." | ".git" | ".jj") || comp.contains(['/', '\0']) {
+                if reserved(comp) {
                     return Err(Crash::new(format!(
                         "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
                         comp

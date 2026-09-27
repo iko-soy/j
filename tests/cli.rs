@@ -503,11 +503,14 @@ fn unwritable_path_refused_before_anything_is_recorded() {
     r.j(&["describe \"stable\""]).ok();
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // longer than NAME_MAX (255 bytes): the checkout failed to stat it
+    let long = format!("[\"{}\"]", "x".repeat(256));
     for bad in [
         r#"[".." "evil"]"#,
         r#"["x" ".."]"#,
         r#"[".git" "hooks" "post-checkout"]"#,
         r#"[".jj" "x"]"#,
+        long.as_str(),
     ] {
         let edit = format!(
             "mapRoot (\\c -> c {{ files = c.files ++ [{{ path = {}, content = blob \"pwn\" }}] }})",

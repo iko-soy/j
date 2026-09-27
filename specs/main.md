@@ -862,10 +862,10 @@ Within it:
    and none both a file and a directory (§7.3); every path component of the
    focus, and of every other commit that is not in `old` or whose files
    differ from its files there (§7.3), is a name a checkout can create: not
-   empty, `.`, `..`, `.git` or `.jj`, and without `/` or NUL. (Any other
-   commit that keeps its files is neither checked out nor written with a
-   name jj has not already stored, and a fetched branch can hold any name git
-   can.) Violations crash with a message naming the rule.
+   empty, `.`, `..`, `.git` or `.jj`, at most 255 bytes long, and without `/`
+   or NUL. (Any other commit that keeps its files is neither checked out nor
+   written with a name jj has not already stored, and a fetched branch can
+   hold any name git can.) Violations crash with a message naming the rule.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.

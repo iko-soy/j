@@ -165,6 +165,10 @@ fn unwritable_path_components_rejected() {
     // `.jj` recorded the operation before the checkout refused it, wedging
     // the repository; the rest crashed only when the tree was written.
     let old = two_commit_repo(&[]);
+    // longer than a filesystem's name limit (NAME_MAX, 255 bytes), which the
+    // checkout found only after the operation was recorded; bytes, not
+    // characters
+    let (long, wide, longest) = ("x".repeat(256), "é".repeat(128), "x".repeat(255));
     for bad in [
         &["..", "evil"][..],
         &["x", ".."][..],
@@ -175,6 +179,8 @@ fn unwritable_path_components_rejected() {
         &[""][..],
         &["a/b"][..],
         &["x\0y"][..],
+        &[long.as_str()][..],
+        &["d", wide.as_str(), "x"][..],
     ] {
         let new = focus_with_files(vec![entry_at(bad, "pwn")]);
         let e = validate_with(&old, &new).unwrap_err();
@@ -183,7 +189,13 @@ fn unwritable_path_components_rejected() {
     // names that merely resemble them are ordinary files; jj's snapshot
     // tracks `.GIT` on a case-sensitive filesystem, so refusing it would
     // refuse the working directory itself
-    for ok in [&["..."][..], &[".gitignore"][..], &[".jjconfig", ".git.d"][..], &[".GIT", "x"][..]] {
+    for ok in [
+        &["..."][..],
+        &[".gitignore"][..],
+        &[".jjconfig", ".git.d"][..],
+        &[".GIT", "x"][..],
+        &[longest.as_str()][..],
+    ] {
         let new = focus_with_files(vec![entry_at(ok, "fine")]);
         assert!(validate_with(&old, &new).is_ok(), "{:?}", ok);
     }
