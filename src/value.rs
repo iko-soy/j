@@ -427,6 +427,78 @@ pub enum FunVal {
     Labelled(String, Value),
 }
 
+/// What a function holds that may hold further functions: a closure's
+/// environment and arguments, a builtin's arguments, the operands of an
+/// `or` or a composition, a label's `labelled`. It is only ever dropped.
+#[allow(dead_code)]
+enum Held {
+    Closure(Env, Vec<Value>),
+    Args(Vec<Value>),
+    Two(Value, Value),
+    One(Value),
+}
+
+/// How many function drops run inside one another before the next one's
+/// contents are put off to the outermost.
+const INLINE_FUN_DROPS: usize = 64;
+
+struct FunDrops {
+    depth: std::cell::Cell<usize>,
+    put_off: std::cell::RefCell<Vec<Held>>,
+}
+
+thread_local! {
+    static FUN_DROPS: FunDrops = const {
+        FunDrops {
+            depth: std::cell::Cell::new(0),
+            put_off: std::cell::RefCell::new(Vec::new()),
+        }
+    };
+}
+
+/// A function is dropped with what it holds, which may be a function holding
+/// a function, and so on: a closure over a closure, a composition of
+/// compositions, a named wrapper around another (named_apply). Dropped the
+/// usual way, such a chain recursed once per link on the native stack, and a
+/// chain a recursion had built a million links long aborted the process
+/// (§4.1). Past a small depth, what a function holds is put off, and the
+/// outermost function drop drops it, so the stack a drop takes is bounded.
+impl Drop for FunVal {
+    fn drop(&mut self) {
+        let held = match self {
+            FunVal::Closure {
+                env, applied_args, ..
+            } => Held::Closure(std::mem::replace(env, Env::empty()), std::mem::take(applied_args)),
+            FunVal::Builtin { args, .. } => Held::Args(std::mem::take(args)),
+            FunVal::OrFun(a, b) | FunVal::ComposeLazy(a, b) => Held::Two(
+                std::mem::replace(a, Value::Bool(false)),
+                std::mem::replace(b, Value::Bool(false)),
+            ),
+            FunVal::Labelled(_, v) => Held::One(std::mem::replace(v, Value::Bool(false))),
+        };
+        // once the thread's locals are gone, `held` simply drops here
+        let _ = FUN_DROPS.try_with(move |d| {
+            let depth = d.depth.get();
+            if depth >= INLINE_FUN_DROPS {
+                d.put_off.borrow_mut().push(held);
+                return;
+            }
+            d.depth.set(depth + 1);
+            drop(held);
+            if depth == 0 {
+                loop {
+                    let next = d.put_off.borrow_mut().pop();
+                    match next {
+                        Some(h) => drop(h),
+                        None => break,
+                    }
+                }
+            }
+            d.depth.set(depth);
+        });
+    }
+}
+
 impl Value {
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -522,7 +594,6 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
             FunVal::Closure {
                 params,
                 applied,
-                applied_args,
                 body,
                 env,
                 src,
@@ -531,7 +602,10 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 name: Some(name.to_string()),
                 params: params.clone(),
                 applied: *applied,
-                applied_args: applied_args.clone(),
+                // the definition renders as its name, followed only by the
+                // arguments it is given, not those its value holds: `prev`,
+                // not `prev (parents)` (§5.2)
+                applied_args: Vec::new(),
                 body: body.clone(),
                 env: env.clone(),
                 src: src.clone(),
@@ -573,18 +647,50 @@ pub fn named_apply(
     name: &str,
     cexpr: Rc<crate::shape::ContractExpr>,
 ) -> Value {
-    let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
     Value::Fun(Rc::new(FunVal::Closure {
         name: Some(name.to_string()),
         params: vec![Pattern::Var("x".to_string())],
         applied: 0,
         applied_args,
-        body: Rc::new(Expr::App(var("f"), var("x"))),
+        body: NAMED_APPLY_BODY.with(Rc::clone),
         env: Env::empty().extend(vec![("f".to_string(), f)]),
         // a named closure renders by its name, not its source (§5.2)
         src: crate::ast::Source::new(Rc::from(""), 0, 0),
         pending: Some((name.to_string(), cexpr)),
     }))
+}
+
+thread_local! {
+    /// `f x`, the body every named_apply wrapper shares, by which one is
+    /// told from a lambda written in the language
+    static NAMED_APPLY_BODY: Rc<Expr> = {
+        let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
+        Rc::new(Expr::App(var("f"), var("x")))
+    };
+}
+
+/// The function `v` wraps when it is a named_apply wrapper under `name` and a
+/// contract the same as `cexpr`. Naming that function afresh under them
+/// checks all the wrapper would, so a definition that names the value of its
+/// own recursive call wraps it once, not once per call (§4.13).
+pub fn named_inner(v: &Value, name: &str, cexpr: &crate::shape::ContractExpr) -> Option<Value> {
+    match v {
+        Value::Fun(fv) => match fv.as_ref() {
+            FunVal::Closure {
+                body,
+                env,
+                pending: Some((n, c)),
+                ..
+            } if n == name
+                && c.same_as(cexpr)
+                && NAMED_APPLY_BODY.with(|b| Rc::ptr_eq(b, body)) =>
+            {
+                env.lookup("f")
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A crash (§4.7).
@@ -621,9 +727,10 @@ pub struct Frame {
 enum FrameKind {
     Small(Vec<(String, Value)>),
     Big(HashMap<String, Value>),
-    /// recursive let bindings: filled incrementally, read through the cell so
+    /// recursive let bindings: the names the block binds, and their values
+    /// in that order, filled incrementally and read through the cell so
     /// closures capturing the frame see later bindings (§4.1)
-    Rec(Rc<std::cell::RefCell<Vec<(String, Value)>>>),
+    Rec(Rc<[String]>, Rc<std::cell::RefCell<Vec<Value>>>),
 }
 
 impl Env {
@@ -649,13 +756,14 @@ impl Env {
         }
     }
 
-    /// extend with a recursive frame (for `let` blocks)
-    pub fn extend_rec(&self) -> (Env, Rc<std::cell::RefCell<Vec<(String, Value)>>>) {
-        let cell = Rc::new(std::cell::RefCell::new(Vec::new()));
+    /// extend with a recursive frame (for `let` blocks) binding `names`,
+    /// whose values are pushed to the returned cell in the same order
+    pub fn extend_rec(&self, names: Rc<[String]>) -> (Env, Rc<std::cell::RefCell<Vec<Value>>>) {
+        let cell = Rc::new(std::cell::RefCell::new(Vec::with_capacity(names.len())));
         (
             Env {
                 frame: Some(Rc::new(Frame {
-                    kind: FrameKind::Rec(cell.clone()),
+                    kind: FrameKind::Rec(names, cell.clone()),
                     parent: self.clone(),
                 })),
             },
@@ -674,11 +782,13 @@ impl Env {
                         }
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, v) in cell.borrow().iter().rev() {
-                        if n == name {
-                            return Some(v.clone());
-                        }
+                FrameKind::Rec(names, cell) => {
+                    // the frame binds its names before it holds their values:
+                    // one not evaluated yet is unbound here, not a same-named
+                    // definition further out, which config.j's binders may
+                    // reuse (§4.2)
+                    if let Some(i) = names.iter().rposition(|n| n == name) {
+                        return cell.borrow().get(i).cloned();
                     }
                 }
                 FrameKind::Big(m) => {
@@ -700,7 +810,7 @@ impl Env {
         while let Some(f) = cur {
             match &f.kind {
                 FrameKind::Small(_) => small_frames += 1,
-                FrameKind::Big(_) | FrameKind::Rec(_) => {}
+                FrameKind::Big(_) | FrameKind::Rec(..) => {}
             }
             cur = f.parent.frame.as_ref();
         }
@@ -716,8 +826,8 @@ impl Env {
                         out.insert(n.clone());
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, _) in cell.borrow().iter() {
+                FrameKind::Rec(names, _) => {
+                    for n in names.iter() {
                         out.insert(n.clone());
                     }
                 }

@@ -648,6 +648,56 @@ fn config_binders_may_reuse_the_configs_own_top_level_names() {
 }
 
 #[test]
+fn a_let_binding_not_yet_evaluated_is_not_its_top_level_namesake() {
+    // §4.2: a config.j binder reusing a top-level name means the binder
+    // throughout its scope. Here `a` applies `f`, whose body needs the
+    // binding `bb`, which needs `a`: a crash, as on the command line. The
+    // lookup used to pass the block's unfilled `bb` by and find the
+    // definition, so `zz` was 1001
+    for block in [
+        "let a = f 1; f = \\x -> bb + x; bb = a in a",
+        // no value cycle, but `bb` reaches back to `a` and is not evaluated
+        // before the rest (§4.1): a crash is allowed, the definition is not
+        "let a = g 1; g = \\x -> h x; h = \\x -> bb + x; bb = c.v; c = { v = 5, back = \\y -> a } in a",
+    ] {
+        let src = format!("{}\n(+) : Int -> Int -> Int\nbb = 1000\nzz = {}\n", MINIMAL, block);
+        match eval_cfg(&src) {
+            Ok(_) => panic!("{}: config loads", block),
+            Err(e) => assert!(e.contains("unbound name `bb`"), "{}: {}", block, e),
+        }
+    }
+    // evaluated before it is used, the binding is what the name means
+    let i = eval_cfg(&format!(
+        "{}\nf = \\x -> 1000 + x\nzz = let a = f 1; f = \\x -> x in a\n",
+        MINIMAL
+    ))
+    .expect("config loads");
+    let v = i.globals.lookup("zz").expect("zz");
+    assert!(j::value::value_eq(&v, &Value::int(1)).unwrap());
+}
+
+#[test]
+fn label_literal_depends_on_a_let_binding_named_labelled() {
+    // §4.11: `%main` is `labelled "main"`, so in the scope of a config.j
+    // binding `labelled` (§4.2) it is ordered after that binding (§4.1) and
+    // applies it, wherever the block lists it. `a` used to be evaluated
+    // first, before the binding: the top-level `labelled` gave `[]` where
+    // `labelled "main"` in its place gave "main"
+    for block in [
+        "let a = %main; labelled = \\n r -> n in a 0",
+        "let a = labelled \"main\"; labelled = \\n r -> n in a 0",
+        "let labelled = \\n r -> n; a = %main in a 0",
+        "let b = { f = (let c = 1 in %main) }; labelled = \\n r -> n in b.f 0",
+        "let a = \\u -> %main; labelled = \\n r -> n in a 1 0",
+    ] {
+        let i = eval_cfg(&format!("{}\nzz = {}\n", MINIMAL, block))
+            .unwrap_or_else(|e| panic!("{}: {}", block, e));
+        let v = i.globals.lookup("zz").expect("zz");
+        assert!(j::value::value_eq(&v, &Value::text("main")).unwrap(), "{}", block);
+    }
+}
+
+#[test]
 fn double_typedecl_rejected() {
     let e = cfg_err(&format!("{}\nPath = [Text]\nPath = [Text]\n", MINIMAL));
     assert!(e.contains("twice"), "{}", e);

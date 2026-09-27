@@ -233,6 +233,28 @@ fn deep_nesting_is_a_parse_error() {
 }
 
 #[test]
+fn lists_nested_as_deep_as_they_parse_display() {
+    // §1.4, §3.4: input within the nesting bound is never a stack overflow,
+    // and the displayed result is no exception. Display recursed once per
+    // level of nested lists, at about 14 KB a level in this debug build, so
+    // a list literal 38,000 deep parsed and then aborted with exit 134 and
+    // no `j:` line, as did a list built that deep at run time
+    let r = setup();
+    let n = 40_000;
+    let out = r.j_stdin(&format!("{}{}", "[".repeat(n), "]".repeat(n)), &[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    // the innermost `[[]]` is a list of one path, the empty one (§5.1)
+    assert_eq!(out.stdout, "\n");
+    // `[[[[] 0] 1] …]`: any other list is one block per item (§5.1), and a
+    // list built at run time is not bounded by the parser
+    let n = 100_000;
+    let out = r.j(&[&format!("foldl (\\acc i -> [acc i]) [] (range 0 {})", n)]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let items: String = (0..n).map(|i| format!("\n{}\n", i)).collect();
+    assert!(out.stdout == format!("none\n{}", items), "{}…", &out.stdout[..40.min(out.stdout.len())]);
+}
+
+#[test]
 fn crash_is_exit_1_with_trace() {
     let r = setup();
     let out = r.j(&["crash \"boom\""]);

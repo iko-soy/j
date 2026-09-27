@@ -2,8 +2,10 @@
 
 use crate::domain::ROOT_ID;
 use crate::eval::Interp;
-use crate::value::{Crash, ShapeKind, Value};
+use crate::value::{Crash, ListVal, RecordMap, ShapeKind, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
+use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
 // ----------------------------------------------------------------------
@@ -178,11 +180,56 @@ pub fn display(interp: &mut Interp, v: &Value, color: bool) -> Result<String, Cr
     let pal = Palette { on: color };
     let mut out = String::new();
     let mut loaded = None;
-    display_block(interp, v, &pal, 0, &mut out, &mut loaded)?;
+    let mut todo = vec![Block::Of(v.clone(), 0)];
+    while let Some(block) = todo.pop() {
+        match block {
+            Block::Of(v, indent) => {
+                display_block(interp, &v, &pal, indent, &mut out, &mut loaded, &mut todo)?
+            }
+            Block::Items { xs, next, indent } => {
+                if let Some(x) = xs.get(next).cloned() {
+                    // separated by a blank line
+                    if next > 0 {
+                        out.push('\n');
+                    }
+                    let next = next + 1;
+                    todo.push(Block::Items { xs, next, indent });
+                    todo.push(Block::Of(x, indent));
+                }
+            }
+            Block::Fields { m, after, name_w, indent } => display_fields(
+                interp,
+                &m,
+                after.as_deref(),
+                name_w,
+                &pal,
+                indent,
+                &mut out,
+                &mut loaded,
+                &mut todo,
+            )?,
+        }
+    }
     if !out.ends_with('\n') {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// A block still to be displayed, or the rest of one that holds blocks
+/// (§5.1): a list shown one block per item, and a generic record, whose list
+/// fields print in block form under their key. Blocks nest as deep as the
+/// value's lists do, so `display` keeps them on a stack of its own instead of
+/// recursing: at about 14 KB of native stack a level in a debug build, a list
+/// nested as deep as the parser allows (§3.4) overflowed the worker's 512 MB,
+/// and one built at run time is not bounded at all.
+enum Block {
+    /// a value in block form, at an indent
+    Of(Value, usize),
+    /// a list's items from the `next`th on, one block each
+    Items { xs: ListVal, next: usize, indent: usize },
+    /// a generic record's fields after the field `after`, or all of them
+    Fields { m: Rc<RecordMap>, after: Option<String>, name_w: usize, indent: usize },
 }
 
 fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
@@ -214,7 +261,7 @@ fn display_line(
         }
         // a lambda renders as its source (§5.2), which may run over several
         // lines and hold comments; the line form keeps only the first
-        Value::Fun(_) => Ok(first_line(&crate::show::show(&Interp::dummy(), v)?)),
+        Value::Fun(_) => Ok(first_line(&crate::show::show(interp, v)?)),
         Value::Shape(s) => Ok(s.name.clone()),
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
@@ -639,6 +686,7 @@ fn has_conflict(c: &Value) -> Result<bool, Crash> {
     Ok(false)
 }
 
+/// `v` in block form, the blocks it holds left on `todo` (see `Block`)
 fn display_block(
     interp: &mut Interp,
     v: &Value,
@@ -646,6 +694,7 @@ fn display_block(
     indent: usize,
     out: &mut String,
     loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
     let v = &v.forced()?;
@@ -669,14 +718,14 @@ fn display_block(
         // all of a lambda's source, of which the line form keeps the first
         // line (§5.1), each line under the block's indent
         Value::Fun(_) => {
-            for l in crate::show::show(&Interp::dummy(), v)?.lines() {
+            for l in crate::show::show(interp, v)?.lines() {
                 out.push_str(&pad);
                 out.push_str(l);
                 out.push('\n');
             }
             return Ok(());
         }
-        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out, loaded),
+        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out, loaded, todo),
         Value::Record(_) => {}
     }
     if let Some(shape) = shape_of_record(interp, v) {
@@ -734,19 +783,42 @@ fn display_block(
         _ => unreachable!(),
     };
     let name_w = m.keys().map(|k| width(k)).max().unwrap_or(0);
-    for (k, x) in m.iter() {
+    display_fields(interp, m, None, name_w, pal, indent, out, loaded, todo)
+}
+
+/// A generic record's fields after the field `after`, or all of them, one
+/// per line under names `name_w` wide, up to the first that is a non-empty
+/// list: its block is left on `todo` to be displayed next, and the fields
+/// after it to follow.
+#[allow(clippy::too_many_arguments)]
+fn display_fields(
+    interp: &mut Interp,
+    m: &Rc<RecordMap>,
+    after: Option<&str>,
+    name_w: usize,
+    pal: &Palette,
+    indent: usize,
+    out: &mut String,
+    loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
+) -> Result<(), Crash> {
+    let pad = " ".repeat(indent);
+    let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+    for (k, x) in m.range::<str, _>((from, Bound::Unbounded)) {
         out.push_str(&pad);
         out.push_str(&pal.dim(&pad_right(k, name_w)));
         out.push_str("  ");
         // lists print in block form under their key (§5.1)
         if matches!(x, Value::List(xs) if !xs.is_empty()) {
             out.push('\n');
-            display_block(interp, x, pal, indent + name_w + 2, out, loaded)?;
-        } else {
-            let line = display_line(interp, x, pal, loaded)?;
-            out.push_str(&line);
-            out.push('\n');
+            let after = Some(k.clone());
+            todo.push(Block::Fields { m: m.clone(), after, name_w, indent });
+            todo.push(Block::Of(x.clone(), indent + name_w + 2));
+            return Ok(());
         }
+        let line = display_line(interp, x, pal, loaded)?;
+        out.push_str(&line);
+        out.push('\n');
     }
     Ok(())
 }
@@ -1011,14 +1083,17 @@ fn top_of(interp: &Interp, _x: &Value) -> Result<Value, Crash> {
     given_repo(interp).ok_or_else(|| Crash::new("display: no repository in context"))
 }
 
+/// `list` in block form, the blocks it holds left on `todo` (see `Block`)
 fn display_list_block(
     interp: &mut Interp,
-    xs: &[Value],
+    list: &ListVal,
     pal: &Palette,
     indent: usize,
     out: &mut String,
     loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
 ) -> Result<(), Crash> {
+    let xs: &[Value] = list;
     let pad = " ".repeat(indent);
     if xs.is_empty() {
         out.push_str(&pad);
@@ -1157,13 +1232,8 @@ fn display_list_block(
         out.push('\n');
         return Ok(());
     }
-    // one block per item, separated by a blank line
-    for (i, x) in xs.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        display_block(interp, x, pal, indent, out, loaded)?;
-    }
+    // one block per item, separated by a blank line (see `Block`)
+    todo.push(Block::Items { xs: list.clone(), next: 0, indent });
     Ok(())
 }
 

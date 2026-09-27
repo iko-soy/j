@@ -326,7 +326,9 @@ Notes:
   `r.a.b …` is thus one level deeper per link, as are right-associative
   operators, `or`, and `\`/`if`/`let` bodies. Lists nest 40,000 deep,
   parentheses and records about 20,000, and a `Subtree` as `show` renders it
-  (§5.2) about 8,000. A type in `config.j` is bounded the same way: one
+  (§5.2) about 13,000: three levels a commit, the braces of its record and
+  the list around them, as a list broken over lines holds records without
+  parentheses (§3.3). A type in `config.j` is bounded the same way: one
   level, plus one for each bracket, parenthesis, field or `->` around it.
 
 ---
@@ -377,8 +379,10 @@ enclose each of its expressions, since they are mutually recursive (§4.1), so
 exception is within `config.j`, whose binders may reuse the names of its own
 top-level definitions, as the reference config's `\files ->` and
 `\old new repo ->` do: within the binder's scope the name means the binder,
-for evaluation order (§4.1) as for lookup. Defining a top-level name twice, or
-defining a name that is also a builtin, is a configuration error.
+for evaluation order (§4.1) as for lookup, so a `let` binding used before it
+is evaluated is a crash there as anywhere, never the definition. Defining a
+top-level name twice, or defining a name that is also a builtin, is a
+configuration error.
 
 ### 4.3 Records
 
@@ -473,7 +477,7 @@ as in §4.13.
 | `text b` | the content of a blob as text; for an unresolved blob, its conflict-marker rendering |
 | `by i repo` | the repo refocused on the commit with id `i`; crashes if absent. Backed by the change-id index; its reference definition is in §10 |
 | `subtreeCommits t` | every commit of the tree `t` (anything with `root` and `children`) in preorder, in time linear in its size: the value of `t.root :: (concat (map subtreeCommits t.children) or [])`. So it crashes only if `t` has no `root`, and a node whose `children` is not a list of values that have a `root` contributes only its own. The reference `commits` is this builtin (§9) |
-| `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no header lines, three lines of context, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
+| `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no `---`/`+++` header lines, three lines of context, each hunk headed `@@ -s,n +s,n @@` with the first line and the number of lines it shows of each side, as `diff -u` writes it, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
 | `difft p a b` | the output of difftastic comparing `a` to `b` as the file `p`; §7.10. Crashes if `difft` is not on `PATH` |
 | `treeWith o r` | the history rendered as a tree with options record `o`; §7.11 |
 | `extract S v` | every subvalue of `v` that is an `S`; §4.12 |
@@ -506,10 +510,12 @@ renders a minted id like any other.
 
 ### 4.11 Label literals
 
-`%main` denotes `labelled "main"`, a `Revset`. It is a function, evaluated
-when applied, so it never fails at parse time: a name the remote does not have
-yields `[]`, and `goto %nope` crashes with "expected one revision, got 0" as
-any revset would.
+`%main` denotes `labelled "main"`, a `Revset`, as if written out where it
+stands: in the scope of a `config.j` binder named `labelled` (§4.2) it applies
+the binder, and it is a reference to it for evaluation order (§4.1). It is a
+function, evaluated when applied, so it never fails at parse time: a name the
+remote does not have yields `[]`, and `goto %nope` crashes with "expected one
+revision, got 0" as any revset would.
 
 ### 4.12 Shapes as values, and `extract`
 
@@ -543,7 +549,8 @@ its `root`. Where order matters, `commits (top repo)` is preorder.
 Every application of a function that has a signature — a builtin or a
 definition with a signature — is checked against it: each argument as it is
 supplied, against the corresponding parameter type, and the result once the
-application is complete (yields a non-function), against the result type.
+function's own application completes (its body has run or the builtin has
+all its arguments), against the result type.
 Lambdas without a signature and the command-line expression are unchecked
 except through the functions they call. A signature covers all the arguments
 it lists, however the definition's value is curried: `describe : Text -> Edit`
@@ -732,6 +739,11 @@ use: `show` writes no stand-in for the part.
 A lambda's source text runs from its `\` to the last token of its body,
 comments within it included, and a section's is the section itself, which
 unlike a lambda is an atom: `map (+ 1)`, `(\x y -> x + y) 1`.
+
+A top-level definition renders as its name whatever its value is built from,
+and its partial application as its name followed by the arguments it was
+given, never by those its value holds: `prev`, not `prev (parents)` (with
+`prev = goto parents`), `tree`, not `treeWith ({ … })`, and `addT 1` (§4.13).
 
 Line breaking: one line if it fits in 80 columns (display width, as in §5.1);
 otherwise the outermost list or record breaks one element per line, two-space

@@ -534,8 +534,11 @@ fn nesting_bound_counts_levels_as_the_spec_says() {
         const MAX: usize = 40_000;
         let lambdas = |k: usize| (0..k).map(|i| format!("\\x{} -> ", i)).collect::<String>();
         let subtree = |k: usize| {
-            // as `show` renders a `Subtree`: 1 + 2 + 2 levels each
-            (0..k).fold("[]".to_string(), |s, _| format!("[({{ children = {}, root = 1 }})]", s))
+            // as `show` renders a `Subtree`, too wide for one line once it
+            // holds a commit: a record in a list broken over lines is bare,
+            // not parenthesised (§3.3), so 1 + 2 levels each. `show` indents
+            // each `, root` line further, which the parser ignores.
+            (0..k).fold("[]".to_string(), |s, _| format!("[{{ children = {}\n, root = 1 }}]", s))
         };
         let chained = |k: usize| format!("(1{}){}", " + 1".repeat(20_000), " + 1".repeat(k));
         let cases: Vec<(Box<dyn Fn(usize) -> String>, usize)> = vec![
@@ -550,7 +553,7 @@ fn nesting_bound_counts_levels_as_the_spec_says() {
             (Box::new(|k| format!("{}[]", "1 :: ".repeat(k))), MAX - 1),
             (Box::new(|k| format!("{}1", "if true then 1 else ".repeat(k))), MAX - 1),
             (Box::new(move |k| format!("{}1", lambdas(k))), MAX - 1),
-            (Box::new(subtree), (MAX - 1) / 5),
+            (Box::new(subtree), (MAX - 1) / 3),
             // a chain around a parenthesised chain: 20,001 + 2 + k
             (Box::new(chained), MAX - 20_003),
         ];

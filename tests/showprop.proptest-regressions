@@ -8,3 +8,4 @@ cc d0ad37528155e721a58f6b981ee99cada4fbc3c7557207290297b785af156fac # shrinks to
 cc 5b66acf287a7fde0a70777e9f64a7efa7996d095bcede467fca16ef4f2554903 # shrinks to v = {"a": Blob(BlobVal { kind: Regular, content: Resolved([98, 108, 111, 98, 32, 99, 111, 110, 116, 101, 110, 116]) }), "b": [Blob(BlobVal { kind: Regular, content: Resolved([98, 108, 111, 98, 32, 99, 111, 110, 116, 101, 110, 116]) }), Int(-100000000000000000)]}
 cc 2665cae1f929e5552bbbcc5cb3d31294b9f1465475511dd4151be2d6bd64fbf4 # shrinks to v = {"if": Int(0)}
 cc 23a341edbf684d2afb8d65a4a64bc9ad60ae2bd217c3b2b4d27f7bfde8652a31 # shrinks to v = [Int(0), {}]
+cc 52e848dba68175ca6e7a74eedfb03b9cbd5d3df5c3fdefd7f4c0cee85f8def03 # shrinks to (a, b) = ("a\n\r\n\n", "\r\n\r\n\r")
