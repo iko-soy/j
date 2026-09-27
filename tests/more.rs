@@ -263,6 +263,74 @@ constT = const (\y -> y)
 }
 
 #[test]
+fn a_signed_definition_shows_as_its_name_and_its_own_arguments() {
+    // §5.2: a top-level definition renders as its name, and a partial
+    // application as the function followed by the arguments it was given.
+    // A signed definition bound to a lambda's partial application showed
+    // the arguments baked into its value as its own: `show prev` was
+    // `prev (parents)`, and `show (addTwo 2)` was `addTwo 1 2`, which is an
+    // Int, not the function it is. One bound to a builtin's partial
+    // application or a composition showed as that, `show tree` as
+    // `treeWith ({ … })`.
+    let (mut i, cfg) = make_interp_with(
+        r#"
+sum3 = \a b -> \c -> a + b + c
+
+addTwo : Int -> Int -> Int
+addTwo = sum3 1
+
+sum3b = \a b c -> a + b + c
+
+addB : Int -> Int -> Int
+addB = sum3b 1
+
+inc : Int -> Int
+inc = \x -> x + 1
+
+constS : Int -> Int -> Int
+constS = const inc
+
+plus : Int -> Int -> Int
+plus = (+)
+"#,
+    );
+    for (src, want) in [
+        ("show prev", "prev"),
+        ("show next", "next"),
+        ("show trunk", "trunk"),
+        ("show stack", "stack"),
+        ("show addTwo", "addTwo"),
+        ("show (addTwo 2)", "addTwo 2"),
+        ("show addB", "addB"),
+        ("show (addB 2)", "addB 2"),
+        ("show constS", "constS"),
+        ("show (constS 5)", "constS 5"),
+        ("show plus", "plus"),
+        ("show (plus 1)", "plus 1"),
+        ("show tree", "tree"),
+        ("show squash", "squash"),
+        ("show everything", "everything"),
+        // a builtin, and its partial application, keep theirs
+        ("show ((+) 1)", "(+) 1"),
+        ("show (const 1)", "const 1"),
+        ("show map", "map"),
+    ] {
+        assert_value(&mut i, &cfg, src, Value::text(want));
+    }
+    // the arguments are still numbered by the signature, and applied
+    assert_value(&mut i, &cfg, "addTwo 2 3", Value::int(6));
+    assert_value(&mut i, &cfg, "plus 1 2", Value::int(3));
+    let m = crash_msg(&mut i, &cfg, "addTwo 2 \"x\"");
+    assert!(m.contains("addTwo expected Int as argument 2, got Text"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "plus 1 \"x\"");
+    assert!(m.contains("plus expected Int as argument 2, got Text"), "{}", m);
+    // and a function displays as it shows (§5.1)
+    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2 }").unwrap();
+    let out = display(&mut i, &v);
+    assert_eq!(out, "a  tree\nb  addTwo 2\n");
+}
+
+#[test]
 fn arguments_are_numbered_by_the_signature() {
     // §4.13 ("describe expected Text as argument 1"): a definition that is a
     // partial application or a composition counted the arguments baked into

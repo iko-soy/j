@@ -594,7 +594,6 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
             FunVal::Closure {
                 params,
                 applied,
-                applied_args,
                 body,
                 env,
                 src,
@@ -603,7 +602,10 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 name: Some(name.to_string()),
                 params: params.clone(),
                 applied: *applied,
-                applied_args: applied_args.clone(),
+                // the definition renders as its name, followed only by the
+                // arguments it is given, not those its value holds: `prev`,
+                // not `prev (parents)` (§5.2)
+                applied_args: Vec::new(),
                 body: body.clone(),
                 env: env.clone(),
                 src: src.clone(),

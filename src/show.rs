@@ -67,6 +67,24 @@ fn render(interp: &Interp, v: &Value) -> Result<String, Crash> {
 
 fn render_fun(interp: &Interp, f: &FunVal) -> Result<String, Crash> {
     Ok(match f {
+        // a signed definition whose value is a builtin's partial application
+        // or a composition (`tree = treeWith { … }`) renders as its name,
+        // followed only by the arguments it is given (§5.2), which its
+        // signature counts, not those baked into its value
+        FunVal::Builtin {
+            name,
+            args,
+            pending: Some((cname, c)),
+            ..
+        } if interp.builtin_def(name, cname).is_some() => {
+            let own = c.position().unwrap_or(0).min(args.len());
+            let mut out = cname.clone();
+            for a in &args[args.len() - own..] {
+                out.push(' ');
+                out.push_str(&render_atom(interp, a)?);
+            }
+            out
+        }
         FunVal::Builtin { name, args, .. } => {
             // a selector `.name` carries its field as a baked-in first
             // argument (builtins::make_selector) and renders as the selector

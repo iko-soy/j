@@ -529,8 +529,9 @@ impl Interp {
     }
 
     /// the definition a crash while applying `builtin` under the contract
-    /// named `cname` is in, as blame_builtin decides
-    fn builtin_def(&self, builtin: &str, cname: &str) -> Option<String> {
+    /// named `cname` is in, as blame_builtin decides, and which the builtin
+    /// renders as (§5.2)
+    pub(crate) fn builtin_def(&self, builtin: &str, cname: &str) -> Option<String> {
         if cname != builtin && self.contracts.contains_key(cname) {
             Some(cname.to_string())
         } else {
