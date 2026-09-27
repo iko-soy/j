@@ -376,6 +376,43 @@ fn entry_list_aligns_by_display_width() {
     );
 }
 
+#[test]
+fn blocks_of_blocks_take_no_stack_a_level() {
+    // §5.1: a list that is not a table or paths is one block per item, and
+    // a generic record's list field is a block under its key, so blocks nest
+    // as deep as the value's lists do. Display recursed once for each, about
+    // 14 KB a level in a debug build: a list nested as deep as the parser
+    // allows (§3.4) aborted the binary's 512 MB, and these depths overflow
+    // 16 MB. Running out of stack aborts the process, an exit §1.4 does not
+    // allow.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let (mut i, _cfg) = make_interp(MemBackend::new());
+            // `[[[[] 0] 1] …]`
+            let n = 20_000;
+            let lists = (0..n).fold(Value::list(vec![]), |v, k| Value::list(vec![v, Value::int(k)]));
+            let items: String = (0..n).map(|k| format!("\n{}\n", k)).collect();
+            let out = j::render::display(&mut i, &lists, false).unwrap();
+            assert!(out == format!("none\n{}", items), "{}…", &out[..40.min(out.len())]);
+            // `[({ a = [({ a = [] }) 0] }) 1]` and so on: each record's list
+            // is indented under its key, the innermost empty one a line
+            let n = 2_000;
+            let records = (0..n).fold(Value::list(vec![]), |v, k| {
+                Value::list(vec![Value::record(&[("a", v)]), Value::int(k)])
+            });
+            let pad = |k: i64| " ".repeat(3 * (n - 1 - k) as usize);
+            let mut want: String = (1..n).rev().map(|k| format!("{}a  \n", pad(k))).collect();
+            want.push_str(&format!("{}a  0 items\n", pad(0)));
+            want.extend((0..n).map(|k| format!("\n{}{}\n", pad(k), k)));
+            let out = j::render::display(&mut i, &records, false).unwrap();
+            assert!(out == want, "{}…", &out[..40.min(out.len())]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 /// The glyph `tree` draws on the row of the commit whose message is `msg`.
 fn tree_glyph(out: &str, msg: &str) -> char {
     let row = out
