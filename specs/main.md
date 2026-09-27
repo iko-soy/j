@@ -1074,9 +1074,14 @@ language: `fetch` and `push` are the only things that change them.
   only bookmark to a name under it, push a temporary label on its commit
   first, `push (label "tmp" (labelled "master"))`: with it on `origin`
   nothing waits, and `rename "master" "master/legacy"` goes as one git
-  push; then `push (unlabel "tmp")`. After a successful push the labels
-  reflect the new positions. It records one operation, even when it sends
-  two git pushes. An empty list sends nothing to the remote.
+  push; then `push (unlabel "tmp")`. The refusal gives these steps with the
+  first of `tmp`, `tmp-1`, `tmp-2`, … that no bookmark, on `origin` or in
+  the repository, and no record names, and that is not a name under one of
+  those or one they are under: following them moves none of the user's
+  bookmarks, and the refused push does not touch the label. After a
+  successful push the labels reflect the new positions. It records one
+  operation, even when it sends two git pushes. An empty list sends nothing
+  to the remote.
   If the remote accepts some of the updates and rejects others, that
   operation records the accepted ones, whose labels move, and `push` exits 1
   naming the rejected bookmarks and any deletes it did not send.

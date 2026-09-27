@@ -1050,6 +1050,62 @@ fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
 }
 
 #[test]
+fn push_refusing_a_nesting_delete_advises_a_label_no_bookmark_has() {
+    // §7.6: the refusal above advised `push (label "tmp" (labelled
+    // "master"))` whatever the remote held. Followed as written, it moved a
+    // `tmp` the user had on origin to trunk's commit and then deleted it; it
+    // was rejected with `tmp/wip` there; and when the refused push itself
+    // deleted `tmp` it changed nothing and the refusal came back. The label
+    // it advises is on no bookmark, no record names it, and it nests with
+    // none of those
+    let env = setup();
+    let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    // the user's own `tmp` and `tmp-1/wip`, which do not reach trunk's commit
+    env.j(&dest, &["new . top"]).ok();
+    std::fs::write(dest.join("f.txt"), "work\n").unwrap();
+    env.j(&dest, &["describe \"my work\""]).ok();
+    env.j(&dest, &["push (\\r -> label \"tmp\" here r ++ label \"tmp-1/wip\" here r)"]).ok();
+    let work = git(&env.remote, &["rev-parse", "tmp"]).trim().to_string();
+    // the remote's default branch is elsewhere, so git lets master be deleted
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+    // `expr` is refused; the steps its message gives are run around it as
+    // written, and the first is returned
+    let follow = |expr: &str| {
+        let out = env.j(&dest, &[expr]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        let steps: Vec<&str> = out.stderr.split('`').filter(|s| s.starts_with("push (")).collect();
+        assert_eq!(steps.len(), 2, "{}", out.stderr);
+        env.j(&dest, &[steps[0]]).ok();
+        env.j(&dest, &[expr]).ok();
+        env.j(&dest, &[steps[1]]).ok();
+        steps[0].to_string()
+    };
+
+    // `tmp` is on origin, and `tmp-1` nests with `tmp-1/wip` there
+    let step = follow("push (rename \"master\" \"master/legacy\")");
+    assert_eq!(step, "push (label \"tmp-2\" (labelled \"master\"))");
+    assert_eq!(
+        refs(),
+        format!("refs/heads/master/legacy {one}\nrefs/heads/tmp {work}\nrefs/heads/tmp-1/wip {work}\n")
+    );
+
+    // with no trunk left nothing is immutable, and the rename back goes
+    env.j(&dest, &["push (rename \"master/legacy\" \"master\")"]).ok();
+    // the push deletes `tmp` and `tmp-1/wip`, and creates `tmp-3` and a name
+    // under `tmp-2`
+    let expr = "push (\\r -> rename \"master\" \"master/legacy\" r ++ rename \"tmp\" \"tmp-2/x\" r ++ rename \"tmp-1/wip\" \"tmp-3\" r)";
+    let step = follow(expr);
+    assert_eq!(step, "push (label \"tmp-4\" (labelled \"master\"))");
+    assert_eq!(
+        refs(),
+        format!("refs/heads/master/legacy {one}\nrefs/heads/tmp-2/x {work}\nrefs/heads/tmp-3 {work}\n")
+    );
+}
+
+#[test]
 fn push_moves_a_bookmark_whose_remote_commit_was_rewritten() {
     // §7.6: only the visible commit carrying a change id is in the immutable
     // set. Bookmarks pushed at a commit that was then amended here, and the
