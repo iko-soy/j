@@ -477,7 +477,7 @@ as in §4.13.
 | `text b` | the content of a blob as text; for an unresolved blob, its conflict-marker rendering |
 | `by i repo` | the repo refocused on the commit with id `i`; crashes if absent. Backed by the change-id index; its reference definition is in §10 |
 | `subtreeCommits t` | every commit of the tree `t` (anything with `root` and `children`) in preorder, in time linear in its size: the value of `t.root :: (concat (map subtreeCommits t.children) or [])`. So it crashes only if `t` has no `root`, and a node whose `children` is not a list of values that have a `root` contributes only its own. The reference `commits` is this builtin (§9) |
-| `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no header lines, three lines of context, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
+| `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no `---`/`+++` header lines, three lines of context, each hunk headed `@@ -s,n +s,n @@` with the first line and the number of lines it shows of each side, as `diff -u` writes it, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
 | `difft p a b` | the output of difftastic comparing `a` to `b` as the file `p`; §7.10. Crashes if `difft` is not on `PATH` |
 | `treeWith o r` | the history rendered as a tree with options record `o`; §7.11 |
 | `extract S v` | every subvalue of `v` that is an `S`; §4.12 |

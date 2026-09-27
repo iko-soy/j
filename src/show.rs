@@ -367,7 +367,30 @@ pub fn unified_diff(a: &str, b: &str) -> String {
     let diff = similar::TextDiff::configure().diff_slices(&old, &new);
     let mut out = String::new();
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        out.push_str(&format!("{}\n", hunk.header()));
+        // each side's range is the lines of it the hunk shows. `hunk.header()`
+        // took a side's start from the hunk's first op and its end from the
+        // last, but `similar`'s compaction moves ops past one another without
+        // updating the index each keeps on the side it does not touch, so the
+        // counts could disagree with the body ("@@ -1 +2,2 @@" over two old
+        // lines and three new), which `patch` and `git apply` refuse. A
+        // change's index on its own side is right, and each side's lines
+        // come in order.
+        let (mut old_first, mut old_len, mut new_first, mut new_len) = (None, 0, None, 0);
+        for change in hunk.iter_changes() {
+            if let Some(i) = change.old_index() {
+                old_first.get_or_insert(i);
+                old_len += 1;
+            }
+            if let Some(i) = change.new_index() {
+                new_first.get_or_insert(i);
+                new_len += 1;
+            }
+        }
+        out.push_str(&format!(
+            "@@ -{} +{} @@\n",
+            hunk_range(old_first, old_len),
+            hunk_range(new_first, new_len)
+        ));
         for change in hunk.iter_changes() {
             let sign = match change.tag() {
                 similar::ChangeTag::Delete => "-",
@@ -388,6 +411,18 @@ pub fn unified_diff(a: &str, b: &str) -> String {
         }
     }
     out
+}
+
+/// One side's range in a hunk header as `diff -u` writes it, from the index
+/// of the side's first line in the hunk and how many it has: `s` for one
+/// line, `s,n` otherwise. With context around every change a hunk shows no
+/// line of a side only when that side has none, the empty range `0,0`.
+fn hunk_range(first: Option<usize>, len: usize) -> String {
+    match first {
+        Some(i) if len == 1 => format!("{}", i + 1),
+        Some(i) => format!("{},{}", i + 1, len),
+        None => "0,0".to_string(),
+    }
 }
 
 // ----------------------------------------------------------------------

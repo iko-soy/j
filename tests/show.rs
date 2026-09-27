@@ -569,6 +569,25 @@ fn unified_diff_lines_end_at_newline_only() {
 }
 
 #[test]
+fn unified_diff_headers_count_the_hunk_body() {
+    // each side's range is the lines the hunk shows of it: `similar`'s own
+    // header took each side's start from the hunk's first op and its end from
+    // the last, and its compaction can leave an op's index on the side the op
+    // does not touch stale, so these came out "@@ -1 +2,2 @@", "@@ -1 +2 @@"
+    // and "@@ -1,3 +7 @@" (outputs as `diff -u` gives them)
+    assert_eq!(unified_diff("cb\n\n", "\n\nc\n"), "@@ -1,2 +1,3 @@\n-cb\n \n+\n+c\n");
+    assert_eq!(unified_diff("bc\n\n", "\n\n"), "@@ -1,2 +1,2 @@\n-bc\n \n+\n");
+    assert_eq!(
+        unified_diff("b\n\n\ra\n", "\n\n\na\r\n\r\n\n\n"),
+        "@@ -1,3 +1,7 @@\n-b\n \n-\ra\n+\n+\n+a\r\n+\r\n+\n+\n"
+    );
+    // an empty side is the empty range before its first line
+    assert_eq!(unified_diff("", "new\n"), "@@ -0,0 +1 @@\n+new\n");
+    assert_eq!(unified_diff("old\n", ""), "@@ -1 +0,0 @@\n-old\n");
+    assert_eq!(unified_diff("", "a\nb"), "@@ -0,0 +1,2 @@\n+a\n+b\n\\ No newline at end of file\n");
+}
+
+#[test]
 fn unified_diff_context_radius() {
     // 3 lines of context: a change far from the ends shows 3 before/after
     let a = (1..=10).map(|n| format!("{}\n", n)).collect::<String>();
