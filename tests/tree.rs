@@ -496,6 +496,81 @@ fn size_bar_counts_lines_added_plus_removed() {
 }
 
 #[test]
+fn size_bar_counts_exactly_up_to_its_last_threshold() {
+    // the line diff stopped at a 200 ms deadline and then overcounted, so the
+    // same commit drew `▅` on an idle machine and `▇` on a busy one, and every
+    // reordered long file cost the whole 200 ms. The bar tops out at 1000
+    // lines (§7.11 column 5), so the count is exact below that, whatever the
+    // diff costs, and stops there: blocks of lines moved within a long file
+    // (a block of n lines moved past at least n others counts 2n), counts on
+    // either side of 1000 in one file and spread over two, and a reversed
+    // file.
+    let base: Vec<String> = (0..60000).map(|i| format!("line {}\n", i)).collect();
+    let moved = |lens: &[usize], inserted: bool| -> String {
+        let mut f = base.clone();
+        for (j, len) in lens.iter().enumerate() {
+            let at = 1000 + 10000 * j;
+            let block: Vec<String> = f.drain(at..at + len).collect();
+            f.splice(at + 1000..at + 1000, block);
+        }
+        if inserted {
+            f.insert(55000, "inserted\n".to_string());
+        }
+        f.concat()
+    };
+    let grown = |by: usize| -> Vec<String> {
+        base.iter().cloned().chain((0..by).map(|i| format!("added {}\n", i))).collect()
+    };
+    let mut reversed = grown(1000);
+    reversed.reverse();
+    let fg = |f: String, g: String| vec![("f".to_string(), f), ("g".to_string(), g)];
+    let (base_f, small) = (base.concat(), numbered(0..10));
+    let chain = vec![
+        ("base", fg(base_f.clone(), small.clone())),
+        ("moves900", fg(moved(&[90; 5], false), small.clone())),
+        ("undo900", fg(base_f.clone(), small.clone())),
+        ("moves999", fg(moved(&[100, 100, 100, 100, 99], true), small.clone())),
+        ("undo999", fg(base_f.clone(), small.clone())),
+        ("moves1000", fg(moved(&[100; 5], false), small.clone())),
+        ("undo1000", fg(base_f.clone(), small.clone())),
+        ("grow999", fg(grown(500).concat(), numbered(0..509))),
+        ("grow1000", fg(grown(1000).concat(), numbered(0..1009))),
+        ("reversed", fg(reversed.concat(), numbered(0..1009))),
+    ];
+    let want = [
+        ("moves900", "▅"),
+        ("undo900", "▅"),
+        ("moves999", "▅"),
+        ("undo999", "▅"),
+        ("moves1000", "▇"),
+        ("undo1000", "▇"),
+        ("grow999", "▅"),
+        ("grow1000", "▇"),
+        ("reversed", "▇"),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip(want) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+    // runs of one repeated line swapped: a shortest diff keeps only the
+    // longer run, so these count 999 and 1000
+    let h = |first: String, then: String| vec![("h".to_string(), first + &then)];
+    let chain = vec![
+        ("runs", h("a\n".repeat(499), "b\n".repeat(501))),
+        ("runs999", h("b\n".repeat(501), "a\n".repeat(500))),
+        ("runs1000", h("a\n".repeat(500), "b\n".repeat(501))),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip([("runs999", "▅"), ("runs1000", "▇")]) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+}
+
+#[test]
 fn files_column_counts_changed_files() {
     // `files` is the number of files changed against the parent (specs/tree.md
     // Step 4 column 9), not the size of the commit's snapshot: an empty

@@ -375,21 +375,31 @@ fn touched_in_maps(from: &SnapMap, to: &SnapMap) -> Result<Vec<(Vec<String>, cha
     Ok(out)
 }
 
+/// The line count from which the size bar draws its last glyph, `▇` (§7.11
+/// column 5): no count past it changes the bar, so none is computed.
+const SIZE_BAR_TOP: usize = 1000;
+
 /// Lines added plus removed between two versions of one path (§7.11 size
-/// bar), either possibly absent: the length of a line diff, lines split after
-/// each `\n` as `line_count` counts them. A conflict counts as its
+/// bar), either possibly absent, counted up to `cap`: the length of a
+/// shortest line diff, or `cap` if that is at least `cap`. Lines are split
+/// after each `\n` as `line_count` counts them. A conflict counts as its
 /// materialized text, as it is checked out.
 ///
-/// Myers' cost grows with the product of the file's length and the size of
-/// the change, so a plain line diff of a rewritten long file takes seconds.
-/// A line that does not occur on the other side at all cannot be part of any
-/// common subsequence, so, as git's xdiff does, those lines count as changed
-/// up front and only the rest is diffed — the count is the same. What remains
-/// slow (a long file whose lines were reordered) has a deadline, past which
-/// `similar` settles for a longer diff: an overcount of a change that is
-/// already large.
-fn changed_lines(from: Option<&Value>, to: Option<&Value>) -> Result<usize, Crash> {
-    use std::collections::HashSet;
+/// A line diff costs the product of the file's length and the size of the
+/// change, so a plain one of a rewritten or reordered long file takes
+/// seconds. The search here stops at the cap, so its cost is bounded by the
+/// cap rather than by a clock and the same two versions always give the same
+/// count, and every step before it keeps the count exact: the common prefix
+/// and suffix are equal lines of some shortest diff, and the difference in
+/// length is a lower bound. A small change is then settled by a short search
+/// over the lines as they are. Otherwise a line that does not occur on the
+/// other side at all cannot be part of any common subsequence, so, as git's
+/// xdiff does, it counts as changed up front, and the rest is searched
+/// unless `reorder_bound` already puts it past the cap.
+fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
+    use std::collections::HashMap;
+    // the rounds of the first, short search
+    const QUICK: usize = 64;
     let text = |v: Option<&Value>| -> Result<Vec<u8>, Crash> {
         match v {
             Some(Value::Blob(b)) => b.bytes(),
@@ -399,26 +409,127 @@ fn changed_lines(from: Option<&Value>, to: Option<&Value>) -> Result<usize, Cras
     let (a, b) = (text(from)?, text(to)?);
     let a: Vec<&[u8]> = a.split_inclusive(|c| *c == b'\n').collect();
     let b: Vec<&[u8]> = b.split_inclusive(|c| *c == b'\n').collect();
-    let (in_a, in_b): (HashSet<&[u8]>, HashSet<&[u8]>) =
-        (a.iter().copied().collect(), b.iter().copied().collect());
-    let a_common: Vec<&[u8]> = a.iter().copied().filter(|l| in_b.contains(l)).collect();
-    let b_common: Vec<&[u8]> = b.iter().copied().filter(|l| in_a.contains(l)).collect();
+    let (a, b) = trim_common(&a, &b);
+    if a.len().abs_diff(b.len()) >= cap {
+        return Ok(cap);
+    }
+    let quick = cap.min(QUICK);
+    let d = edit_distance(a, b, quick);
+    if d < quick || quick == cap {
+        return Ok(d);
+    }
+    // number each distinct line, so the rest compares numbers; the lines
+    // numbered while reading `a` are those that occur in it
+    fn number<'l>(ids: &mut HashMap<&'l [u8], usize>, lines: &[&'l [u8]]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| {
+                let next = ids.len();
+                *ids.entry(*l).or_insert(next)
+            })
+            .collect()
+    }
+    let mut ids = HashMap::new();
+    let a = number(&mut ids, a);
+    let in_a = ids.len();
+    let b = number(&mut ids, b);
+    let mut in_b = vec![false; ids.len()];
+    for l in &b {
+        in_b[*l] = true;
+    }
+    let a_common: Vec<usize> = a.iter().copied().filter(|l| in_b[*l]).collect();
+    let b_common: Vec<usize> = b.iter().copied().filter(|l| *l < in_a).collect();
     let unmatched = (a.len() - a_common.len()) + (b.len() - b_common.len());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-    let ops = similar::capture_diff_slices_deadline(
-        similar::Algorithm::Myers,
-        &a_common,
-        &b_common,
-        Some(deadline),
-    );
-    let diffed: usize = ops
-        .iter()
-        .map(|op| match op.as_tag_tuple() {
-            (similar::DiffTag::Equal, _, _) => 0,
-            (_, old, new) => old.len() + new.len(),
-        })
-        .sum();
-    Ok(unmatched + diffed)
+    if unmatched >= cap {
+        return Ok(cap);
+    }
+    let (a, b) = trim_common(&a_common, &b_common);
+    let max = cap - unmatched;
+    if reorder_bound(a, b, ids.len()) >= max {
+        return Ok(cap);
+    }
+    Ok(unmatched + edit_distance(a, b, max))
+}
+
+/// `a` and `b` without the lines they start and end with in common.
+fn trim_common<'s, T: PartialEq>(a: &'s [T], b: &'s [T]) -> (&'s [T], &'s [T]) {
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[pre..], &b[pre..]);
+    let suf = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
+    (&a[..a.len() - suf], &b[..b.len() - suf])
+}
+
+/// The number of lines deleted plus inserted by a shortest diff of `a` to
+/// `b`, or `max` if that is at least `max`: Myers' greedy search, which
+/// reaches the end on round `d` exactly when the shortest diff has `d` steps,
+/// run for `max` rounds at most. A round extends each of its diagonals along
+/// equal lines from where the round before left off, so the work is at most
+/// `max` squared steps plus one pass over the lines per diagonal.
+fn edit_distance<T: PartialEq>(a: &[T], b: &[T], max: usize) -> usize {
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    // the furthest `x` reached on diagonal `k = x - y`, at `v[k + max]`;
+    // round `d` writes diagonals `-d..=d` from those round `d - 1` wrote, and
+    // round 0 starts from the zero on diagonal 1
+    let mut v = vec![0isize; 2 * max + 1];
+    let at = |k: isize| (k + max as isize) as usize;
+    for d in 0..max as isize {
+        for k in (-d..=d).step_by(2) {
+            // from diagonal `k + 1` by inserting a line of `b`, or from
+            // `k - 1` by deleting one of `a`, whichever gets further
+            let mut x = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+                v[at(k + 1)]
+            } else {
+                v[at(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[at(k)] = x;
+            if x >= n && y >= m {
+                return d as usize;
+            }
+        }
+    }
+    max
+}
+
+/// A lower bound on the lines deleted plus inserted by any diff of `a` to
+/// `b` (lines numbered below `ids`), cheap where the search is dearest: a
+/// long file whose lines were reordered. A line that occurs once on each
+/// side can only be kept by pairing those two, and the pairs kept keep their
+/// order on both sides, so at most the longest sequence of them in the same
+/// order on both sides is kept (patience sorting finds its length); every
+/// other line kept pairs up lines of `a` and `b` that are not such lines.
+fn reorder_bound(a: &[usize], b: &[usize], ids: usize) -> usize {
+    // per line: its occurrences in `a` and in `b`, and where it is in `a`
+    let mut seen = vec![(0usize, 0usize, 0usize); ids];
+    for (i, l) in a.iter().enumerate() {
+        seen[*l].0 += 1;
+        seen[*l].2 = i;
+    }
+    for l in b {
+        seen[*l].1 += 1;
+    }
+    // over the lines once on each side, in `b`'s order, by where they are in
+    // `a`: `ends[i]` is the least last place of an increasing sequence of
+    // `i + 1` of them
+    let mut ends: Vec<usize> = Vec::new();
+    let mut once = 0;
+    for l in b {
+        if let (1, 1, i) = seen[*l] {
+            once += 1;
+            let at = ends.partition_point(|e| *e < i);
+            if at == ends.len() {
+                ends.push(i);
+            } else {
+                ends[at] = i;
+            }
+        }
+    }
+    let kept = ends.len() + (a.len().min(b.len()) - once);
+    a.len() + b.len() - 2 * kept
 }
 
 fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
@@ -1135,7 +1246,7 @@ struct CommitInfo {
     is_ancestor_of_focus: bool,
     is_child_of_ancestor: bool,
     meta: Option<crate::domain::MetaInfo>,
-    size: Option<usize>, // lines added+removed against parent
+    size: Option<usize>, // lines added+removed against parent, up to SIZE_BAR_TOP
     nfiles: usize,       // number of files changed against parent (`files` column)
     detail_marks: Vec<(String, char)>,
     children: Vec<CommitInfo>,
@@ -1282,10 +1393,14 @@ fn build_info(
                 // size: lines added plus removed against the parent (§7.11
                 // column 5); a path changed without a changed line (an empty
                 // file, a new file type) counts one, so only an empty commit
-                // has no bar
+                // has no bar. The count stops where the bar does.
                 let mut lines = 0usize;
                 for (key, _, _) in &marks {
-                    lines += changed_lines(from_map.get(key), to_map.get(key))?.max(1);
+                    if lines >= SIZE_BAR_TOP {
+                        break;
+                    }
+                    let cap = SIZE_BAR_TOP - lines;
+                    lines += changed_lines(from_map.get(key), to_map.get(key), cap)?.max(1);
                 }
                 let marks2: Vec<(String, char)> =
                     marks.iter().map(|(p, m, _)| (p.join("/"), *m)).collect();
@@ -2577,7 +2692,7 @@ fn size_bar(size: Option<usize>, pal: &Palette) -> String {
         None | Some(0) => String::new(),
         Some(n) => {
             // one glyph per threshold 1, 10, 50, 200, 1000 (§7.11 column 5)
-            let (bar, level) = if n >= 1000 {
+            let (bar, level) = if n >= SIZE_BAR_TOP {
                 ("▇", 4)
             } else if n >= 200 {
                 ("▅", 3)

@@ -1132,9 +1132,9 @@ Columns, left to right:
 4. **Id**: shortest prefix unique among visible commits, minimum 4.
 5. **Size bar** (`detail ≥ 1`, focus and its parent and children only; all
    commits at `detail = 2`): one of `▁ ▂ ▃ ▅ ▇`, lines added plus removed
-   against the parent, thresholds 1, 10, 50, 200, 1000. Absent for empty
-   commits. A changed path with no line added or removed (an empty file, a
-   new file type) counts as one line.
+   by a shortest line diff against the parent, thresholds 1, 10, 50, 200,
+   1000. Absent for empty commits. A changed path with no line added or
+   removed (an empty file, a new file type) counts as one line.
 6. **Message**: first line; nothing if empty.
 7. **Labels**: right-aligned column, present only if any rendered commit has
    a label; names separated by two spaces.
