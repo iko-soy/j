@@ -384,6 +384,40 @@ fn files_over_conflicts(
     Ok(files)
 }
 
+/// Why a run is refused over a stale working copy whose directory has
+/// changed from `state`, the tree its working-copy state records, to
+/// `scanned` (§7.4), naming the first few of the paths it changed and what
+/// to do: set the changes aside so that the directory holds `state` again,
+/// which a persisting run checks the focus out from, then bring them back
+async fn stale_message(state: &MergedTree, scanned: &MergedTree) -> String {
+    const SHOWN: usize = 3;
+    let mut paths = Vec::new();
+    let mut count = 0;
+    let mut diff = state.diff_stream(scanned, &EverythingMatcher);
+    while let Some(TreeDiffEntry { path, .. }) = diff.next().await {
+        if paths.len() < SHOWN {
+            paths.push(format!("`{}`", path.as_internal_file_string()));
+        }
+        count += 1;
+    }
+    let at = if paths.is_empty() {
+        String::new()
+    } else if count > paths.len() {
+        format!(", at {} and {} more", paths.join(", "), count - paths.len())
+    } else {
+        format!(", at {}", paths.join(", "))
+    };
+    format!(
+        "the working copy is stale: its commit was changed without updating the working \
+         directory (by jj with --ignore-working-copy, or from another workspace), and the \
+         directory has changed since{}; recording that would undo the commit's change, so \
+         nothing was recorded. To record your changes, move them out of the directory so that \
+         it holds what it did before them, run a command that changes the repository, such as \
+         `j new`, which writes the focus there, then put them back",
+        at
+    )
+}
+
 /// What the working directory holds along a checkout's footprint, the
 /// paths whose value differs between the tree it holds and the focus,
 /// recorded before the checkout runs so that one failing part way can be
@@ -1063,9 +1097,37 @@ impl JjBackend {
             .load_at_head()
             .await
             .map_err(|e| (2, format!("cannot reload the repository: {}", e)))?;
+        let wc_commit = self.wc_commit(&ws_repo).await?;
+        // The working copy is stale when jj changed its commit without
+        // updating the directory or its state (a command run with
+        // `--ignore-working-copy`, or one in another workspace that rewrote
+        // this workspace's commit). The directory's changes are then
+        // changes to the tree the state records, not to the commit, and
+        // recording the directory into the commit would silently undo what
+        // jj did to it; so, as jj does, refuse, dropping the lock without
+        // saving anything (§7.4). A directory holding the commit's files has
+        // nothing to record, and its scanned state is saved as the commit's.
+        // Snapshots of this directory that failed checkouts recorded alone
+        // (§7.5 step 7, `record_snapshot`) leave the state behind too, but
+        // there the directory's changes are changes to them.
+        let wc_tree = wc_commit.tree();
+        if old_tree.tree_ids() != wc_tree.tree_ids() {
+            if new_tree.tree_ids() == wc_tree.tree_ids() {
+                locked_ws
+                    .finish(ws_repo.operation().id().clone())
+                    .await
+                    .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
+                return Ok((self.current_repo(), None));
+            }
+            if !self.only_snapshots_since(&ws_repo, &old_tree).await? {
+                return Err((2, stale_message(&old_tree, &new_tree).await));
+            }
+        }
         let mut tx = ws_repo.start_transaction();
         tx.set_is_snapshot(true);
-        let wc_commit = self.wc_commit(&ws_repo).await?;
+        // marks it as this workspace's own snapshot, for the check above
+        // when a failed checkout records it alone
+        tx.set_workspace_name(&self.inner.workspace_name);
         let new_wc = tx
             .repo_mut()
             .rewrite_commit(&wc_commit)
@@ -1109,7 +1171,51 @@ impl JjBackend {
         Ok((new_repo, Some(pending)))
     }
 
-
+    /// Whether each operation from `repo`'s back to the last one at which
+    /// the working-copy commit's tree was `state`, the tree the working-copy
+    /// state records, is a snapshot of this workspace: the state was then
+    /// left behind only by snapshots of the directory itself, as a failed
+    /// checkout records one alone (§7.5 step 7, `record_snapshot`), and the
+    /// directory's changes since are changes to them (§7.4). The walk stops
+    /// at the first operation that is anything else.
+    async fn only_snapshots_since(
+        &self,
+        repo: &Arc<ReadonlyRepo>,
+        state: &MergedTree,
+    ) -> Result<bool, OpenError> {
+        let loader = repo.loader();
+        let mut op = repo.operation().clone();
+        loop {
+            let meta = op.metadata();
+            if !meta.is_snapshot || meta.workspace_name.as_ref() != Some(&self.inner.workspace_name) {
+                return Ok(false);
+            }
+            let [parent_id] = op.parent_ids() else {
+                return Ok(false);
+            };
+            let parent = loader
+                .load_operation(parent_id)
+                .await
+                .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+            let view = loader
+                .op_store()
+                .read_view(parent.view_id())
+                .await
+                .map_err(|e| (2, format!("cannot load an operation view: {}", e)))?;
+            let Some(wc_id) = view.wc_commit_ids.get(&self.inner.workspace_name) else {
+                return Ok(false);
+            };
+            let wc = repo
+                .store()
+                .get_commit_async(wc_id)
+                .await
+                .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
+            if wc.tree().tree_ids() == state.tree_ids() {
+                return Ok(true);
+            }
+            op = parent;
+        }
+    }
 
     async fn wc_commit(&self, repo: &Arc<ReadonlyRepo>) -> Result<Commit, OpenError> {
         let id = repo
@@ -1480,12 +1586,15 @@ impl JjBackend {
     /// checkout that could not be put back (§7.5 step 7), so that no
     /// uncommitted edit it wrote over is lost; the working-copy state is
     /// left as it was, and the next run records what the directory holds.
+    /// The operation is marked as a snapshot of this workspace, so that
+    /// `snapshot_repo` does not take the state it leaves for a stale one.
     async fn record_snapshot(&self, p: &PendingSnapshot) -> Result<(), String> {
         let repo = if p.fold_into_wc {
             p.repo.clone()
         } else {
             let mut tx = p.pre_repo.start_transaction();
             tx.set_is_snapshot(true);
+            tx.set_workspace_name(&self.inner.workspace_name);
             let wc = self.wc_commit(&p.pre_repo).await.map_err(|e| e.1)?;
             let child = tx
                 .repo_mut()

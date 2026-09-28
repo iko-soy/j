@@ -1229,6 +1229,47 @@ fn a_failed_put_back_records_the_edits_of_an_immutable_focus_in_a_child() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn put_backs_that_fail_in_a_row_leave_the_next_run_recording_the_directory() {
+    // §7.4, §7.5 step 7: a snapshot that a failed checkout records alone
+    // leaves the working-copy state behind the commit, as jj leaves a
+    // stale one. The directory's changes since are changes to the
+    // snapshots recorded since the state was the commit's, here two in a
+    // row, so the next run records them onto those rather than refusing
+    // them as it does over a stale working copy; undoing gives each edit
+    // back.
+    let r = setup();
+    r.write("a", "precious\n");
+    r.write("d", "cherished\n");
+    r.j(&["describe \"base\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // each time a file becomes a directory, and a file made in it
+    // meanwhile is in the way of writing the file back
+    for (path, edit) in [("a", "edit 1\n"), ("d", "edit 2\n")] {
+        r.write(path, edit);
+        let files = format!(
+            "filter (\\e -> e.path /= [\"{0}\"]) c.files ++ [{{ path = [\"{0}\" \"x\"], content = blob \"x\\n\" }}]",
+            path
+        );
+        let out = stopped_mid_checkout(&r, &slow_failing_edit(&files, n), n, || {
+            r.write(&format!("{}/mine", path), "mine\n");
+        });
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    r.j(&["id"]).ok();
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["base" [["a" "mine"] ["d" "mine"]]]]"#);
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("d"), "edit 2\n");
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("a"), "edit 1\n");
+    assert_eq!(r.read("d"), "cherished\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn a_failed_checkout_says_what_it_leaves_in_a_nested_repository() {
     // §7.5 step 7: no run reads a directory holding `.git` or `.jj`, so
     // what a put-back leaves there is not recorded by the next run either.
@@ -2595,6 +2636,58 @@ fn a_failed_checkout_over_a_stale_working_copy_is_put_back() {
     assert_eq!(r.j(&["log"]).ok().stdout, log);
     let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
     assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B" [["a"] ["z"]]]]"#);
+}
+
+#[test]
+fn a_stale_working_copy_with_changes_is_refused() {
+    // §7.4: the snapshot read the directory against the stale state and
+    // recorded all of it into the focus, so one new file beside A's files
+    // undid B: `a` back to 1, `b` back, `z` gone. Such a run now exits 2
+    // and records nothing, printing or not, and the way out it names works.
+    let r = stale_working_copy();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.write("notes.txt", "note\n");
+    for expr in ["describe \"B2\"", "id", "log"] {
+        let out = r.j(&[expr]);
+        assert_eq!(out.code, 2, "{}: {}", expr, out.stderr);
+        assert!(out.stderr.contains("the working copy is stale"), "{}", out.stderr);
+        assert!(out.stderr.contains("notes.txt"), "{}", out.stderr);
+        assert!(out.stderr.contains("nothing was recorded"), "{}", out.stderr);
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("a"), "1\n");
+    assert_eq!(r.read("b"), "b\n");
+    assert!(!r.dir.join("z").exists());
+    assert_eq!(r.read("notes.txt"), "note\n");
+    // move the change aside, let a run that changes the repository write
+    // the focus, and put the change back
+    std::fs::remove_file(r.dir.join("notes.txt")).unwrap();
+    r.j(&["describe \"B2\""]).ok();
+    assert_eq!(r.read("a"), "2\n");
+    r.write("notes.txt", "note\n");
+    r.j(&["id"]).ok();
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B2" [["a"] ["notes.txt"] ["z"]]]]"#);
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["A" (blob "1\n")] ["B2" (blob "2\n")]]"#);
+}
+
+#[test]
+fn a_stale_working_copy_holding_the_focus_records_nothing() {
+    // §7.4: a directory that holds the focus's files over a stale state
+    // has nothing to record and is not refused; the state is brought up to
+    // date, so a change made from there is recorded as usual
+    let r = stale_working_copy();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.write("a", "2\n");
+    std::fs::remove_file(r.dir.join("b")).unwrap();
+    r.write("z", "z\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    r.write("notes.txt", "note\n");
+    r.j(&["id"]).ok();
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B" [["a"] ["notes.txt"] ["z"]]]]"#);
 }
 
 #[test]

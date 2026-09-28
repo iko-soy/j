@@ -81,7 +81,8 @@ they are reachable only inside larger expressions.
 3. Load and validate `config.j` (§6), except for its `Id` literals. If it is
    missing or invalid, exit 3.
 4. Build the current repository value `r` (§7.2). This includes snapshotting
-   the working directory into the focused commit (§7.4).
+   the working directory into the focused commit (§7.4), and exits 2 where
+   the working copy is stale and the directory has changed (§7.4).
 5. Resolve every `Id` literal in `config.j` and in the expression (§4.10).
    A failure in `config.j` is a configuration error (exit 3); one in the
    expression is a crash (exit 1). Nothing has been evaluated.
@@ -939,6 +940,21 @@ directory.
   or printing program leaves the working copy and the repository exactly as
   before (but see §7.5 step 7); `j id` is the way to record the working
   directory and nothing else (§1.2).
+- **A stale working copy.** jj can change the working-copy commit without
+  updating the working directory (a command run with
+  `--ignore-working-copy`, or one in another workspace that rewrites this
+  workspace's commit). The directory then started from the files last
+  checked out, not the commit's, and what has changed in it since is a
+  change to those. With no such change there is nothing to snapshot, and a
+  program that persists writes the focus over them as usual; nor is there
+  where the directory holds the commit's files. Any other change is not
+  recorded, as recording the directory into the commit would undo what jj
+  did to it: the program exits 2 before evaluation, recording nothing, and
+  names the changed paths. Moving those changes out of the way, running a
+  program that persists, and putting them back records them onto the
+  focus. The snapshot that a failed checkout records alone (§7.5 step 7)
+  leaves the working copy behind in the same way, but there what has
+  changed is a change to that snapshot, and it is snapshotted as usual.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
