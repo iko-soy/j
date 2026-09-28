@@ -878,6 +878,58 @@ struct InTheWay {
     holder: RepoPathBuf,
 }
 
+impl InTheWay {
+    /// Whether it is a directory at `path`, holding `holder`
+    fn is_dir(&self) -> bool {
+        self.holder != self.path && self.holder.starts_with(&self.path)
+    }
+
+    /// What a refused checkout says of it among others: a directory by its
+    /// own path, with what it holds, anything else by its path
+    fn named(&self) -> String {
+        if self.is_dir() {
+            format!(
+                "`{}` (a directory holding untracked files, such as `{}`)",
+                self.path.as_internal_file_string(),
+                self.holder.as_internal_file_string()
+            )
+        } else {
+            format!("`{}`", self.holder.as_internal_file_string())
+        }
+    }
+}
+
+/// Why a checkout is refused over `in_the_way`, which is not empty, as
+/// git names each untracked file in the way: one with the path the focus
+/// has there, more by listing the first ten and counting the rest
+fn in_the_way_of(in_the_way: &[InTheWay]) -> String {
+    const LISTED: usize = 10;
+    match in_the_way {
+        [one] if one.is_dir() => format!(
+            "it has `{0}`, and `{0}` in the working directory is a directory holding untracked files, such as `{1}`; move it aside",
+            one.path.as_internal_file_string(),
+            one.holder.as_internal_file_string()
+        ),
+        [one] => format!(
+            "it has `{}`, and an untracked `{}` in the working directory is in its way; move it aside",
+            one.path.as_internal_file_string(),
+            one.holder.as_internal_file_string()
+        ),
+        _ => {
+            let mut named: Vec<String> = in_the_way.iter().take(LISTED).map(InTheWay::named).collect();
+            let last = match in_the_way.len() - named.len() {
+                0 => named.pop().unwrap_or_default(),
+                more => format!("{} more", more),
+            };
+            format!(
+                "untracked files in the working directory are in the way of files it has: {} and {}; move them aside",
+                named.join(", "),
+                last
+            )
+        }
+    }
+}
+
 /// What stands in the working directory where a checkout from `from`, the
 /// tree the directory holds as scanned, to `to` adds a file (or a symlink,
 /// or a conflict): at each path where `to` has one and `from` has none.
@@ -889,22 +941,25 @@ struct InTheWay {
 /// directories, which no scan sees, and a file holding just what the
 /// checkout writes there (`holds_written`), as a checkout cut short leaves
 /// at an ignored path, are cleared for it (`clear_the_way`). The result is
-/// the paths where nothing else stands, or the first path where anything
-/// else does (`InTheWay`). No symlink is followed. Each path costs one
-/// `lstat`, and each directory above one not looked at before one more; a
-/// file standing at a path is read, and a directory read whole, each entry
-/// in it that is no directory looked up in `from`.
+/// the paths where nothing else stands, or, walking the whole diff all the
+/// same, each thing standing where anything else does (`InTheWay`), in
+/// path order, what stands above several paths once. No symlink is
+/// followed. Each path costs one `lstat`, and each directory above one not
+/// looked at before one more; a file standing at a path is read, and a
+/// directory read until something untracked is found in it, each entry in
+/// it that is no directory looked up in `from`.
 async fn look_where_added(
     root: &std::path::Path,
     markers: ConflictMarkerStyle,
     from: &MergedTree,
     to: &MergedTree,
-) -> Result<Result<Vec<RepoPathBuf>, InTheWay>, String> {
+) -> Result<Result<Vec<RepoPathBuf>, Vec<InTheWay>>, String> {
     let err = |e: jj_lib::backend::BackendError| e.to_string();
     let mut dirs = HashMap::new();
-    // whether `from` tracks each thing looked up that is no directory
-    let mut tracked: HashMap<RepoPathBuf, bool> = HashMap::new();
+    // each thing that is no directory looked up in `from`, above a path
+    let mut looked_up = std::collections::HashSet::new();
     let mut clear = Vec::new();
+    let mut in_the_way = Vec::new();
     let mut diff = from.diff_stream(to, &EverythingMatcher);
     while let Some(entry) = diff.next().await {
         let Diff { before, after } = entry.values.map_err(err)?;
@@ -916,17 +971,10 @@ async fn look_where_added(
         if let Some((dir, stands)) = first_not_a_dir(root, &path, &mut dirs) {
             // where nothing stands above the path, or what `from` tracks
             // and the checkout removes, nothing stands at it
-            if stands.is_some() {
-                let is_tracked = match tracked.get(&dir) {
-                    Some(&is_tracked) => is_tracked,
-                    None => {
-                        let is_tracked = from.path_value(&dir).await.map_err(err)?.is_present();
-                        tracked.insert(dir.clone(), is_tracked);
-                        is_tracked
-                    }
-                };
+            if stands.is_some() && looked_up.insert(dir.clone()) {
+                let is_tracked = from.path_value(&dir).await.map_err(err)?.is_present();
                 if !is_tracked {
-                    return Ok(Err(InTheWay { path, holder: dir }));
+                    in_the_way.push(InTheWay { path, holder: dir });
                 }
             }
             continue;
@@ -945,11 +993,15 @@ async fn look_where_added(
             Some(path.clone())
         };
         match holder {
-            Some(holder) => return Ok(Err(InTheWay { path, holder })),
+            Some(holder) => in_the_way.push(InTheWay { path, holder }),
             None => clear.push(path),
         }
     }
-    Ok(Ok(clear))
+    if in_the_way.is_empty() {
+        Ok(Ok(clear))
+    } else {
+        Ok(Err(in_the_way))
+    }
 }
 
 /// Something that is no directory in the directory `disk`, standing at
@@ -1947,12 +1999,8 @@ impl JjBackend {
             None => Vec::new(),
             Some(on_disk) => match look_where_added(&root, markers, on_disk, &commit.tree()).await {
                 Ok(Ok(clear)) => clear,
-                Ok(Err(InTheWay { path, holder })) => {
-                    return Err(Crash::new(format!(
-                        "cannot check out the focus: it has `{}`, and an untracked `{}` in the working directory is in its way; move it aside",
-                        path.as_internal_file_string(),
-                        holder.as_internal_file_string()
-                    )));
+                Ok(Err(in_the_way)) => {
+                    return Err(Crash::new(format!("cannot check out the focus: {}", in_the_way_of(&in_the_way))));
                 }
                 Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}", e))),
             },

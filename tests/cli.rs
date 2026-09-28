@@ -1077,7 +1077,8 @@ fn a_checkout_writes_nothing_over_what_the_directory_does_not_track() {
     // ignored file (a secret, say) in place of the focus's content. The
     // run now refuses before anything is recorded or written, naming what
     // is in the way where the focus adds a file: an ignored symlink above
-    // it, an ignored file, an ignored file in a directory in its place.
+    // it, an ignored file, a directory in its place holding an ignored
+    // file, each of them in one refusal.
     let r = setup();
     r.write(".gitignore", "*.env\nlnk\n");
     r.write("keep.txt", "k\n");
@@ -1098,26 +1099,30 @@ fn a_checkout_writes_nothing_over_what_the_directory_does_not_track() {
     r.write("out/junk.env", "junk\n");
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    let refused = |holder: &str| {
+    let refused = |says: &[&str]| {
         let out = r.j(&[&new_above("B")]);
         assert_eq!(out.code, 1, "{}", out.stderr);
-        assert!(out.stderr.contains(&format!("untracked `{}`", holder)), "{}", out.stderr);
-        assert!(out.stderr.contains("move it aside"), "{}", out.stderr);
+        for said in says {
+            assert!(out.stderr.contains(said), "{}", out.stderr);
+        }
         assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
         assert_eq!(r.j(&["log"]).ok().stdout, log);
         assert!(!has_blob(&r, secret));
     };
-    refused("lnk");
+    let out_dir = "`out` (a directory holding untracked files, such as `out/junk.env`)";
+    refused(&["in the way of files it has: `lnk`, `local.env` and ", out_dir, "; move them aside"]);
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     std::fs::remove_file(r.dir.join("lnk")).unwrap();
-    refused("local.env");
+    refused(&["in the way of files it has: `local.env` and ", out_dir, "; move them aside"]);
     assert_eq!(r.read("local.env"), secret);
     r.j(&["id"]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
     assert!(!has_blob(&r, secret));
     let aside = r.cfg.join("local.env");
     std::fs::rename(r.dir.join("local.env"), &aside).unwrap();
-    refused("out/junk.env");
+    refused(&[
+        "it has `out`, and `out` in the working directory is a directory holding untracked files, such as `out/junk.env`; move it aside",
+    ]);
     assert_eq!(r.read("out/junk.env"), "junk\n");
     // with those moved aside, B's files are written, over the empty
     // directories left in `out`
@@ -1142,13 +1147,70 @@ fn a_checkout_writes_nothing_over_what_the_directory_does_not_track() {
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let out = r.j(&["undo"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("untracked `local.env`"), "{}", out.stderr);
+    assert!(out.stderr.contains("an untracked `local.env` in the working directory is in its way; move it aside"), "{}", out.stderr);
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
     assert_eq!(r.read("local.env"), secret);
     std::fs::rename(r.dir.join("local.env"), &aside).unwrap();
     r.j(&["undo"]).ok();
     assert_eq!(r.read("local.env"), "COMMITTED=1\n");
     assert!(!has_blob(&r, secret));
+}
+
+#[test]
+fn a_refused_checkout_names_all_that_is_in_its_way() {
+    // §7.4: a checkout refused over what the working directory does not
+    // track named only the first path in its way, so a directory of build
+    // outputs took a run per file to clear; and for a directory standing
+    // where the focus has a file, it named a file in it, the first a read
+    // of the directory found, and said to move that aside. The refusal
+    // lists what is in the way now, ten paths and how many more, and a
+    // directory by its own path.
+    let r = setup();
+    let dist = |what: &str| {
+        std::fs::create_dir(r.dir.join("dist")).unwrap();
+        for i in 1..=12 {
+            r.write(&format!("dist/m{:02}.js", i), &format!("{} {}\n", what, i));
+        }
+    };
+    dist("release");
+    r.write("build", "#!/bin/sh\n");
+    r.write("keep", "k\n");
+    r.j(&["describe \"v1\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_dir_all(r.dir.join("dist")).unwrap();
+    std::fs::remove_file(r.dir.join("build")).unwrap();
+    std::fs::create_dir(r.dir.join("build")).unwrap();
+    r.write("build/main.c", "c\n");
+    r.write(".gitignore", "dist/\n*.o\n");
+    r.j(&["describe \"v2\""]).ok();
+    r.j(&["new"]).ok();
+    // a local build
+    dist("dev");
+    r.write("build/1.o", "o\n");
+    r.write("build/2.o", "o\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let out = r.j(&[&new_above("v1")]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    let listed = "in the way of files it has: `build` (a directory holding untracked files, such as `build/";
+    assert!(out.stderr.contains(listed), "{}", out.stderr);
+    for i in 1..=9 {
+        assert!(out.stderr.contains(&format!(", `dist/m{:02}.js`", i)), "{}", out.stderr);
+    }
+    assert!(!out.stderr.contains("m10"), "{}", out.stderr);
+    assert!(out.stderr.contains("`dist/m09.js` and 3 more; move them aside"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.read("dist/m12.js"), "dev 12\n");
+    assert_eq!(r.read("build/2.o"), "o\n");
+    // with them moved aside, v1's files are written
+    std::fs::remove_dir_all(r.dir.join("dist")).unwrap();
+    std::fs::remove_file(r.dir.join("build/1.o")).unwrap();
+    std::fs::remove_file(r.dir.join("build/2.o")).unwrap();
+    r.j(&[&new_above("v1")]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("build"), "#!/bin/sh\n");
+    assert_eq!(r.read("dist/m12.js"), "release 12\n");
 }
 
 #[test]

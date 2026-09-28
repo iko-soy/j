@@ -1018,8 +1018,10 @@ directory.
   which skips its path, fails, naming it and why (§7.5 step 7). Anything
   else untracked there, or in place of a directory above the path (an
   ignored file, a symlink, a directory holding one), crashes the program
-  before its operation is recorded, naming it, as git refuses to write over
-  an untracked file: it is to be moved aside.
+  before its operation is recorded, as git refuses to write over an
+  untracked file, naming each such thing (the first ten, and how many more
+  there are), a directory by its own path and an untracked file in it:
+  each is to be moved aside.
   A later snapshot reads such a file back as the conflict its markers
   describe, edits included, while they parse at the length they were written
   with (longer than 7 when a side holds a marker-like line); once they do
