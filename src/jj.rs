@@ -24,7 +24,7 @@ use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::revset::{ResolvedRevsetExpression, RevsetStreamExt};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
@@ -730,12 +730,13 @@ async fn conflicts_written(
     tree.write_tree().await.map_err(err)
 }
 
-/// Whether `disk`, the file at `path`, holds what a checkout writes there
-/// for the conflict `value`: exactly its markers, compared byte for byte
-/// (j's settings convert no line endings), or, where a side is no file, a
-/// description of the same sides, whatever their labels and less any it
-/// both removes and adds, as a scan reads one back (`files_on_conflicts`);
-/// nothing is written to the store
+/// Whether `disk`, the entry at `path`, holds what a checkout writes there
+/// for `value`: a file's content or a symlink's target, whatever its
+/// executable bit, or, for a conflict, exactly its markers, compared byte
+/// for byte (j's settings convert no line endings), or, where a side is no
+/// file, a description of the same sides, whatever their labels and less
+/// any it both removes and adds, as a scan reads one back
+/// (`files_on_conflicts`); nothing is written to the store
 async fn holds_written(
     store: &Arc<Store>,
     path: &RepoPath,
@@ -745,13 +746,22 @@ async fn holds_written(
     disk: &std::path::Path,
 ) -> Result<bool, String> {
     use jj_lib::conflicts::{self, MaterializedTreeValue};
-    let Some(meta) = disk.symlink_metadata().ok().filter(|meta| meta.is_file()) else {
+    let symlink = matches!(value.as_normal(), Some(TreeValue::Symlink(_)));
+    let Some(meta) = disk.symlink_metadata().ok().filter(|m| if symlink { m.is_symlink() } else { m.is_file() })
+    else {
         return Ok(false);
     };
     let written = conflicts::materialize_tree_value(store, path, value, labels)
         .await
         .map_err(|e| e.to_string())?;
     match written {
+        MaterializedTreeValue::Symlink { target, .. } => {
+            Ok(std::fs::read_link(disk).is_ok_and(|t| t.as_os_str() == target.as_str()))
+        }
+        MaterializedTreeValue::File(mut file) => {
+            let bytes = file.read_all(path).await.map_err(|e| e.to_string())?;
+            Ok(meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
+        }
         MaterializedTreeValue::FileConflict(file) => {
             let options = conflicts::ConflictMaterializeOptions {
                 marker_style: markers,
@@ -806,54 +816,188 @@ fn first_not_a_dir(
     None
 }
 
-/// Remove each tree of directories holding no file at a path where `to`
-/// has a file (or a symlink, or a conflict) and `from`, the tree the
-/// working directory holds, has none. A checkout writes no file over a
-/// directory and skips it without failing, and the next scan would then
-/// take the file for deleted; a checkout that failed or was cut short
-/// leaves such trees, made for a path it did not reach or in place of a
-/// file it removed (§7.5 step 7). Only a checkout over a stale working copy
-/// looks, one `lstat` for each path it adds and each directory above one
-/// not looked at before (`first_not_a_dir`): a path below a symlink, which
-/// the checkout replaces, is not looked at, so nothing outside the working
-/// directory is. Directories are removed one at a time, deepest first,
-/// only while empty, and no symlink in one is followed.
-async fn clear_empty_dirs(root: &std::path::Path, from: &MergedTree, to: &MergedTree) -> Result<(), String> {
-    fn holds_no_file(dir: &std::path::Path) -> bool {
-        std::fs::read_dir(dir).is_ok_and(|entries| {
-            entries.into_iter().all(|entry| {
-                entry.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_dir()) && holds_no_file(&e.path()))
-            })
-        })
+/// What stands in the way of a path a checkout adds: `holder`, in the
+/// working directory, which does not track it, at `path`, above it, or in
+/// a directory at it
+struct InTheWay {
+    path: RepoPathBuf,
+    holder: RepoPathBuf,
+}
+
+/// What stands in the working directory where a checkout from `from`, the
+/// tree the directory holds as scanned, to `to` adds a file (or a symlink,
+/// or a conflict): at each path where `to` has one and `from` has none.
+/// jj's checkout writes nothing over anything already there, and skips
+/// the path without failing, recording it as written, so the next scan
+/// would read what stands there into the focus, an ignored file's content
+/// in place of the focus's, or take the focus's file for deleted (§7.4).
+/// What `from` tracks there the checkout removes first, and trees of empty
+/// directories, which no scan sees, it clears (`clear_empty_dirs`): the
+/// result is the paths where a directory holds nothing else, or the first
+/// path where anything else stands (`InTheWay`). No symlink is followed.
+/// Each path costs one `lstat`, and each directory above one not looked at
+/// before one more; a directory standing at a path is read whole, and
+/// each entry in it that is no directory looked up in `from`.
+async fn look_where_added(
+    root: &std::path::Path,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<Result<Vec<RepoPathBuf>, InTheWay>, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut dirs = HashMap::new();
+    // whether `from` tracks each thing looked up that is no directory
+    let mut tracked: HashMap<RepoPathBuf, bool> = HashMap::new();
+    let mut clear = Vec::new();
+    let mut diff = from.diff_stream(to, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, after } = entry.values.map_err(err)?;
+        // a submodule's directory is the submodule's own, which jj keeps
+        if before.is_present() || after.is_absent() || matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            continue;
+        }
+        let path = entry.path;
+        if let Some((dir, stands)) = first_not_a_dir(root, &path, &mut dirs) {
+            // where nothing stands above the path, or what `from` tracks
+            // and the checkout removes, nothing stands at it
+            if stands.is_some() {
+                let is_tracked = match tracked.get(&dir) {
+                    Some(&is_tracked) => is_tracked,
+                    None => {
+                        let is_tracked = from.path_value(&dir).await.map_err(err)?.is_present();
+                        tracked.insert(dir.clone(), is_tracked);
+                        is_tracked
+                    }
+                };
+                if !is_tracked {
+                    return Ok(Err(InTheWay { path, holder: dir }));
+                }
+            }
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            return Ok(Err(InTheWay { holder: path.clone(), path }));
+        }
+        match untracked_below(&disk, &path, from) {
+            Some(holder) => return Ok(Err(InTheWay { path, holder })),
+            None => clear.push(path),
+        }
     }
-    fn remove(dir: &std::path::Path) {
+    Ok(Ok(clear))
+}
+
+/// Something that is no directory in the directory `disk`, standing at
+/// `path`, or in a directory in it, that `from` does not track, or a
+/// directory that cannot be read; none where it holds nothing else. Entries
+/// are told apart without following a symlink, and `from` is read below
+/// `path` only once there is something to look up.
+fn untracked_below(disk: &std::path::Path, path: &RepoPath, from: &MergedTree) -> Option<RepoPathBuf> {
+    let mut tracked: Option<std::collections::HashSet<RepoPathBuf>> = None;
+    let mut dirs = vec![(disk.to_owned(), path.to_owned())];
+    while let Some((dir, at)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Some(at);
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Some(at);
+            };
+            let name = entry.file_name();
+            // a name no path of a tree holds
+            let Some(below) = name.to_str().and_then(|n| RepoPathComponent::new(n).ok()).map(|c| at.join(c)) else {
+                return Some(at);
+            };
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push((entry.path(), below));
+                continue;
+            }
+            let tracked = tracked.get_or_insert_with(|| {
+                let under = jj_lib::matchers::PrefixMatcher::new([path]);
+                from.entries_matching(&under).filter(|(_, value)| value.is_ok()).map(|(p, _)| p).collect()
+            });
+            if !tracked.contains(&below) {
+                return Some(below);
+            }
+        }
+    }
+    None
+}
+
+/// Clear each of `paths`, a directory where a checkout writes a file
+/// (`look_where_added`): remove every directory in it holding no file,
+/// deepest first, and it too once empty. A path below anything that is no
+/// directory on disk, a symlink included, is left alone, and no symlink in
+/// one is followed; a directory is removed only while empty, so a file put
+/// there meanwhile stays, and the checkout skips the path (§7.5 step 7).
+fn clear_empty_dirs(root: &std::path::Path, paths: &[RepoPathBuf]) {
+    fn clear(dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    remove(&entry.path());
+                    clear(&entry.path());
                 }
             }
         }
         let _ = std::fs::remove_dir(dir);
     }
     let mut dirs = HashMap::new();
+    for path in paths {
+        if first_not_a_dir(root, path, &mut dirs).is_some() {
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        if disk.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            clear(&disk);
+        }
+    }
+}
+
+/// The first path a checkout from `from` to `to` that skipped some left
+/// holding something other than what it writes there: with no directory
+/// above it, or a directory at it, or, where it adds the path, anything but
+/// what it writes (`holds_written`); none if no such path is found. Only
+/// once a checkout has skipped a path is the directory looked at again,
+/// reading the files it added until one differs.
+async fn first_skipped(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<Option<RepoPathBuf>, String> {
+    let mut dirs = HashMap::new();
     let mut diff = from.diff_stream(to, &EverythingMatcher);
     while let Some(entry) = diff.next().await {
         let Diff { before, after } = entry.values.map_err(|e| e.to_string())?;
-        if before.is_present() || after.is_absent() {
+        if after.is_absent() || matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
             continue;
         }
-        if first_not_a_dir(root, &entry.path, &mut dirs).is_some() {
+        let path = entry.path;
+        if let Some((_, stands)) = first_not_a_dir(root, &path, &mut dirs) {
+            if stands.is_some() {
+                return Ok(Some(path));
+            }
             continue;
         }
-        let Ok(disk) = entry.path.to_fs_path(root) else {
+        let Ok(disk) = path.to_fs_path(root) else {
             continue;
         };
-        if disk.symlink_metadata().is_ok_and(|m| m.is_dir()) && holds_no_file(&disk) {
-            remove(&disk);
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir()
+            || (before.is_absent() && !holds_written(to.store(), &path, after, to.labels(), markers, &disk).await?)
+        {
+            return Ok(Some(path));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Save the working copy's state as a scan that found `scanned` left it:
@@ -1497,13 +1641,16 @@ impl JjBackend {
     /// `on_disk` is the tree the directory holds, which the checkout starts
     /// from: what a persisting run's snapshot scanned, or the tree the
     /// working-copy state records where it scanned nothing to record, or
-    /// what `undo`'s look found; with none, the state as it is. A checkout
-    /// that fails, or is cut short, after `op` is published leaves `op`
-    /// recorded and the state stale, recording `on_disk`: the next run
-    /// takes what the checkout wrote for the commit's own and carries on
-    /// (`snapshot_tree`), as the crash says, with `back` naming the way
-    /// back; with no `back` it says nothing of the operation (a clone that
-    /// fails removes it).
+    /// what `undo`'s look found; with none, the state as it is. Where the
+    /// commit adds a file, something `on_disk` does not track standing
+    /// there refuses the checkout before `op` is published
+    /// (`look_where_added`), and one put there since fails it after, as it
+    /// makes jj skip the path. A checkout that fails, or is cut short,
+    /// after `op` is published leaves `op` recorded and the state stale,
+    /// recording `on_disk`: the next run takes what the checkout wrote for
+    /// the commit's own and carries on (`snapshot_tree`), as the crash
+    /// says, with `back` naming the way back; with no `back` it says
+    /// nothing of the operation (a clone that fails removes it).
     async fn checkout(
         &self,
         commit: &Commit,
@@ -1517,19 +1664,6 @@ impl JjBackend {
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
-        // whether the working copy is stale (§7.4), as a checkout that failed
-        // or was cut short leaves it (§7.5 step 7): its state records other
-        // files than the working-copy commit, and was saved at an operation
-        // before the head's
-        let stale = match on_disk {
-            None => false,
-            Some(_) => {
-                let head = self.current_repo();
-                let wc = self.wc_commit(&head).await.map_err(|e| Crash::new(e.1))?;
-                wc.tree().tree_ids() != locked_ws.locked_wc().old_tree().tree_ids()
-                    && locked_ws.locked_wc().old_operation_id() != head.operation().id()
-            }
-        };
         // A persisting run's snapshot released its lock without saving what
         // it scanned, so the state just loaded may still describe the tree
         // recorded before the edits, and jj checks out by diffing that tree
@@ -1560,6 +1694,26 @@ impl JjBackend {
                     .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?,
             }
         }
+        // Where the focus adds a file and something the directory does not
+        // track stands (an ignored file, a symlink, a directory holding
+        // one), jj's checkout would skip the path, and the next run read
+        // what stands there into the focus: refuse before anything is
+        // recorded or written, as git does (§7.5 step 7). The trees of
+        // empty directories found there are cleared once `op` is published.
+        let clear = match on_disk {
+            None => Vec::new(),
+            Some(on_disk) => match look_where_added(&root, on_disk, &commit.tree()).await {
+                Ok(Ok(clear)) => clear,
+                Ok(Err(InTheWay { path, holder })) => {
+                    return Err(Crash::new(format!(
+                        "cannot check out the focus: it has `{}`, and an untracked `{}` in the working directory is in its way; move it aside",
+                        path.as_internal_file_string(),
+                        holder.as_internal_file_string()
+                    )));
+                }
+                Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}", e))),
+            },
+        };
         // from here until the state is saved, a signal to stop waits
         let _deferral = Deferral::start();
         let published = op.is_some();
@@ -1608,15 +1762,34 @@ impl JjBackend {
                 }
             };
         }
-        if let Some(on_disk) = on_disk.filter(|_| stale) {
-            if let Err(e) = clear_empty_dirs(&root, on_disk, &commit.tree()).await {
-                let what = "the working directory was not updated";
-                return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what))));
-            }
-        }
-        if let Err(e) = locked_ws.locked_wc().check_out(commit).await {
-            let what = "the working directory was only partly updated";
-            return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what))));
+        clear_empty_dirs(&root, &clear);
+        let from = locked_ws.locked_wc().old_tree().clone();
+        let what = "the working directory was only partly updated";
+        let stats = match locked_ws.locked_wc().check_out(commit).await {
+            Ok(stats) => stats,
+            Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what)))),
+        };
+        // Something the directory does not track, put where the focus adds a
+        // file since it was looked at, made jj skip the path, which it
+        // records as written. The state is left stale, as by a checkout
+        // that fails, so that no run reads what stands there (§7.5 step 7).
+        if stats.skipped_files > 0 {
+            let markers = marker_style(self.current_repo().settings());
+            let skipped = match markers {
+                Ok(markers) => first_skipped(&root, markers, &from, &commit.tree()).await.ok().flatten(),
+                Err(_) => None,
+            };
+            let why = match skipped {
+                Some(path) => format!(
+                    "`{}` was not written, as something untracked in the working directory was in its way (move it aside)",
+                    path.as_internal_file_string()
+                ),
+                None => format!(
+                    "{} of its files were not written, as something untracked in the working directory was in their way",
+                    stats.skipped_files
+                ),
+            };
+            return Err(Crash::new(format!("cannot check out the focus: {}{}", why, carry_on(what))));
         }
         // the state names the operation it was checked out at, so it is
         // saved only once that operation is published

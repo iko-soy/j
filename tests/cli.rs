@@ -836,32 +836,33 @@ fn a_failed_checkout_leaves_ignored_files_alone() {
     // directory with the `.gitignore` the checkout had just written, and so
     // could read into the store, or delete, an ignored file; a checkout
     // that fails is now left as it is, for the next run to carry on from.
-    // An ignored file where the focus adds one is left alone by the
-    // checkout, which writes no file over one, by the runs after it, which
-    // read none, and by `j undo`, which takes back only what was written.
+    // An ignored file put where the focus adds one the checkout did not
+    // reach is left alone by the runs after it, which do not track it, and
+    // by `j undo`, which takes back only what was written. (One there
+    // before the run refuses it, before anything is recorded:
+    // `a_checkout_writes_nothing_over_what_the_directory_does_not_track`.)
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     let secret = "API_KEY=hunter2\n";
     r.write("secret.env", secret);
-    r.write("local.env", "mine\n");
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    // written in path order: `.gitignore`, `build/out`, `local.env`
-    // (skipped: already there), then the deep path fails. Each record is
-    // parenthesised: side by side, the second would update the first (§3).
+    // written in path order: `.gitignore`, `build/out`, then the deep path
+    // under `c` fails, before `local.env`. Each record is parenthesised:
+    // side by side, the second would update the first (§3).
     let edit = format!(
         "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\".gitignore\"]) c.files ++ [\
          ({{ path = [\".gitignore\"], content = blob \"*.env\\n*.log\\n\" }}) \
          ({{ path = [\"build\" \"out\"], content = blob \"built\\n\" }}) \
          ({{ path = [\"local.env\"], content = blob \"committed\\n\" }}) \
          ({{ path = [{}], content = blob \"deep\" }})] }})",
-        too_deep("zz")
+        too_deep("c")
     );
     let paths = r.j(&[&format!("\\r -> show (map (\\e -> e.path) (files (({}) r)))", edit)]).ok().stdout;
     let paths = paths.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(paths.starts_with(r#"[["keep.txt"] [".gitignore"] ["build" "out"] ["local.env"] ["zz" "#), "{}", paths);
+    assert!(paths.starts_with(r#"[["keep.txt"] [".gitignore"] ["build" "out"] ["local.env"] ["c" "#), "{}", paths);
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
@@ -870,10 +871,14 @@ fn a_failed_checkout_leaves_ignored_files_alone() {
     assert_eq!(r.read(".gitignore"), "*.env\n*.log\n");
     assert_eq!(r.read("build/out"), "built\n");
     assert_eq!(r.read("secret.env"), secret);
-    assert_eq!(r.read("local.env"), "mine\n");
-    r.j(&["log"]).ok();
-    assert!(!has_blob(&r, secret));
-    assert!(!has_blob(&r, "mine\n"));
+    assert!(!r.dir.join("local.env").exists());
+    r.write("local.env", "mine\n");
+    for run in ["log", "id"] {
+        r.j(&[run]).ok();
+        assert!(!has_blob(&r, secret));
+        assert!(!has_blob(&r, "mine\n"));
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     r.j(&["undo"]).ok();
     assert_eq!(r.read(".gitignore"), "*.env\n");
     assert!(!r.dir.join("build").exists());
@@ -924,6 +929,118 @@ fn undoing_a_failed_checkout_keeps_the_ignored_files_where_it_wrote() {
 /// `message`
 fn new_above(message: &str) -> String {
     format!("new . goto (matching (\\c -> c.message == \"{}\") all)", message)
+}
+
+/// The focus's paths
+const FOCUS_PATHS: &str = "\\r -> show (map (\\e -> e.path) (files r))";
+
+#[test]
+#[cfg(unix)]
+fn a_checkout_writes_nothing_over_what_the_directory_does_not_track() {
+    // §7.4, §7.5 step 7: jj's checkout writes no file where something
+    // stands already, and skips the path without failing, recording it as
+    // written, so the next run read what stood there into the focus: an
+    // ignored file (a secret, say) in place of the focus's content. The
+    // run now refuses before anything is recorded or written, naming what
+    // is in the way where the focus adds a file: an ignored symlink above
+    // it, an ignored file, an ignored file in a directory in its place.
+    let r = setup();
+    r.write(".gitignore", "*.env\nlnk\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"A\""]).ok();
+    let adds = "mapRoot (\\c -> c { files = c.files ++ [({ path = [\"lnk\" \"f\"], content = blob \"f\\n\" }) \
+                ({ path = [\"local.env\"], content = blob \"COMMITTED=1\\n\" }) \
+                ({ path = [\"out\"], content = blob \"out\\n\" })] })";
+    r.j(&[&format!("describe \"B\" . {} . new", adds)]).ok();
+    r.j(&[&new_above("A")]).ok();
+    assert!(!r.dir.join("local.env").exists());
+    // outside the working directory, and removed with the repository
+    let outside = r.cfg.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, r.dir.join("lnk")).unwrap();
+    let secret = "SECRET=hunter2\n";
+    r.write("local.env", secret);
+    std::fs::create_dir_all(r.dir.join("out/sub")).unwrap();
+    r.write("out/junk.env", "junk\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let refused = |holder: &str| {
+        let out = r.j(&[&new_above("B")]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains(&format!("untracked `{}`", holder)), "{}", out.stderr);
+        assert!(out.stderr.contains("move it aside"), "{}", out.stderr);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+        assert_eq!(r.j(&["log"]).ok().stdout, log);
+        assert!(!has_blob(&r, secret));
+    };
+    refused("lnk");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(r.dir.join("lnk")).unwrap();
+    refused("local.env");
+    assert_eq!(r.read("local.env"), secret);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(!has_blob(&r, secret));
+    let aside = r.cfg.join("local.env");
+    std::fs::rename(r.dir.join("local.env"), &aside).unwrap();
+    refused("out/junk.env");
+    assert_eq!(r.read("out/junk.env"), "junk\n");
+    // with those moved aside, B's files are written, over the empty
+    // directories left in `out`
+    std::fs::remove_file(r.dir.join("out/junk.env")).unwrap();
+    r.j(&[&new_above("B")]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("lnk/f"), "f\n");
+    assert_eq!(r.read("local.env"), "COMMITTED=1\n");
+    assert_eq!(r.read("out"), "out\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let paths = r.j(&[FOCUS_PATHS]).ok().stdout;
+    assert_eq!(
+        paths.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[[".gitignore"] ["keep.txt"] ["lnk" "f"] ["local.env"] ["out"]]"#
+    );
+    assert_eq!(std::fs::read_to_string(&aside).unwrap(), secret);
+    assert!(!has_blob(&r, secret));
+}
+
+#[test]
+fn a_checkout_clears_the_empty_directories_where_it_writes_a_file() {
+    // §7.4: a checkout writes no file over a directory, and skips it
+    // without failing: where a tool had left empty directories, the next
+    // run took the focus's file for deleted. Only a checkout over a stale
+    // working copy cleared such directories; every checkout does now,
+    // those in a directory the focus replaces by a file included.
+    let r = setup();
+    r.write("build", "b\n");
+    r.write("keep", "k\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("build")).unwrap();
+    r.j(&["describe \"Q\""]).ok();
+    std::fs::create_dir_all(r.dir.join("build/sub/deeper")).unwrap();
+    r.j(&["new . goto parents"]).ok();
+    assert_eq!(r.read("build"), "b\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&[FOCUS_PATHS]).ok().stdout.trim(), r#"[["build"] ["keep"]]"#);
+    // `lib` holds the tracked `lib/x` and empty directories, and the focus
+    // has the file `lib`
+    r.write("lib", "lib\n");
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("lib")).unwrap();
+    std::fs::create_dir(r.dir.join("lib")).unwrap();
+    r.write("lib/x", "x\n");
+    r.j(&["describe \"D\""]).ok();
+    std::fs::create_dir_all(r.dir.join("lib/e/f")).unwrap();
+    r.j(&[&new_above("L")]).ok();
+    assert_eq!(r.read("lib"), "lib\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&[FOCUS_PATHS]).ok().stdout.trim(), r#"[["build"] ["keep"] ["lib"]]"#);
 }
 
 #[test]
@@ -1270,26 +1387,24 @@ fn has_blob(r: &Repo, content: &str) -> bool {
 #[test]
 #[cfg(target_os = "linux")]
 fn an_ignored_file_saved_meanwhile_where_the_focus_adds_one_is_left_alone() {
-    // §7.5 step 7: an ignored file at a path the focus adds is left alone,
-    // as the checkout does not write over it. The put-back knew the file by
-    // its inode, so one an editor saved meanwhile by renaming a new file
-    // over it was taken for the checkout's own, read into the store and
-    // deleted. Neither the failed checkout nor the runs after it read or
-    // remove such a file; one the checkout wrote, where one was removed
-    // meanwhile, stays ignored.
+    // §7.5 step 7: an ignored file saved meanwhile at a path the focus adds
+    // is left alone. The put-back knew the file by its inode, so one an
+    // editor saved meanwhile by renaming a new file over the one the
+    // checkout wrote was taken for the checkout's own, read into the store
+    // and deleted. Neither the failed checkout, which writes no file over
+    // one saved before it reached the path, nor the runs after it read or
+    // remove such a file; those the checkout wrote stay, ignored. (One
+    // there before the run refuses it, before anything is recorded:
+    // `a_checkout_writes_nothing_over_what_the_directory_does_not_track`.)
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
-    r.write("k.env", "committed k\n");
-    r.write("local.env", "SECRET=v1\n");
-    r.write("o.env", "o\n");
-    r.write("p.env", "p\n");
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    // the checkout skips `k.env` and `local.env` before `m`, and `o.env`
-    // after it
+    // the checkout writes `k.env` and `local.env` before `m`, and `o.env`
+    // and `p.env` after it
     let files = "c.files ++ [({ path = [\"k.env\"], content = blob \"committed k\\n\" }) \
                  ({ path = [\"local.env\"], content = blob \"committed\\n\" }) \
                  ({ path = [\"o.env\"], content = blob \"committed o\\n\" }) \
@@ -1300,8 +1415,6 @@ fn an_ignored_file_saved_meanwhile_where_the_focus_adds_one_is_left_alone() {
         std::fs::rename(r.dir.join("local.env.tmp"), r.dir.join("local.env")).unwrap();
         r.write("o.env.tmp", "committed");
         std::fs::rename(r.dir.join("o.env.tmp"), r.dir.join("o.env")).unwrap();
-        // removed, so the checkout writes the focus's `p.env`
-        std::fs::remove_file(r.dir.join("p.env")).unwrap();
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
@@ -1326,6 +1439,103 @@ fn an_ignored_file_saved_meanwhile_where_the_focus_adds_one_is_left_alone() {
     r.j(&["id"]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
     assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_ignored_file_put_where_a_checkout_cut_short_adds_one_is_not_read() {
+    // §7.4, §7.5 step 7: the next run that persisted after a checkout cut
+    // short completed it, and jj skipped the path where an ignored file had
+    // been put meanwhile, recording it as written: the run after that read
+    // the file into the focus. That run refuses now, naming the file, and
+    // no run reads it.
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `o.env` is written after `m`
+    let files = "c.files ++ [{ path = [\"o.env\"], content = blob \"committed\\n\" }]";
+    let secret = "SECRET=hunter2\n";
+    let out = stopped_mid_checkout_as(&r, &slow_edit(files, n), n, |pid| {
+        r.write("o.env", secret);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    });
+    assert_eq!(out.code, -libc::SIGKILL, "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert!(in_m(&r) < n);
+    for run in ["log", "id"] {
+        r.j(&[run]).ok();
+        assert!(!has_blob(&r, secret));
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let out = r.j(&["describe \"S\""]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("untracked `o.env`"), "{}", out.stderr);
+    assert!(out.stderr.contains("move it aside"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("o.env"), secret);
+    r.j(&["id"]).ok();
+    assert!(!has_blob(&r, secret));
+    // moved aside, the run completes the checkout
+    let aside = r.cfg.join("o.env");
+    std::fs::rename(r.dir.join("o.env"), &aside).unwrap();
+    r.j(&["describe \"S\""]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_eq!(r.read("o.env"), "committed\n");
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert!(!has_blob(&r, secret));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_ignored_file_saved_meanwhile_where_a_checkout_adds_one_fails_it() {
+    // §7.4, §7.5 step 7: a file saved while the checkout runs, at a path
+    // it adds after that, is in its way, and jj skipped the path, recording
+    // it as written: the next run read an ignored one into the focus. The
+    // checkout fails now, naming the path, and leaves the working copy
+    // stale, so no run reads the file.
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `o.env` is written after `m`
+    let files = "c.files ++ [{ path = [\"o.env\"], content = blob \"committed\\n\" }]";
+    let secret = "SECRET=hunter2\n";
+    let out = stopped_mid_checkout(&r, &slow_edit(files, n), n, || r.write("o.env", secret));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("`o.env`"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    // the checkout carried on past it
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    assert_eq!(r.read("o.env"), secret);
+    for run in ["log", "id"] {
+        r.j(&[run]).ok();
+        assert!(!has_blob(&r, secret));
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let text = "\\r -> text (contentAt [\"o.env\"] (files r))";
+    assert_eq!(r.j(&[text]).ok().stdout, "committed\n");
+    let out = r.j(&["describe \"S\""]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("untracked `o.env`"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["undo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.read("o.env"), secret);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert!(!has_blob(&r, secret));
 }
 
 /// Run `edit`, which must take a while to evaluate, over a directory with a
@@ -1397,9 +1607,11 @@ fn a_run_that_fails_to_publish_writes_nothing() {
     r.write("keep.txt", "my uncommitted edit\n");
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // an ignored path the focus adds, where nothing stands: one where
+    // `local.env` stands would refuse the run before it tries to publish
     let edit = "mapRoot (\\c -> c { message = show (foldl (+) 0 (range 0 300000)), \
                 files = c.files ++ [({ path = [\"b\"], content = blob \"b\\n\" }) \
-                ({ path = [\"local.env\"], content = blob \"committed\\n\" })] })";
+                ({ path = [\"other.env\"], content = blob \"committed\\n\" })] })";
     // a file where jj keeps its operation heads: publishing fails
     let heads = r.dir.join(".jj/repo/op_heads/heads");
     let aside = heads.with_extension("aside");
@@ -1417,6 +1629,7 @@ fn a_run_that_fails_to_publish_writes_nothing() {
     assert_eq!(r.read("local.env"), secret);
     assert_eq!(r.read("keep.txt"), "my uncommitted edit\n");
     assert!(!r.dir.join("b").exists());
+    assert!(!r.dir.join("other.env").exists());
     assert!(!has_blob(&r, secret));
     // the run wrote the focus's objects before it tried to publish
     assert!(has_blob(&r, "committed\n"));
@@ -1651,8 +1864,8 @@ fn a_file_a_failed_checkout_replaced_by_directories_comes_back() {
     // for a path under it until the path grew too long. No scan sees empty
     // directories, but a checkout writes no file over one: `j undo` skipped
     // writing `zz` back without an error, and the next run recorded it as
-    // deleted. A checkout over a stale working copy removes such a tree of
-    // empty directories where it writes a file.
+    // deleted. A checkout removes such a tree of empty directories where it
+    // writes a file.
     let r = setup();
     r.write("zz", "precious\n");
     r.write("a", "k\n");

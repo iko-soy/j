@@ -972,15 +972,20 @@ directory.
   that conflict: exactly its markers, or a description of the same sides,
   whatever their labels and less any side it both removes and adds. With
   no change there is nothing to snapshot, and a program that persists
-  writes the focus over the files last checked out as usual. A checkout
-  over a stale working copy first removes each tree of empty directories
-  where it writes a file, such as one a failed checkout made for a path it
-  did not reach: a checkout writes no file over a directory. It looks
-  through no symlink, so nothing outside the working directory is removed.
-  A stale working copy refuses no program.
+  writes the focus over the files last checked out as usual. A stale
+  working copy refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
+  A checkout writes nothing over what stands where the focus has a file (or
+  a symlink, or a conflict) and the directory has no tracked one. It first
+  removes each tree of empty directories there, which no snapshot sees (a
+  tool may leave one, and a failed checkout does, for a path it did not
+  reach), looking through no symlink, so nothing outside the working
+  directory is removed. Anything else untracked there, or in place of a
+  directory above the path (an ignored file, a symlink, a directory holding
+  one), crashes the program before its operation is recorded, naming it, as
+  git refuses to write over an untracked file: it is to be moved aside.
   A later snapshot reads such a file back as the conflict its markers
   describe, edits included, while they parse at the length they were written
   with (longer than 7 when a side holds a marker-like line); once they do
@@ -1054,7 +1059,8 @@ Within it:
    is written `new . goto trunk`.)
 7. Record the operation, then perform the checkout of §7.4, as jj does. A
    signal to stop that comes meanwhile waits until the checkout and its
-   record are saved (§1.3). An operation that cannot be recorded crashes
+   record are saved (§1.3). An operation that cannot be recorded, or a
+   checkout that would write over something untracked (§7.4), crashes
    before the checkout, so nothing is recorded or written. A checkout that
    fails (a path the filesystem cannot hold, a full disk) crashes with the
    operation recorded and the working directory partly updated, and says
@@ -1067,11 +1073,13 @@ Within it:
    saved meanwhile at a path the checkout writes, before or after it wrote
    there, and a file a full disk cut short, are conflicts with the focus's
    content there, so neither is lost. The checkout reads no file into the
-   repository and removes none it does not replace: an ignored file where
-   the focus adds one stays, holding what it held, and so does anything
-   inside a nested repository. No uncommitted edit the checkout writes over
-   is lost, as the operation holds the run's snapshot of the directory
-   (§7.4). This is the one crash that records anything.
+   repository and removes none it does not replace: an ignored file saved
+   meanwhile where the focus adds one, before the checkout reached it,
+   stays, holding what it held, and the checkout fails, naming it, so that
+   no run reads it; anything inside a nested repository stays too. No
+   uncommitted edit the checkout writes over is lost, as the operation
+   holds the run's snapshot of the directory (§7.4). This is the one crash
+   that records anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
