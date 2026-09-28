@@ -1448,15 +1448,17 @@ fn an_ignored_file_put_where_a_checkout_cut_short_adds_one_is_not_read() {
     // short completed it, and jj skipped the path where an ignored file had
     // been put meanwhile, recording it as written: the run after that read
     // the file into the focus. That run refuses now, naming the file, and
-    // no run reads it.
+    // no run reads it. What the checkout wrote at an ignored path before it
+    // was cut short, the focus's own, is written again.
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    // `o.env` is written after `m`
-    let files = "c.files ++ [{ path = [\"o.env\"], content = blob \"committed\\n\" }]";
+    // `k.env` is written before `m`, `o.env` after it
+    let files = "c.files ++ [({ path = [\"k.env\"], content = blob \"committed k\\n\" }) \
+                 ({ path = [\"o.env\"], content = blob \"committed\\n\" })]";
     let secret = "SECRET=hunter2\n";
     let out = stopped_mid_checkout_as(&r, &slow_edit(files, n), n, |pid| {
         r.write("o.env", secret);
@@ -1465,6 +1467,7 @@ fn an_ignored_file_put_where_a_checkout_cut_short_adds_one_is_not_read() {
     assert_eq!(out.code, -libc::SIGKILL, "{}", out.stderr);
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     assert!(in_m(&r) < n);
+    assert_eq!(r.read("k.env"), "committed k\n");
     for run in ["log", "id"] {
         r.j(&[run]).ok();
         assert!(!has_blob(&r, secret));
@@ -1483,6 +1486,7 @@ fn an_ignored_file_put_where_a_checkout_cut_short_adds_one_is_not_read() {
     std::fs::rename(r.dir.join("o.env"), &aside).unwrap();
     r.j(&["describe \"S\""]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_eq!(r.read("k.env"), "committed k\n");
     assert_eq!(r.read("o.env"), "committed\n");
     assert_eq!(in_m(&r), n);
     assert_eq!(r.read("zz"), "z\n");

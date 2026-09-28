@@ -981,11 +981,13 @@ directory.
   a symlink, or a conflict) and the directory has no tracked one. It first
   removes each tree of empty directories there, which no snapshot sees (a
   tool may leave one, and a failed checkout does, for a path it did not
-  reach), looking through no symlink, so nothing outside the working
-  directory is removed. Anything else untracked there, or in place of a
-  directory above the path (an ignored file, a symlink, a directory holding
-  one), crashes the program before its operation is recorded, naming it, as
-  git refuses to write over an untracked file: it is to be moved aside.
+  reach), and an untracked file holding just what it writes there (as a
+  checkout cut short leaves at an ignored path), looking through no
+  symlink, so nothing outside the working directory is removed. Anything
+  else untracked there, or in place of a directory above the path (an
+  ignored file, a symlink, a directory holding one), crashes the program
+  before its operation is recorded, naming it, as git refuses to write over
+  an untracked file: it is to be moved aside.
   A later snapshot reads such a file back as the conflict its markers
   describe, edits included, while they parse at the length they were written
   with (longer than 7 when a side holds a marker-like line); once they do

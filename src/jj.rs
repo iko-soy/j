@@ -831,15 +831,18 @@ struct InTheWay {
 /// the path without failing, recording it as written, so the next scan
 /// would read what stands there into the focus, an ignored file's content
 /// in place of the focus's, or take the focus's file for deleted (§7.4).
-/// What `from` tracks there the checkout removes first, and trees of empty
-/// directories, which no scan sees, it clears (`clear_empty_dirs`): the
-/// result is the paths where a directory holds nothing else, or the first
-/// path where anything else stands (`InTheWay`). No symlink is followed.
-/// Each path costs one `lstat`, and each directory above one not looked at
-/// before one more; a directory standing at a path is read whole, and
-/// each entry in it that is no directory looked up in `from`.
+/// What `from` tracks there the checkout removes first; trees of empty
+/// directories, which no scan sees, and a file holding just what the
+/// checkout writes there (`holds_written`), as a checkout cut short leaves
+/// at an ignored path, are cleared for it (`clear_the_way`). The result is
+/// the paths where nothing else stands, or the first path where anything
+/// else does (`InTheWay`). No symlink is followed. Each path costs one
+/// `lstat`, and each directory above one not looked at before one more; a
+/// file standing at a path is read, and a directory read whole, each entry
+/// in it that is no directory looked up in `from`.
 async fn look_where_added(
     root: &std::path::Path,
+    markers: ConflictMarkerStyle,
     from: &MergedTree,
     to: &MergedTree,
 ) -> Result<Result<Vec<RepoPathBuf>, InTheWay>, String> {
@@ -880,10 +883,14 @@ async fn look_where_added(
         let Ok(meta) = disk.symlink_metadata() else {
             continue;
         };
-        if !meta.is_dir() {
-            return Ok(Err(InTheWay { holder: path.clone(), path }));
-        }
-        match untracked_below(&disk, &path, from) {
+        let holder = if meta.is_dir() {
+            untracked_below(&disk, &path, from)
+        } else if holds_written(to.store(), &path, after, to.labels(), markers, &disk).await? {
+            None
+        } else {
+            Some(path.clone())
+        };
+        match holder {
             Some(holder) => return Ok(Err(InTheWay { path, holder })),
             None => clear.push(path),
         }
@@ -928,13 +935,16 @@ fn untracked_below(disk: &std::path::Path, path: &RepoPath, from: &MergedTree) -
     None
 }
 
-/// Clear each of `paths`, a directory where a checkout writes a file
-/// (`look_where_added`): remove every directory in it holding no file,
-/// deepest first, and it too once empty. A path below anything that is no
+/// Clear each of `paths`, where a checkout from the tree the working
+/// directory holds to `to` adds a file (`look_where_added`): a file there
+/// is removed while it holds what the checkout writes (`holds_written`),
+/// and in a directory there every directory holding no file, deepest
+/// first, and it too once empty. A path below anything that is no
 /// directory on disk, a symlink included, is left alone, and no symlink in
 /// one is followed; a directory is removed only while empty, so a file put
-/// there meanwhile stays, and the checkout skips the path (§7.5 step 7).
-fn clear_empty_dirs(root: &std::path::Path, paths: &[RepoPathBuf]) {
+/// there meanwhile stays, as does one changed meanwhile, and the checkout
+/// skips the path (§7.5 step 7).
+async fn clear_the_way(root: &std::path::Path, markers: ConflictMarkerStyle, to: &MergedTree, paths: &[RepoPathBuf]) {
     fn clear(dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -953,8 +963,18 @@ fn clear_empty_dirs(root: &std::path::Path, paths: &[RepoPathBuf]) {
         let Ok(disk) = path.to_fs_path(root) else {
             continue;
         };
-        if disk.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
             clear(&disk);
+            continue;
+        }
+        let Ok(value) = to.path_value(path).await else {
+            continue;
+        };
+        if holds_written(to.store(), path, value, to.labels(), markers, &disk).await.unwrap_or(false) {
+            let _ = std::fs::remove_file(&disk);
         }
     }
 }
@@ -1643,14 +1663,15 @@ impl JjBackend {
     /// working-copy state records where it scanned nothing to record, or
     /// what `undo`'s look found; with none, the state as it is. Where the
     /// commit adds a file, something `on_disk` does not track standing
-    /// there refuses the checkout before `op` is published
-    /// (`look_where_added`), and one put there since fails it after, as it
-    /// makes jj skip the path. A checkout that fails, or is cut short,
-    /// after `op` is published leaves `op` recorded and the state stale,
-    /// recording `on_disk`: the next run takes what the checkout wrote for
-    /// the commit's own and carries on (`snapshot_tree`), as the crash
-    /// says, with `back` naming the way back; with no `back` it says
-    /// nothing of the operation (a clone that fails removes it).
+    /// there, but for empty directories and what the checkout writes,
+    /// refuses the checkout before `op` is published (`look_where_added`),
+    /// and one put there since fails it after, as it makes jj skip the
+    /// path. A checkout that fails, or is cut short, after `op` is
+    /// published leaves `op` recorded and the state stale, recording
+    /// `on_disk`: the next run takes what the checkout wrote for the
+    /// commit's own and carries on (`snapshot_tree`), as the crash says,
+    /// with `back` naming the way back; with no `back` it says nothing of
+    /// the operation (a clone that fails removes it).
     async fn checkout(
         &self,
         commit: &Commit,
@@ -1699,10 +1720,13 @@ impl JjBackend {
         // one), jj's checkout would skip the path, and the next run read
         // what stands there into the focus: refuse before anything is
         // recorded or written, as git does (§7.5 step 7). The trees of
-        // empty directories found there are cleared once `op` is published.
+        // empty directories found there, and the files holding what the
+        // checkout writes, are cleared once `op` is published.
+        let markers = marker_style(self.current_repo().settings())
+            .map_err(|e| Crash::new(format!("cannot check out the focus: {}", e)))?;
         let clear = match on_disk {
             None => Vec::new(),
-            Some(on_disk) => match look_where_added(&root, on_disk, &commit.tree()).await {
+            Some(on_disk) => match look_where_added(&root, markers, on_disk, &commit.tree()).await {
                 Ok(Ok(clear)) => clear,
                 Ok(Err(InTheWay { path, holder })) => {
                     return Err(Crash::new(format!(
@@ -1762,7 +1786,7 @@ impl JjBackend {
                 }
             };
         }
-        clear_empty_dirs(&root, &clear);
+        clear_the_way(&root, markers, &commit.tree(), &clear).await;
         let from = locked_ws.locked_wc().old_tree().clone();
         let what = "the working directory was only partly updated";
         let stats = match locked_ws.locked_wc().check_out(commit).await {
@@ -1774,11 +1798,7 @@ impl JjBackend {
         // records as written. The state is left stale, as by a checkout
         // that fails, so that no run reads what stands there (§7.5 step 7).
         if stats.skipped_files > 0 {
-            let markers = marker_style(self.current_repo().settings());
-            let skipped = match markers {
-                Ok(markers) => first_skipped(&root, markers, &from, &commit.tree()).await.ok().flatten(),
-                Err(_) => None,
-            };
+            let skipped = first_skipped(&root, markers, &from, &commit.tree()).await.ok().flatten();
             let why = match skipped {
                 Some(path) => format!(
                     "`{}` was not written, as something untracked in the working directory was in its way (move it aside)",
