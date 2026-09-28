@@ -1867,6 +1867,83 @@ fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
     assert_eq!(r.read("a/x"), "file\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_file_written_over_a_conflict_with_a_side_that_is_no_file_is_recorded() {
+    // a conflict at `a` with a side that is a directory or a symlink is
+    // checked out as jj's description of its sides. A file written there
+    // in its place reached no tree: jj's scan found no file merge to read
+    // it into and kept the conflict, so the run showed the conflict,
+    // `describe` recorded it, and a checkout wrote the description back
+    // over the file, which no blob held (§7.4)
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let content = "\\r -> show (contentAt [\"a\"] (files r))";
+    let goto = |m: &str| format!("goto (matching (\\c -> c.message == \"{}\") all)", m);
+    // R, rebased onto its sibling L, where each changes P's file `a`
+    let conflict = |left: &dyn Fn(&Repo), right: &dyn Fn(&Repo)| {
+        let r = setup();
+        r.write("a", "base\n");
+        r.j(&["describe \"P\""]).ok();
+        r.j(&["new"]).ok();
+        std::fs::remove_file(r.dir.join("a")).unwrap();
+        left(&r);
+        r.j(&["describe \"L\""]).ok();
+        r.j(&["new . goto parents"]).ok();
+        std::fs::remove_file(r.dir.join("a")).unwrap();
+        right(&r);
+        r.j(&["describe \"R\""]).ok();
+        r.j(&["rebase (matching (\\c -> c.message == \"L\") all)"]).ok();
+        r.j(&["new"]).ok();
+        assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+        assert!(r.read("a").starts_with("Conflict:\n"), "{}", r.read("a"));
+        r
+    };
+
+    // R's directory against L's deletion
+    let r = conflict(&|_| {}, &|r| {
+        std::fs::create_dir(r.dir.join("a")).unwrap();
+        r.write("a/b", "deep\n");
+    });
+    // the description, left as it is or written again, is the conflict
+    let description = r.read("a");
+    r.j(&["id"]).ok();
+    r.write("a", &description);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"]]");
+    r.write("a", "resolved\n");
+    // `undo` scans to refuse a working directory not recorded
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("working copy has changes not in @"), "{}", out.stderr);
+    assert_eq!(r.j(&[content]).ok().stdout.trim(), "blob \"resolved\\n\"");
+    r.j(&["describe \"C\""]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    r.j(&[&goto("P")]).ok();
+    assert_eq!(r.read("a"), "base\n");
+    r.j(&[&goto("C")]).ok();
+    assert_eq!(r.read("a"), "resolved\n");
+    assert_eq!(r.j(&[content]).ok().stdout.trim(), "blob \"resolved\\n\"");
+    // R keeps its conflict; the child resolves it
+    let parent = "\\r -> show (conflicted (files (up r)))";
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[[\"a\"]]");
+    r.j(&["squash"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[]");
+    assert_eq!(r.read("a"), "resolved\n");
+
+    // L's symlink against R's file; `a` stays tracked where `.gitignore`
+    // has come to match it, as a tracked file does
+    let r = conflict(&|r| std::os::unix::fs::symlink("elsewhere", r.dir.join("a")).unwrap(), &|r| {
+        r.write("a", "right\n")
+    });
+    r.write(".gitignore", "a\n");
+    r.write("a", "resolved\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[content]).ok().stdout.trim(), "blob \"resolved\\n\"");
+    assert_eq!(r.read("a"), "resolved\n");
+}
+
 #[test]
 fn edit_applied_to_an_edit_is_a_contract_crash() {
     // `new new` gives `new` a function where its signature wants a Repo: a

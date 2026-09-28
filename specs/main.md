@@ -932,6 +932,7 @@ directory.
 - **Before evaluation**, the working directory is snapshotted into the
   working-copy commit, and that is the `files` of the focus in the `Repo`
   value. The snapshot tracks every file not matched by `.gitignore` files,
+  and each file it tracked before that a `.gitignore` has come to match,
   with no size limit, symlinks as symlinks, and nothing inside a nested
   repository (a directory below the root holding `.git` or `.jj`); these
   rules are fixed, since `j` reads no jj configuration. If the snapshot
@@ -961,7 +962,11 @@ directory.
   A later snapshot reads such a file back as the conflict its markers
   describe, edits included, while they parse at the length they were written
   with (longer than 7 when a side holds a marker-like line); once they do
-  not, the file is resolved to its text.
+  not, the file is resolved to its text. A conflict with a side that is no
+  file (a directory, a symlink) has no markers: it is written as jj's
+  description of its sides, and read back as that conflict while the file
+  holds the description; a file holding anything else is resolved to its
+  text.
 
 Reserved commands never snapshot.
 

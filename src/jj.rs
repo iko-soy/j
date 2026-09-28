@@ -311,30 +311,47 @@ fn snapshot_options() -> SnapshotOptions<'static> {
 
 /// Scan the working directory with `options`, as `wc.snapshot` does, where
 /// `base` is the tree the working copy's state records; return the tree
-/// scanned. jj's scan loses a file found where `base` has a directory
-/// holding a conflict: it takes the directory's differing sides for a
-/// conflict it cannot write a file into and keeps them at the path, while
-/// it removes the entries below, so the file reaches no tree (and a debug
-/// build fails an assertion). Such a file is first left untracked, which
-/// scans it as if it had been moved away and records the directory's
-/// removal; a second scan then records the file where nothing is, as a
-/// later run would once it was put back (§7.4).
+/// scanned. jj's scan loses a regular file found where `base` has a
+/// conflict it cannot write a file into, one with a side that is no file,
+/// and keeps the conflict, so the file reaches no tree (§7.4):
+///
+/// - at a conflicted path, where a checkout wrote jj's description of the
+///   sides and the file now holds something else (`FilesOnConflicts::at`).
+///   The state is first reset to a resolved file there, so that the scan
+///   reads the file whole, as it reads any tracked file; the path stays
+///   tracked where a `.gitignore` has come to match it.
+/// - above one, where `base` has a directory holding a conflict, whose
+///   differing sides the scan keeps at the path while it removes the
+///   entries below (and a debug build fails an assertion). Such a file is
+///   first left untracked, which scans it as if it had been moved away and
+///   records the directory's removal; a second scan then records the file
+///   where nothing is, as a later run would once it was put back.
 async fn scan(
     wc: &mut dyn LockedWorkingCopy,
     root: &std::path::Path,
     base: &MergedTree,
     options: &SnapshotOptions<'_>,
 ) -> Result<MergedTree, String> {
-    let files = files_over_conflicts(root, base)?;
-    if !files.is_empty() {
-        let untracked = FilesMatcher::new(&files);
+    let files = files_on_conflicts(root, base)?;
+    if !files.at.is_empty() {
+        // the empty file: a reset records the file at each path it changes
+        // as an empty one, not executable, modified at the epoch, so the
+        // scan reads any other file there, and keeps this one for such a file
+        let store = base.store();
+        let id = store.write_file(RepoPath::root(), &mut &[][..]).await.map_err(|e| e.to_string())?;
+        let copy_id = CopyId::placeholder();
+        let empty = Merge::normal(TreeValue::File { id, executable: false, copy_id });
+        reset_paths(wc, base, files.at.into_iter().map(|path| (path, empty.clone()))).await?;
+    }
+    if !files.over.is_empty() {
+        let untracked = FilesMatcher::new(&files.over);
         let start = DifferenceMatcher::new(options.start_tracking_matcher, &untracked);
         let first = SnapshotOptions { start_tracking_matcher: &start, ..options.clone() };
         let (removed, _stats) = wc.snapshot(&first).await.map_err(|e| e.to_string())?;
         // a state that agrees with its tree tracks every entry below the
         // directory, so none is left; were a conflict left below, the
         // second scan would lose the file after all
-        if let Some(path) = files_over_conflicts(root, &removed)?.first() {
+        if let Some(path) = files_on_conflicts(root, &removed)?.over.first() {
             return Err(format!(
                 "cannot record the file `{}` in place of a directory holding a conflict",
                 path.as_internal_file_string()
@@ -345,40 +362,80 @@ async fn scan(
     Ok(scanned)
 }
 
-/// The paths where the working directory holds a regular file and `tree`
-/// a directory holding a conflict, that is one above a conflicted path: a
-/// directory's sides differ exactly when a conflict is below it, as jj
-/// writes no tree whose sides differ where every path resolves. Nothing is
-/// looked at when `tree` is resolved, and each directory above a conflict
-/// at most once, with one `lstat`.
-fn files_over_conflicts(
-    root: &std::path::Path,
-    tree: &MergedTree,
-) -> Result<Vec<RepoPathBuf>, String> {
-    let mut files = Vec::new();
+/// Give the working copy's state, which records `state`, the tree `state`
+/// with `values` at their paths, and return it; nothing in the working
+/// directory is read or written. A reset takes each path it changes for one
+/// the next scan is to read again.
+async fn reset_paths(
+    wc: &mut dyn LockedWorkingCopy,
+    state: &MergedTree,
+    values: impl IntoIterator<Item = (RepoPathBuf, jj_lib::backend::MergedTreeValue)>,
+) -> Result<MergedTree, String> {
+    let mut builder = MergedTreeBuilder::new(state.clone());
+    for (path, value) in values {
+        builder.set_or_remove(path, value);
+    }
+    let tree = builder.write_tree().await.map_err(|e| e.to_string())?;
+    // a reset reads only the commit's tree
+    let commit = with_tree(&state.store().root_commit(), tree.clone());
+    wc.reset(&commit).await.map_err(|e| e.to_string())?;
+    Ok(tree)
+}
+
+/// Where the working directory holds a regular file that jj's scan reads
+/// into no tree, as `tree` has a conflict there it cannot write a file into
+struct FilesOnConflicts {
+    /// the conflicted paths with a side that is no file (a directory, a
+    /// symlink, a submodule), which a checkout writes as jj's description of
+    /// the sides, whose file holds something else
+    at: Vec<RepoPathBuf>,
+    /// the directories holding a conflict, that is those above a conflicted
+    /// path: a directory's sides differ exactly when a conflict is below
+    /// it, as jj writes no tree whose sides differ where every path resolves
+    over: Vec<RepoPathBuf>,
+}
+
+/// Look on disk at `tree`'s conflicts for `FilesOnConflicts`. Nothing is
+/// looked at when `tree` is resolved; each directory above a conflict at
+/// most once, with one `lstat`; and a conflict with a side that is no file
+/// below directories, with one more, and a read where its file is as long
+/// as its description.
+fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<FilesOnConflicts, String> {
+    let mut files = FilesOnConflicts { at: Vec::new(), over: Vec::new() };
     // whether each directory looked at so far is one on disk
     let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
     for (path, value) in tree.conflicts() {
-        value.map_err(|e| e.to_string())?;
+        let value = value.map_err(|e| e.to_string())?;
         let parent = path.parent().expect("a conflicted path has a parent");
         let above: Vec<&RepoPath> = parent.ancestors().take_while(|d| !d.is_root()).collect();
         // from the top down, stopping at the first that is not a directory
-        for dir in above.into_iter().rev() {
-            let is_dir = match dirs.get(dir) {
-                Some(&is_dir) => is_dir,
-                None => {
-                    let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
-                    if meta.as_ref().is_some_and(|m| m.is_file()) {
-                        files.push(dir.to_owned());
-                    }
-                    let is_dir = meta.is_some_and(|m| m.is_dir());
-                    dirs.insert(dir.to_owned(), is_dir);
-                    is_dir
+        let below_dirs = above.into_iter().rev().all(|dir| match dirs.get(dir) {
+            Some(&is_dir) => is_dir,
+            None => {
+                let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+                if meta.as_ref().is_some_and(|m| m.is_file()) {
+                    files.over.push(dir.to_owned());
                 }
-            };
-            if !is_dir {
-                break;
+                let is_dir = meta.is_some_and(|m| m.is_dir());
+                dirs.insert(dir.to_owned(), is_dir);
+                is_dir
             }
+        });
+        if !below_dirs || value.to_file_merge().is_some() {
+            continue;
+        }
+        // what jj's checkout writes for it, as `holds_written` compares
+        let written = value.describe(tree.labels());
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        let changed = disk.symlink_metadata().is_ok_and(|m| {
+            m.is_file()
+                && (m.len() != written.len() as u64
+                    || std::fs::read(&disk).is_ok_and(|bytes| bytes != written.as_bytes()))
+        });
+        if changed {
+            files.at.push(path);
         }
     }
     Ok(files)
