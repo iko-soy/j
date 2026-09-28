@@ -1294,9 +1294,11 @@ that state, §7.2 applies.
 and no `host:` before its first `/`) as the absolute path it names from the
 current directory, symlinks resolved, as `jj git clone` does (`git clone`
 stores it absolute too), so that `fetch` and `push` reach it from wherever
-they run; any other `URL` is stored unresolved. A `URL` that cannot be
-parsed, or a path that cannot be resolved, is a usage error (exit 2) that
-changes nothing.
+they run. A local path that begins with `~` (`~/x.git`, `~user/x.git`) is
+stored as given, since git expands it to that home directory on every
+`fetch` and `push`; `./~/x.git` names a directory called `~`. Any other
+`URL` is stored unresolved. A `URL` that cannot be parsed, or a path that
+cannot be resolved, is a usage error (exit 2) that changes nothing.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
 at most one operation, described `init` and `clone URL` (`URL` as stored),

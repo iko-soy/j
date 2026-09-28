@@ -120,11 +120,17 @@ fn setup() -> Env {
 
 impl Env {
     fn j(&self, workdir: &PathBuf, args: &[&str]) -> Out {
+        self.j_env(workdir, args, &[])
+    }
+
+    /// `j` with `vars` added to its environment
+    fn j_env(&self, workdir: &PathBuf, args: &[&str], vars: &[(&str, &std::path::Path)]) -> Out {
         let out = Command::new(j_bin())
             .args(args)
             .current_dir(workdir)
             .env("XDG_CONFIG_HOME", &self.cfg)
             .env("NO_COLOR", "1")
+            .envs(vars.iter().copied())
             .output()
             .unwrap();
         Out {
@@ -1694,6 +1700,38 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
     let out = env.j(&work, &["clone", bad, "d"]);
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert!(!work.join("d").exists());
+}
+
+#[test]
+fn a_local_remote_under_home_is_stored_as_given() {
+    // §7.8: a `~` the shell did not expand (`j 'remote ~/r.git'`, or any
+    // URL on stdin) was resolved as a directory named `~` in the current
+    // one, so every later fetch and push failed with "Could not find
+    // repository"; git expands it to the home directory on each fetch and
+    // push, wherever it runs, so it is stored as given
+    let env = setup();
+    let home = env.dir.join("home");
+    std::fs::create_dir(&home).unwrap();
+    git(&env.dir, &["clone", "-q", "--bare", env.remote.to_str().unwrap(), home.join("r.git").to_str().unwrap()]);
+    let vars = [("HOME", home.as_path())];
+    let stored = |dir: &PathBuf| git(dir, &["config", "--get", "remote.origin.url"]).trim().to_string();
+    let work = env.dir.join("work");
+    std::fs::create_dir(&work).unwrap();
+    env.j_env(&work, &["clone", "~/r.git", "c"], &vars).ok();
+    let c = work.join("c");
+    assert_eq!(stored(&c), "~/r.git");
+    assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "one\n");
+    // set from the top, used from a subdirectory
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), "d"]).ok();
+    let d = env.dir.join("d");
+    env.j_env(&d, &["remote ~/r.git"], &vars).ok();
+    assert_eq!(stored(&d), "~/r.git");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("b.txt"), "b\n").unwrap();
+    env.j(&d, &["describe \"b\""]).ok();
+    env.j_env(&d.join("sub"), &["push (label \"feature\" here)"], &vars).ok();
+    git(&home.join("r.git"), &["rev-parse", "--verify", "-q", "refs/heads/feature"]);
+    env.j_env(&d.join("sub"), &["fetch"], &vars).ok();
 }
 
 #[test]

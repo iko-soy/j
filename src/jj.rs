@@ -2671,12 +2671,19 @@ fn left_note(left: &[&std::path::Path]) -> String {
 /// `url` as `origin` holds it (§7.8): a local path resolved against the
 /// current directory, as `jj git clone` stores it, for git resolves a
 /// relative one against the directory each later `fetch` or `push` runs
-/// in; any other URL, a `file://` one included, as given. One that does not
-/// parse is a usage error.
+/// in; one under a home directory (`~/…`, `~user/…`) and any other URL, a
+/// `file://` one included, as given. One that does not parse is a usage
+/// error.
 fn origin_url(url: &str) -> Result<String, OpenError> {
     let mut parsed = gix::url::parse(url).map_err(|e| (2, format!("invalid URL `{}`: {}", url, e)))?;
     // a bare path is a file location in the alternative form
     if parsed.scheme != gix::url::Scheme::File || !parsed.serialize_alternative_form {
+        return Ok(url.to_string());
+    }
+    // git expands a leading `~` to the home directory on every fetch and
+    // push, from wherever it runs; resolved here, it would name a directory
+    // called `~` (`./~/…` still does)
+    if parsed.path.starts_with(b"~") {
         return Ok(url.to_string());
     }
     let cwd = std::env::current_dir()
