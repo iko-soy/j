@@ -956,9 +956,14 @@ directory.
   the base, in which a path that the directory and the commit both
   changed, differently, is a conflict (an edit to a file the commit
   deletes, say), and one where the directory holds what the commit does is
-  the commit's (what a checkout cut short had written). With no change
-  there is nothing to snapshot, and a program that persists writes the
-  focus over the files last checked out as usual. A stale working copy
+  the commit's (what a checkout cut short had written). A file holding
+  exactly what a checkout writes for one of the commit's conflicts, its
+  markers or its description, is read back as that conflict. With no
+  change there is nothing to snapshot, and a program that persists writes
+  the focus over the files last checked out as usual. A checkout over a
+  stale working copy first removes each tree of empty directories where it
+  writes a file, such as one a failed checkout made for a path it did not
+  reach: a checkout writes no file over a directory. A stale working copy
   refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's

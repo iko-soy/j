@@ -1522,6 +1522,92 @@ fn a_failed_checkout_removes_nothing_through_a_symlink() {
 }
 
 #[test]
+fn a_file_a_failed_checkout_replaced_by_directories_comes_back() {
+    // §7.5 step 7: the checkout removed the file `zz` and made directories
+    // for a path under it until the path grew too long. No scan sees empty
+    // directories, but a checkout writes no file over one: `j undo` skipped
+    // writing `zz` back without an error, and the next run recorded it as
+    // deleted. A checkout over a stale working copy removes such a tree of
+    // empty directories where it writes a file.
+    let r = setup();
+    r.write("zz", "precious\n");
+    r.write("a", "k\n");
+    r.j(&["describe \"W\""]).ok();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\"zz\"]) c.files ++ [{{ path = [{}], content = blob \"deep\" }}] }})",
+        too_deep("zz")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert!(r.dir.join("zz").is_dir());
+    r.j(&["undo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.read("zz"), "precious\n");
+    let paths = r.j(&["\\r -> show (map (\\e -> e.path) (files r))"]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["a"] ["zz"]]"#);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+}
+
+#[test]
+fn a_conflict_a_failed_checkout_wrote_is_read_back_as_that_conflict() {
+    // §7.4, §7.5 step 7: a checkout records a conflict in the working-copy
+    // state as it writes its markers, so a checkout that fails records none
+    // of those it wrote, and the next run read each file as the text of its
+    // markers: a conflict nested in the focus's, which `j undo` refused to
+    // write over. A file holding exactly what the checkout writes for the
+    // focus's conflict is read back as that conflict, markers made longer
+    // than any line of its sides that looks like one included.
+    let r = setup();
+    r.write("a.txt", "base\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "<<<<<<< left\n");
+    r.j(&["describe \"left\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a.txt", "right\n");
+    r.j(&["describe \"right\""]).ok();
+    r.j(&["rebase siblings"]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // the conflict is written to `c.txt` and over `keep.txt` too, then the
+    // deep path fails
+    let conflict = "(filter (\\e -> e.path == [\"a.txt\"]) c.files)";
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\"keep.txt\"]) c.files \
+         ++ map (\\e -> e {{ path = [\"c.txt\"] }}) {0} ++ map (\\e -> e {{ path = [\"keep.txt\"] }}) {0} \
+         ++ [{{ path = [{1}], content = blob \"deep\" }}] }})",
+        conflict,
+        too_deep("zz")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert!(r.read("c.txt").contains("<<<<<<<<"), "{}", r.read("c.txt"));
+    assert_eq!(r.read("c.txt"), r.read("keep.txt"));
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let all = r.j(&[conflicted]).ok().stdout;
+    assert_eq!(all.split_whitespace().collect::<Vec<_>>().join(" "), r#"[["a.txt"] ["c.txt"] ["keep.txt"]]"#);
+    r.j(&["undo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert!(!r.dir.join("c.txt").exists());
+    assert_eq!(r.read("keep.txt"), "k\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn a_checkout_whose_state_fails_to_save_is_carried_on_from() {
     // §7.4, §7.5 step 7: a checkout that completed, but whose working-copy

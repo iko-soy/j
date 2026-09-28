@@ -11,8 +11,10 @@ use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::MergedTree;
@@ -498,13 +500,22 @@ fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<Files
 /// directory holds what the commit does, the base is taken to hold it too,
 /// so that a conflict the state records there, whose sides would not
 /// cancel against the commit's, does not make one of a change both made.
-async fn snapshot_tree(wc: &MergedTree, state: &MergedTree, scanned: &MergedTree) -> Result<MergedTree, String> {
+/// That includes a conflict the checkout wrote, which the scan read as its
+/// text (`conflicts_written`).
+async fn snapshot_tree(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    wc: &MergedTree,
+    state: &MergedTree,
+    scanned: &MergedTree,
+) -> Result<MergedTree, String> {
     if state.tree_ids() == wc.tree_ids() {
         return Ok(scanned.clone());
     }
     if scanned.tree_ids() == state.tree_ids() {
         return Ok(wc.clone());
     }
+    let scanned = &conflicts_written(root, markers, wc, state, scanned).await?;
     let err = |e: jj_lib::backend::BackendError| e.to_string();
     // the paths where the directory holds something other than the commit
     let mut apart = std::collections::HashSet::new();
@@ -535,6 +546,125 @@ async fn snapshot_tree(wc: &MergedTree, state: &MergedTree, scanned: &MergedTree
     ))
     .await
     .map_err(err)
+}
+
+/// `scanned` with the commit's conflict at each path the working-copy
+/// state records something else at, where the file holds exactly what jj's
+/// checkout writes for that conflict: its markers, or its description where
+/// a side is no file (§7.4). A checkout records the conflict in the state
+/// as it writes the file, so a scan reads such a file back as the conflict;
+/// one cut short, or one over a stale state, records nothing, and the scan
+/// reads the file as the text it holds. Each of the commit's conflicts is
+/// looked at, and a file read, only where neither the state nor the scan
+/// has the conflict.
+async fn conflicts_written(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    wc: &MergedTree,
+    state: &MergedTree,
+    scanned: &MergedTree,
+) -> Result<MergedTree, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut tree = MergedTreeBuilder::new(scanned.clone());
+    let mut found = false;
+    for (path, value) in wc.conflicts() {
+        let value = value.map_err(err)?;
+        if state.path_value(&path).await.map_err(err)? == value
+            || scanned.path_value(&path).await.map_err(err)? == value
+        {
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        if holds_written(wc.store(), &path, value.clone(), wc.labels(), markers, &disk).await? {
+            tree.set_or_remove(path, value);
+            found = true;
+        }
+    }
+    if !found {
+        return Ok(scanned.clone());
+    }
+    tree.write_tree().await.map_err(err)
+}
+
+/// Whether `disk`, the file at `path`, holds exactly what a checkout writes
+/// there for the conflict `value`, compared byte for byte (j's settings
+/// convert no line endings); nothing is written to the store
+async fn holds_written(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: jj_lib::backend::MergedTreeValue,
+    labels: &jj_lib::conflict_labels::ConflictLabels,
+    markers: ConflictMarkerStyle,
+    disk: &std::path::Path,
+) -> Result<bool, String> {
+    use jj_lib::conflicts::{self, MaterializedTreeValue};
+    let Ok(meta) = disk.symlink_metadata() else {
+        return Ok(false);
+    };
+    let written = conflicts::materialize_tree_value(store, path, value, labels)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bytes: Vec<u8> = match written {
+        MaterializedTreeValue::FileConflict(file) => {
+            let options = conflicts::ConflictMaterializeOptions {
+                marker_style: markers,
+                marker_len: Some(conflicts::choose_materialized_conflict_marker_len(&file.contents)),
+                merge: store.merge_options().clone(),
+            };
+            conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into()
+        }
+        MaterializedTreeValue::OtherConflict { id, labels } => id.describe(&labels).into_bytes(),
+        _ => return Ok(false),
+    };
+    Ok(meta.is_file() && meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
+}
+
+/// How the working copy writes a conflict, as `settings` say
+fn marker_style(settings: &UserSettings) -> Result<ConflictMarkerStyle, String> {
+    Ok(TreeStateSettings::try_from_user_settings(settings).map_err(|e| e.to_string())?.conflict_marker_style)
+}
+
+/// Remove each tree of directories holding no file at a path where `to`
+/// has a file (or a symlink, or a conflict) and `from`, the tree the
+/// working directory holds, has none. A checkout writes no file over a
+/// directory and skips it without failing, and the next scan would then
+/// take the file for deleted; a checkout that failed or was cut short
+/// leaves such trees, made for a path it did not reach or in place of a
+/// file it removed (§7.5 step 7). Only a checkout over a stale working copy
+/// looks, one `lstat` for each path it adds; directories are removed one at
+/// a time, deepest first, and only while empty.
+async fn clear_empty_dirs(root: &std::path::Path, from: &MergedTree, to: &MergedTree) -> Result<(), String> {
+    fn holds_no_file(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.into_iter().all(|entry| {
+                entry.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_dir()) && holds_no_file(&e.path()))
+            })
+        })
+    }
+    fn remove(dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                remove(&entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+    let mut diff = from.diff_stream(to, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, after } = entry.values.map_err(|e| e.to_string())?;
+        if before.is_present() || after.is_absent() {
+            continue;
+        }
+        let Ok(disk) = entry.path.to_fs_path(root) else {
+            continue;
+        };
+        if disk.symlink_metadata().is_ok_and(|m| m.is_dir()) && holds_no_file(&disk) {
+            remove(&disk);
+        }
+    }
+    Ok(())
 }
 
 /// Save the working copy's state as a scan that found `scanned` left it:
@@ -811,9 +941,11 @@ impl JjBackend {
         // loader, whose store the scanned tree lives in
         let head = self.current_repo();
         let wc_commit = self.wc_commit(&head).await?;
-        let tree = snapshot_tree(&wc_commit.tree(), &old_tree, &scanned)
-            .await
-            .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
+        let tree = match marker_style(head.settings()) {
+            Ok(markers) => snapshot_tree(&root, markers, &wc_commit.tree(), &old_tree, &scanned).await,
+            Err(e) => Err(e),
+        }
+        .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
         if tree.tree_ids() == wc_commit.tree().tree_ids() {
             // nothing to record: the directory holds the commit's files, or,
             // where the state is stale, the state's, or changes to them the
@@ -1123,6 +1255,15 @@ impl JjBackend {
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
+        // whether the working copy is stale (§7.4), as a checkout that failed
+        // or was cut short leaves it (§7.5 step 7)
+        let stale = match on_disk {
+            None => false,
+            Some(_) => {
+                let wc = self.wc_commit(&self.current_repo()).await.map_err(|e| Crash::new(e.1))?;
+                wc.tree().tree_ids() != locked_ws.locked_wc().old_tree().tree_ids()
+            }
+        };
         // A persisting run's snapshot released its lock without saving what
         // it scanned, so the state just loaded may still describe the tree
         // recorded before the edits, and jj checks out by diffing that tree
@@ -1198,6 +1339,12 @@ impl JjBackend {
                     return Err(Crash::new(format!("cannot save the working copy's state: {}{}", e, carry_on(what))));
                 }
             };
+        }
+        if let Some(on_disk) = on_disk.filter(|_| stale) {
+            if let Err(e) = clear_empty_dirs(&root, on_disk, &commit.tree()).await {
+                let what = "the working directory was not updated";
+                return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what))));
+            }
         }
         if let Err(e) = locked_ws.locked_wc().check_out(commit).await {
             let what = "the working directory was only partly updated";
@@ -1658,8 +1805,11 @@ impl JjBackend {
         let old_tree = locked_ws.locked_wc().old_tree().clone();
         let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
-        let recorded = block_on(snapshot_tree(&wc_tree, &old_tree, &scanned))
-            .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
+        let recorded = match marker_style(base.settings()) {
+            Ok(markers) => block_on(snapshot_tree(&root, markers, &wc_tree, &old_tree, &scanned)),
+            Err(e) => Err(e),
+        }
+        .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
         if recorded.tree_ids() != wc_tree.tree_ids() {
             // drop the lock without saving, or the state would claim the
             // directory was snapshotted and hide the changes from the next
