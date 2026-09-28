@@ -1244,12 +1244,20 @@ that state, §7.2 applies.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
+`clone` and `remote` store a `URL` that is a local path (one with no scheme
+and no `host:` before its first `/`) as the absolute path it names from the
+current directory, symlinks resolved, as `jj git clone` does (`git clone`
+stores it absolute too), so that `fetch` and `push` reach it from wherever
+they run; any other `URL` is stored unresolved. A `URL` that cannot be
+parsed, or a path that cannot be resolved, is a usage error (exit 2) that
+changes nothing.
+
 Besides jj's own record of the new workspace, `init` and `clone` each record
-at most one operation, described `init` and `clone URL`, holding what they
-imported and the working-copy commit; `undo` never undoes it (§7.7). That
-commit holds its parent's files less any at a path a checkout cannot create
-(§7.5 step 1), such as a committed `.jj` directory: their removal is its
-change.
+at most one operation, described `init` and `clone URL` (`URL` as stored),
+holding what they imported and the working-copy commit; `undo` never undoes
+it (§7.7). That commit holds its parent's files less any at a path a
+checkout cannot create (§7.5 step 1), such as a committed `.jj` directory:
+their removal is its change.
 
 ### 7.9 Identity
 

@@ -1482,6 +1482,61 @@ fn remote_command_sets_url() {
 }
 
 #[test]
+fn a_local_remote_is_stored_resolved_against_the_current_directory() {
+    // §7.8: `clone` and `remote` stored a local path as typed, and git
+    // resolves a relative one against the directory each later run is in:
+    // cloned by `../remote.git` from a sibling directory, the clone's every
+    // `fetch` and `push` failed with "Could not find repository", and so
+    // did those of a repository whose `remote` was set from a subdirectory.
+    // Such a path is now stored resolved against the current directory, as
+    // `git clone` stores it; other URLs are stored unresolved.
+    let env = setup();
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let name = env.remote.file_name().unwrap().to_str().unwrap();
+    let stored = |dir: &PathBuf| git(dir, &["config", "--get", "remote.origin.url"]).trim().to_string();
+    let same_dir = |url: &str, dir: &PathBuf| {
+        assert!(std::path::Path::new(url).is_absolute(), "stored {}", url);
+        assert_eq!(std::fs::canonicalize(url).unwrap(), std::fs::canonicalize(dir).unwrap());
+    };
+    // `work` is in `env.dir`, a sibling of the remote
+    env.j(&work, &["clone", &format!("../../{}", name), "c"]).ok();
+    let c = work.join("c");
+    same_dir(&stored(&c), &env.remote);
+    env.j(&c, &["fetch"]).ok();
+    std::fs::write(c.join("b.txt"), "b\n").unwrap();
+    env.j(&c, &["describe \"b\""]).ok();
+    env.j(&c, &["push (label \"feature\" here)"]).ok();
+    git(&env.remote, &["rev-parse", "--verify", "-q", "refs/heads/feature"]);
+
+    // set from a subdirectory, fetched from the top
+    let other = env.dir.join("other.git");
+    git(&env.dir, &["clone", "-q", "--bare", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::create_dir(c.join("sub")).unwrap();
+    env.j(&c.join("sub"), &["remote", "../../../other.git"]).ok();
+    same_dir(&stored(&c), &other);
+    env.j(&c, &["fetch"]).ok();
+
+    for url in [
+        "file://../project.git",
+        "https://example.com/team/project.git",
+        "git@example.com:team/project.git",
+        "ssh://git@example.com/team/project.git",
+    ] {
+        env.j(&c, &["remote", url]).ok();
+        assert_eq!(stored(&c), url);
+    }
+    // a URL that cannot be parsed is a usage error, which changes nothing
+    let bad = "ssh://example.com:port/project.git";
+    let out = env.j(&c, &["remote", bad]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(stored(&c), "ssh://git@example.com/team/project.git");
+    let out = env.j(&work, &["clone", bad, "d"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(!work.join("d").exists());
+}
+
+#[test]
 fn undo_push_restores_labels() {
     let env = setup();
     let dest = uniq("clone");

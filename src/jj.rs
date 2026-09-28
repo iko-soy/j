@@ -1667,6 +1667,7 @@ impl JjBackend {
     }
 
     pub fn cmd_remote(&self, url: &str) -> Result<(), OpenError> {
+        let url = &origin_url(url)?;
         self.take_lock();
         let base = self.current_repo();
         let origin = RemoteName::new("origin");
@@ -2158,6 +2159,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
 
 pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     let settings = user_settings_strict(cfg)?;
+    let url = &origin_url(url)?;
     let dir_path = PathBuf::from(dir);
     if dir_path.join(".jj").is_dir() {
         return Err((2, format!("{} already contains a jj repository", dir)));
@@ -2307,6 +2309,27 @@ fn left_note(left: &[&std::path::Path]) -> String {
             named(&[last])
         ),
     }
+}
+
+/// `url` as `origin` holds it (§7.8): a local path resolved against the
+/// current directory, as `jj git clone` stores it, for git resolves a
+/// relative one against the directory each later `fetch` or `push` runs
+/// in; any other URL, a `file://` one included, as given. One that does not
+/// parse is a usage error.
+fn origin_url(url: &str) -> Result<String, OpenError> {
+    let mut parsed = gix::url::parse(url).map_err(|e| (2, format!("invalid URL `{}`: {}", url, e)))?;
+    // a bare path is a file location in the alternative form
+    if parsed.scheme != gix::url::Scheme::File || !parsed.serialize_alternative_form {
+        return Ok(url.to_string());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| (2, format!("cannot read the current directory: {}", e)))?;
+    parsed
+        .canonicalize(&cwd)
+        .map_err(|e| (2, format!("cannot resolve `{}`: {}", url, e)))?;
+    // `add_remote` takes UTF-8, which only a current directory's name can
+    // break: such a path is stored as given
+    Ok(String::from_utf8(parsed.to_bstring().into()).unwrap_or_else(|_| url.to_string()))
 }
 
 /// `clone`'s work once `dir_path` exists and is empty (§7.8)
