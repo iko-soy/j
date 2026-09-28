@@ -932,10 +932,11 @@ directory.
 - **Before evaluation**, the working directory is snapshotted into the
   working-copy commit, and that is the `files` of the focus in the `Repo`
   value. The snapshot tracks every file not matched by `.gitignore` files,
-  and each file it tracked before that a `.gitignore` has come to match,
-  with no size limit, symlinks as symlinks, and nothing inside a nested
-  repository (a directory below the root holding `.git` or `.jj`); these
-  rules are fixed, since `j` reads no jj configuration. If the snapshot
+  and each file it tracked before that a `.gitignore` has come to match
+  (deleted once it is gone, even where a file has replaced a directory
+  above it), with no size limit, symlinks as symlinks, and nothing inside a
+  nested repository (a directory below the root holding `.git` or `.jj`);
+  these rules are fixed, since `j` reads no jj configuration. If the snapshot
   changed the commit, that change is part of the operation persisted
   afterwards, or discarded with the rest if nothing is persisted. A crashed
   or printing program leaves the working copy and the repository exactly as

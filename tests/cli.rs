@@ -319,6 +319,39 @@ fn gitignore_is_honored() {
 }
 
 #[test]
+fn a_directory_replaced_by_a_file_inside_an_ignored_directory_is_recorded() {
+    // `build/a` holds tracked files when `.gitignore` comes to ignore
+    // `build/`, and is then replaced by a file. jj's scan reads an ignored
+    // directory only at the paths it tracks there, and took a path below
+    // the file for one it could not look at rather than one deleted, so
+    // every run that scanned exited 2, `undo` included, until the file was
+    // moved away (§7.4)
+    let r = setup();
+    std::fs::create_dir_all(r.dir.join("build/a/c")).unwrap();
+    r.write("build/a/b", "x\n");
+    r.write("build/a/c/d", "y\n");
+    r.write("build/keep", "k\n");
+    r.j(&["id"]).ok();
+    r.write(".gitignore", "build/\n");
+    r.j(&["id"]).ok();
+    std::fs::remove_dir_all(r.dir.join("build/a")).unwrap();
+    r.write("build/a", "f\n");
+    // the files below it are deleted; it is ignored, as a new file there is
+    let paths = "\\r -> show (map (.path) (files r))";
+    let left = "[[\".gitignore\"] [\"build\" \"keep\"]]";
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), left);
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("working copy has changes not in @"), "{}", out.stderr);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), left);
+    r.j(&["new"]).ok();
+    assert_eq!(r.j(&[paths]).ok().stdout.trim(), left);
+    assert_eq!(r.read("build/a"), "f\n");
+    assert_eq!(r.read("build/keep"), "k\n");
+}
+
+#[test]
 fn dry_run_persists_nothing() {
     let r = setup();
     r.write("a.txt", "x\n");

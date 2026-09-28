@@ -29,7 +29,7 @@ use jj_lib::revset::{ResolvedRevsetExpression, RevsetStreamExt};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::transaction::UnpublishedOperation;
-use jj_lib::working_copy::{LockedWorkingCopy, SnapshotOptions};
+use jj_lib::working_copy::{LockedWorkingCopy, SnapshotError, SnapshotOptions};
 use jj_lib::workspace::Workspace;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -333,6 +333,7 @@ async fn scan(
     options: &SnapshotOptions<'_>,
 ) -> Result<MergedTree, String> {
     let files = files_on_conflicts(root, base)?;
+    let mut state = base.clone();
     if !files.at.is_empty() {
         // the empty file: a reset records the file at each path it changes
         // as an empty one, not executable, modified at the epoch, so the
@@ -341,23 +342,67 @@ async fn scan(
         let id = store.write_file(RepoPath::root(), &mut &[][..]).await.map_err(|e| e.to_string())?;
         let copy_id = CopyId::placeholder();
         let empty = Merge::normal(TreeValue::File { id, executable: false, copy_id });
-        reset_paths(wc, base, files.at.into_iter().map(|path| (path, empty.clone()))).await?;
+        state = reset_paths(wc, &state, files.at.into_iter().map(|path| (path, empty.clone()))).await?;
     }
     if !files.over.is_empty() {
         let untracked = FilesMatcher::new(&files.over);
         let start = DifferenceMatcher::new(options.start_tracking_matcher, &untracked);
         let first = SnapshotOptions { start_tracking_matcher: &start, ..options.clone() };
-        let (removed, _stats) = wc.snapshot(&first).await.map_err(|e| e.to_string())?;
+        state = scan_pass(wc, root, &state, &first).await?;
         // a state that agrees with its tree tracks every entry below the
         // directory, so none is left; were a conflict left below, the
         // second scan would lose the file after all
-        if let Some(path) = files_on_conflicts(root, &removed)?.over.first() {
+        if let Some(path) = files_on_conflicts(root, &state)?.over.first() {
             return Err(format!(
                 "cannot record the file `{}` in place of a directory holding a conflict",
                 path.as_internal_file_string()
             ));
         }
     }
+    scan_pass(wc, root, &state, options).await
+}
+
+/// `wc.snapshot(options)`, where `state` is the tree the working copy's
+/// state records; return the tree scanned. jj's scan reads a directory a
+/// `.gitignore` ignores only at the paths the state tracks there, and where
+/// it cannot look at one of them because a directory above it has been
+/// replaced by a file, it fails instead of taking the path for deleted, as
+/// it takes one it does not find. The paths below a file are then dropped
+/// from the state, which records them as deleted, and the directory is
+/// scanned again (§7.4). A scan fails so while it walks the directory,
+/// before it changes anything in the state.
+async fn scan_pass(
+    wc: &mut dyn LockedWorkingCopy,
+    root: &std::path::Path,
+    state: &MergedTree,
+    options: &SnapshotOptions<'_>,
+) -> Result<MergedTree, String> {
+    let err = match wc.snapshot(options).await {
+        Ok((scanned, _stats)) => return Ok(scanned),
+        Err(err) => err,
+    };
+    let not_a_dir = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotADirectory;
+    let SnapshotError::Other { err: source, .. } = &err else {
+        return Err(err.to_string());
+    };
+    if !source.downcast_ref::<std::io::Error>().is_some_and(not_a_dir) {
+        return Err(err.to_string());
+    }
+    // one `lstat` per path the state tracks, only once a scan has failed
+    let mut gone = Vec::new();
+    for (path, value) in state.entries() {
+        value.map_err(|e| e.to_string())?;
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        if disk.symlink_metadata().is_err_and(|e| not_a_dir(&e)) {
+            gone.push((path, Merge::absent()));
+        }
+    }
+    if gone.is_empty() {
+        return Err(err.to_string());
+    }
+    reset_paths(wc, state, gone).await?;
     let (scanned, _stats) = wc.snapshot(options).await.map_err(|e| e.to_string())?;
     Ok(scanned)
 }
