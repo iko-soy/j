@@ -975,8 +975,9 @@ directory.
   writes the focus over the files last checked out as usual. A checkout
   over a stale working copy first removes each tree of empty directories
   where it writes a file, such as one a failed checkout made for a path it
-  did not reach: a checkout writes no file over a directory. A stale
-  working copy refuses no program.
+  did not reach: a checkout writes no file over a directory. It looks
+  through no symlink, so nothing outside the working directory is removed.
+  A stale working copy refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.

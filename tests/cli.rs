@@ -920,6 +920,55 @@ fn undoing_a_failed_checkout_keeps_the_ignored_files_where_it_wrote() {
     assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
+/// An expression that goes to a new commit above the one whose message is
+/// `message`
+fn new_above(message: &str) -> String {
+    format!("new . goto (matching (\\c -> c.message == \"{}\") all)", message)
+}
+
+#[test]
+#[cfg(unix)]
+fn a_checkout_clears_nothing_through_a_symlink() {
+    // §7.4: clearing the empty directories where a checkout over a stale
+    // working copy writes a file looked at each path through the symlinks
+    // above it: `x`, a symlink to a directory outside the working directory
+    // that the focus has as a directory, had it remove an empty tree the
+    // symlink's target held
+    let r = setup();
+    // outside the working directory, and removed with the repository
+    let outside = r.cfg.join("outside");
+    std::fs::create_dir_all(outside.join("y/z/deeper")).unwrap();
+    r.write("keep", "k\n");
+    std::os::unix::fs::symlink(&outside, r.dir.join("x")).unwrap();
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("x")).unwrap();
+    std::fs::create_dir_all(r.dir.join("x/y")).unwrap();
+    r.write("x/y/z", "z\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&[&new_above("A")]).ok();
+    assert!(r.dir.join("x").symlink_metadata().unwrap().is_symlink());
+    let saved: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(r.dir.join(".jj/working_copy"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+        .collect();
+    r.j(&[&new_above("B")]).ok();
+    assert!(outside.join("y/z/deeper").is_dir());
+    assert_eq!(r.read("x/y/z"), "z\n");
+    // the same over a stale working copy, as jj leaves it when it moves the
+    // working-copy commit without updating the working directory
+    for (path, bytes) in saved {
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::remove_dir_all(r.dir.join("x")).unwrap();
+    std::os::unix::fs::symlink(&outside, r.dir.join("x")).unwrap();
+    r.j(&["describe \"B2\""]).ok();
+    assert!(outside.join("y/z/deeper").is_dir());
+    assert_eq!(r.read("x/y/z"), "z\n");
+    assert!(r.dir.join("x").symlink_metadata().unwrap().is_dir());
+}
+
 /// Run `edit`, whose checkout writes `m/0` … `m/<n-1>` and more after them,
 /// and call `meanwhile` with the process stopped while it writes `m`, once
 /// its operation is published

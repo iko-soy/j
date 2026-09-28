@@ -776,6 +776,36 @@ fn marker_style(settings: &UserSettings) -> Result<ConflictMarkerStyle, String> 
     Ok(TreeStateSettings::try_from_user_settings(settings).map_err(|e| e.to_string())?.conflict_marker_style)
 }
 
+/// The first of the directories between the root and `path`, from the top
+/// down, that is no directory on disk, with the type of what stands there
+/// (none where nothing does, or it cannot be looked at), or none if each
+/// is: a symlink is not one, and is not followed, as no directory below
+/// one is looked at. Each directory not looked at before costs one
+/// `lstat`, and what it found is kept in `dirs`.
+fn first_not_a_dir(
+    root: &std::path::Path,
+    path: &RepoPath,
+    dirs: &mut HashMap<RepoPathBuf, Option<std::fs::FileType>>,
+) -> Option<(RepoPathBuf, Option<std::fs::FileType>)> {
+    let parent = path.parent()?;
+    let above: Vec<&RepoPath> = parent.ancestors().take_while(|d| !d.is_root()).collect();
+    for dir in above.into_iter().rev() {
+        let stands = match dirs.get(dir) {
+            Some(&stands) => stands,
+            None => {
+                let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+                let stands = meta.map(|m| m.file_type());
+                dirs.insert(dir.to_owned(), stands);
+                stands
+            }
+        };
+        if !stands.is_some_and(|t| t.is_dir()) {
+            return Some((dir.to_owned(), stands));
+        }
+    }
+    None
+}
+
 /// Remove each tree of directories holding no file at a path where `to`
 /// has a file (or a symlink, or a conflict) and `from`, the tree the
 /// working directory holds, has none. A checkout writes no file over a
@@ -783,8 +813,11 @@ fn marker_style(settings: &UserSettings) -> Result<ConflictMarkerStyle, String> 
 /// take the file for deleted; a checkout that failed or was cut short
 /// leaves such trees, made for a path it did not reach or in place of a
 /// file it removed (§7.5 step 7). Only a checkout over a stale working copy
-/// looks, one `lstat` for each path it adds; directories are removed one at
-/// a time, deepest first, and only while empty.
+/// looks, one `lstat` for each path it adds and each directory above one
+/// not looked at before (`first_not_a_dir`): a path below a symlink, which
+/// the checkout replaces, is not looked at, so nothing outside the working
+/// directory is. Directories are removed one at a time, deepest first,
+/// only while empty, and no symlink in one is followed.
 async fn clear_empty_dirs(root: &std::path::Path, from: &MergedTree, to: &MergedTree) -> Result<(), String> {
     fn holds_no_file(dir: &std::path::Path) -> bool {
         std::fs::read_dir(dir).is_ok_and(|entries| {
@@ -796,15 +829,21 @@ async fn clear_empty_dirs(root: &std::path::Path, from: &MergedTree, to: &Merged
     fn remove(dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                remove(&entry.path());
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    remove(&entry.path());
+                }
             }
         }
         let _ = std::fs::remove_dir(dir);
     }
+    let mut dirs = HashMap::new();
     let mut diff = from.diff_stream(to, &EverythingMatcher);
     while let Some(entry) = diff.next().await {
         let Diff { before, after } = entry.values.map_err(|e| e.to_string())?;
         if before.is_present() || after.is_absent() {
+            continue;
+        }
+        if first_not_a_dir(root, &entry.path, &mut dirs).is_some() {
             continue;
         }
         let Ok(disk) = entry.path.to_fs_path(root) else {

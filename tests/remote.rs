@@ -1459,6 +1459,46 @@ fn an_edit_to_a_file_a_fetch_abandoned_is_kept_as_a_conflict() {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_fetch_that_replaces_a_symlink_by_a_directory_has_nothing_cleared_through_it() {
+    // §7.4, §7.6: the fetch rebases the working-copy commit onto `dir`,
+    // where `link`, a symlink to a directory outside the working directory,
+    // is a directory holding `link/cache/x`, and leaves the working copy
+    // stale. The next run that persisted cleared the empty directories
+    // where its checkout wrote a file, looking at each path through the
+    // symlinks above it, and so removed the empty tree `cache/x` outside.
+    let env = setup();
+    let shared = env.dir.join("shared");
+    std::fs::create_dir_all(shared.join("cache/x/tmp")).unwrap();
+    let seed = env.dir.join("seed");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
+    std::fs::create_dir_all(seed.join("link/cache")).unwrap();
+    std::fs::write(seed.join("link/cache/x"), "x\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "dir"]);
+    git(&seed, &["rm", "-rq", "link"]);
+    std::os::unix::fs::symlink(&shared, seed.join("link")).unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "use shared"]);
+    git(&seed, &["push", "-q", "origin", "master"]);
+    let w = env.dir.join("w");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), w.to_str().unwrap()]).ok();
+    assert!(w.join("link").symlink_metadata().unwrap().is_symlink());
+    // the collaborator drops `use shared`
+    git(&seed, &["reset", "-q", "--hard", "HEAD~1"]);
+    std::fs::write(seed.join("u"), "u\n").unwrap();
+    git(&seed, &["add", "u"]);
+    git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "u"]);
+    git(&seed, &["push", "-qf", "origin", "master"]);
+    env.j(&w, &["fetch"]).ok();
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "dir");
+    env.j(&w, &["describe \"mine\""]).ok();
+    assert!(shared.join("cache/x/tmp").is_dir());
+    assert!(w.join("link").symlink_metadata().unwrap().is_dir());
+    assert_eq!(std::fs::read_to_string(w.join("link/cache/x")).unwrap(), "x\n");
+}
+
+#[test]
 fn fetch_without_origin_is_exit_1() {
     let env = setup();
     let dir = uniq("plain");
