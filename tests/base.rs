@@ -413,10 +413,11 @@ fn inspection_definitions() {
     // meta of minted crashes
     let m = crash(&mut i, &cfg, "meta @", repo.clone());
     assert!(m.contains("stored commit") || m.contains("meta"), "{}", m);
-    // review with no difft falls to crash (difft not on PATH in tests)
+    // review renders the two changed paths with difft, or crashes saying
+    // difft cannot run; "no changes" is for a focus that changes nothing
     let r = ev(&mut i, &cfg, "review", repo.clone());
     match r {
-        Ok(v) => assert_eq!(v.as_text().unwrap(), "no changes\n"),
+        Ok(v) => assert_ne!(v.as_text().unwrap(), "no changes\n"),
         Err(m) => assert!(m.contains("difft"), "{}", m),
     }
 }

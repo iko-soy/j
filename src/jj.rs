@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, ThunkVal, Value};
 use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
@@ -1099,9 +1099,13 @@ extern "C" fn defer(sig: libc::c_int) {
 /// While it lives, SIGINT, SIGTERM, SIGHUP and SIGQUIT, whichever thread
 /// gets them, only note that they came: it lives from the operation's
 /// publishing until the working copy's state is saved, so that a checkout
-/// the user interrupts completes, leaving the working copy current (§1.3).
-/// Dropping it gives each signal back what it did before, and
-/// `raise_deferred` then acts on one that came.
+/// the user interrupts completes, leaving the working copy current, and
+/// through a clone, which one that comes before the working-copy commit is
+/// made fails (`unless_interrupted`), so that it removes what it made
+/// (§1.3). A signal the process ignores stays ignored, as it does for the
+/// git a clone runs (`nohup j clone`, a background job). Dropping it gives
+/// each signal back what it did before, and `raise_deferred` then acts on
+/// one that came.
 struct Deferral {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
@@ -1113,12 +1117,17 @@ impl Deferral {
             // SAFETY: the handler only stores to an atomic, which is
             // async-signal-safe; both actions are initialised before use
             unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                    || old.sa_sigaction == libc::SIG_IGN
+                {
+                    continue;
+                }
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = defer as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 action.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&mut action.sa_mask);
-                let mut old: libc::sigaction = std::mem::zeroed();
-                if libc::sigaction(sig, &action, &mut old) == 0 {
+                if libc::sigaction(sig, &action, std::ptr::null_mut()) == 0 {
                     previous.push((sig, old));
                 }
             }
@@ -1136,9 +1145,10 @@ impl Drop for Deferral {
     }
 }
 
-/// Act on a signal a checkout deferred (§1.3) as it would have acted then:
-/// with its default action, stopping the process, unless it was ignored.
-/// Called once the run has reported what it did.
+/// Act on a signal a checkout or a clone deferred (§1.3) as it would have
+/// acted then: with its default action, stopping the process (`Deferral`
+/// defers no signal the process ignores). Called once the run has reported
+/// what it did.
 pub fn raise_deferred() {
     let sig = DEFERRED.swap(0, std::sync::atomic::Ordering::SeqCst);
     if sig != 0 {
@@ -1147,6 +1157,20 @@ pub fn raise_deferred() {
         let _ = std::io::stdout().flush();
         // SAFETY: raising a signal whose action `Deferral` gave back
         unsafe { libc::raise(sig) };
+    }
+}
+
+/// `done`, the outcome of a step of a clone, unless a signal to stop came
+/// while `cmd_clone`'s `Deferral` held it off: the clone then fails, before
+/// it records anything, so that it removes what it made (§1.3, §7.8). A
+/// Ctrl-C at the terminal stops the git the step runs too, which fails the
+/// step itself: `j` may take the signal only after that, and then reports
+/// the step's failure.
+fn unless_interrupted<T>(done: Result<T, OpenError>) -> Result<T, OpenError> {
+    if DEFERRED.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        Err((1, "clone interrupted".to_string()))
+    } else {
+        done
     }
 }
 
@@ -1481,7 +1505,7 @@ impl JjBackend {
         interp: &mut Interp,
         cfg: &Config,
         loaded: &Value,
-        _current: &Value,
+        current: &Value,
         new: &Value,
         text: &str,
     ) -> Result<(), Crash> {
@@ -1531,6 +1555,9 @@ impl JjBackend {
             old_stored = Arc::new(vis);
         }
         let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
+        // the stored trees the program's commits were loaded with
+        let visible = self.inner.visible.lock().unwrap().clone();
+        let loaded_trees = LoadedTrees::new(visible.as_deref(), &[current, new])?;
         // shared across the whole persist walk so unchanged blobs are inflated once
         let cache = BlobCache::default();
         let entries = EntryCache::default();
@@ -1581,7 +1608,7 @@ impl JjBackend {
             let message = commit_v.field("message")?.as_text()?.to_string();
             let new_id = match old_stored.commits.get(&id) {
                 None => {
-                    let tree = block_on(build_tree(&store, &files_v.forced()?))?;
+                    let tree = loaded_trees.tree_to_write(&store, &files_v)?;
                     let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
                         Crash::new(format!("persistence: `{}` is not a valid change id", id))
                     })?;
@@ -1615,7 +1642,12 @@ impl JjBackend {
                         };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {
-                        let tree = block_on(build_tree(&store, &files_v.forced()?))?;
+                        // files the stored tree lists are written as it is
+                        let tree = if files_changed {
+                            loaded_trees.tree_to_write(&store, &files_v)?
+                        } else {
+                            stored_tree
+                        };
                         let c = block_on(
                             tx.repo_mut()
                                 .rewrite_commit(stored_commit)
@@ -1984,6 +2016,7 @@ impl JjBackend {
     }
 
     pub fn cmd_remote(&self, url: &str) -> Result<(), OpenError> {
+        let url = &origin_url(url)?;
         self.take_lock();
         let base = self.current_repo();
         let origin = RemoteName::new("origin");
@@ -2478,6 +2511,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
 
 pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     let settings = user_settings_strict(cfg)?;
+    let url = &origin_url(url)?;
     let dir_path = PathBuf::from(dir);
     if dir_path.join(".jj").is_dir() {
         return Err((2, format!("{} already contains a jj repository", dir)));
@@ -2507,6 +2541,10 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     // those of them a failed clone leaves, as their paths no longer lead
     // to them
     let mut left: Vec<&std::path::Path> = Vec::new();
+    // from here until the clone has removed what it made or completed, a
+    // signal to stop waits, and fails a clone that has not yet made its
+    // working-copy commit (`unless_interrupted`, §1.3)
+    let _held = Deferral::start();
     if !existed {
         // DIR and its missing parents, DIR first ("" is the current
         // directory, which exists)
@@ -2629,6 +2667,27 @@ fn left_note(left: &[&std::path::Path]) -> String {
     }
 }
 
+/// `url` as `origin` holds it (§7.8): a local path resolved against the
+/// current directory, as `jj git clone` stores it, for git resolves a
+/// relative one against the directory each later `fetch` or `push` runs
+/// in; any other URL, a `file://` one included, as given. One that does not
+/// parse is a usage error.
+fn origin_url(url: &str) -> Result<String, OpenError> {
+    let mut parsed = gix::url::parse(url).map_err(|e| (2, format!("invalid URL `{}`: {}", url, e)))?;
+    // a bare path is a file location in the alternative form
+    if parsed.scheme != gix::url::Scheme::File || !parsed.serialize_alternative_form {
+        return Ok(url.to_string());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| (2, format!("cannot read the current directory: {}", e)))?;
+    parsed
+        .canonicalize(&cwd)
+        .map_err(|e| (2, format!("cannot resolve `{}`: {}", url, e)))?;
+    // `add_remote` takes UTF-8, which only a current directory's name can
+    // break: such a path is stored as given
+    Ok(String::from_utf8(parsed.to_bstring().into()).unwrap_or_else(|_| url.to_string()))
+}
+
 /// `clone`'s work once `dir_path` exists and is empty (§7.8)
 fn clone_into(
     cfg: &Config,
@@ -2657,16 +2716,26 @@ fn clone_into(
     };
     let origin = RemoteName::new("origin");
     let mut tx = backend.current_repo().start_transaction();
-    jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
-        .map_err(|e| (1, format!("cannot set the remote: {}", e)))?;
-    backend.git_fetch_refs(tx.repo_mut(), origin)?;
-    let default_branch =
-        git_default_branch(git_backend(tx.repo().store())?.git_repo_path(), origin)?;
+    // a signal to stop fails each step before the working-copy commit's
+    // (§1.3)
+    unless_interrupted(
+        jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
+            .map_err(|e| (1, format!("cannot set the remote: {}", e))),
+    )?;
+    unless_interrupted(backend.git_fetch_refs(tx.repo_mut(), origin))?;
+    let default_branch = unless_interrupted(git_default_branch(
+        git_backend(tx.repo().store())?.git_repo_path(),
+        origin,
+    ))?;
     let import_options = backend.git_import_options()?;
-    block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
-        .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
-    block_on(tx.repo_mut().rebase_descendants())
-        .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
+    unless_interrupted(
+        block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+            .map_err(|e| (1, format!("cannot import the fetched refs: {}", e))),
+    )?;
+    unless_interrupted(
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| (1, format!("cannot rebase descendants: {}", e))),
+    )?;
     // §7.8: the default bookmark's target (none when the remote's HEAD names
     // no branch, or a branch it does not have)
     let head = default_branch.and_then(|name| {
@@ -2877,13 +2946,19 @@ fn git_fetch_subprocess(git_dir: &std::path::Path, remote: &RemoteName) -> Resul
     if out.status.success() {
         Ok(())
     } else {
-        Err((
-            1,
-            format!(
-                "fetch failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ))
+        Err((1, format!("fetch failed: {}", git_failure(&out))))
+    }
+}
+
+/// What a git that failed said, or how it ended when it said nothing (a
+/// Ctrl-C stops it silently)
+fn git_failure(out: &std::process::Output) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match (said.is_empty(), out.status.signal()) {
+        (false, _) => said,
+        (true, Some(sig)) => format!("git was stopped by signal {}", sig),
+        (true, None) => format!("git exited with status {}", out.status.code().unwrap_or(-1)),
     }
 }
 
@@ -2903,13 +2978,7 @@ fn git_default_branch(
         .output()
         .map_err(|e| (1, format!("cannot run git ls-remote: {}", e)))?;
     if !out.status.success() {
-        return Err((
-            1,
-            format!(
-                "cannot read the remote's default branch: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ));
+        return Err((1, format!("cannot read the remote's default branch: {}", git_failure(&out))));
     }
     // `ref: refs/heads/<branch>\tHEAD`
     Ok(String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
@@ -3513,6 +3582,58 @@ impl ConflictTreeValue {
     }
 }
 
+/// The stored trees a program's commits may still hold the files of, to
+/// write each such commit with the tree itself (§7.5 step 4). A list holds
+/// each conflict simplified (`merged_value_to_blob`), and the tree it was
+/// loaded from need not, so a tree built from the list could differ from
+/// the stored one where the files do not: a child `new` made would not be
+/// empty, as jj's own `new` leaves one.
+struct LoadedTrees<'a> {
+    /// the stored commits the program's repo was loaded from
+    visible: Option<&'a VisibleRepo>,
+    /// the lists the lazy `files` of the program's commits have loaded, by
+    /// identity: `c.files` takes the list out, so a commit given it, as
+    /// `new` gives its child its parent's, holds the list itself
+    lists: HashMap<(*const Vec<Value>, usize), Rc<ThunkVal>>,
+}
+
+impl<'a> LoadedTrees<'a> {
+    /// The trees `repos`' commits were loaded with; nothing is read
+    fn new(visible: Option<&'a VisibleRepo>, repos: &[&Value]) -> Result<LoadedTrees<'a>, Crash> {
+        let mut lists = HashMap::new();
+        for repo in repos {
+            for commit in crate::repo::all_commits(repo)? {
+                if let Value::Thunk(t) = crate::repo::files_of(&commit)? {
+                    if let (Some(_), Some(Value::List(list))) = (t.tree(), t.peek()) {
+                        lists.insert(list.identity(), t);
+                    }
+                }
+            }
+        }
+        Ok(LoadedTrees { visible, lists })
+    }
+
+    /// The tree to write for a commit whose files are `files`: where they
+    /// are still a list loaded from a stored tree, that tree as jj stored
+    /// it, and otherwise the one `build_tree` makes of them
+    fn tree_to_write(&self, store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
+        let loaded = match files {
+            Value::Thunk(t) => Some(t),
+            Value::List(list) => self.lists.get(&list.identity()),
+            _ => None,
+        };
+        if let Some(t) = loaded {
+            let stored = t.origin().zip(self.visible).and_then(|(id, vis)| vis.commits.get(id));
+            if let Some(tree) = stored.map(|rec| rec.commit.tree()) {
+                if t.tree() == Some(tree_name(&tree).as_str()) {
+                    return Ok(tree);
+                }
+            }
+        }
+        block_on(build_tree(store, &files.forced()?))
+    }
+}
+
 async fn build_tree(store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
     let entries = files
         .as_list()
@@ -3741,6 +3862,17 @@ async fn merged_value_to_blob(
     value: &jj_lib::backend::MergedTreeValue,
     cache: &BlobCache,
 ) -> Result<Value, Crash> {
+    // a conflict less each pair of sides that cancel, one added and one
+    // removed the same (§7.3), as jj simplifies a file conflict to write it
+    // out. jj keeps every term of a merge it cannot resolve, pairs that
+    // cancel included, so a replayed commit's conflict inherited from its
+    // parent was not the parent's, and each commit a rebase replayed above
+    // took two more sides for it. Where only directory sides would be left,
+    // the value is kept whole: jj keeps it as one conflict at the path, and
+    // the simplified one would be a conflict between directories, which jj
+    // merges entry by entry.
+    let simplified = (!value.is_resolved()).then(|| value.simplify()).filter(|v| !v.is_tree());
+    let value = simplified.as_ref().unwrap_or(value);
     if let Some(v) = value.as_resolved() {
         return match v {
             Some(tv) => tree_value_to_blob(store, path, tv).await,

@@ -1059,8 +1059,10 @@ and its parent.
 rendered by difftastic, one record per changed path. (Replace `difft` with
 `(\p -> diff)` to use the built-in unified diff instead.)
 
-**`review : Repo -> Text`** — the same, as one page of text. A `Text` result
-prints raw, so `j review` is readable in the terminal.
+**`review : Repo -> Text`** — the same, as one page of text, or
+`"no changes\n"` when the focus changes nothing. A `Text` result prints raw,
+so `j review` is readable in the terminal. Like `diffs`, it crashes when a
+change cannot be rendered, as when `difft` is not on `PATH`.
 
 ```
 j 'review'              -- the focus's changes, as difftastic renders them

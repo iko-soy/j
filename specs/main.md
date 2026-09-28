@@ -130,6 +130,15 @@ a power loss) leaves the operation recorded and the working directory
 partly updated, as a checkout that fails does: the next run carries on from
 there (§7.4), and `j undo` goes back.
 
+`clone` (§7.8) writes its directory from the start, so it holds the four
+signals off from creating it. One that comes while it creates the
+repository, fetches and imports lets the step in progress end (the git it
+runs, which a Ctrl-C at the terminal stops too), then fails the clone, which
+removes what it made, and then takes effect; one that comes later, once it
+makes the working-copy commit, waits for the clone to complete. A signal `j`
+was started ignoring (`nohup`, a background job) stays ignored, by the git
+it runs too.
+
 ### 1.4 Exit status
 
 | status | meaning |
@@ -877,7 +886,13 @@ some other value in its place.
   the list of path components; components must be valid UTF-8, and a
   repository with a path that is not exits 2. `content` is a `Blob` carrying the file's
   content and type (regular, executable, symlink) and, for conflicted paths,
-  jj's conflict value for that path. The entries' order carries no meaning,
+  jj's conflict value for that path, less each pair of sides that cancel (a
+  side added and one removed that are the same), as jj drops them to write
+  a file's conflict out. jj keeps such pairs in the conflicts of the trees
+  it merges; dropped here, a conflict a commit inherits unchanged reads as
+  its parent's. A conflict whose sides left would all be directories keeps
+  every side, as jj keeps it as one conflict at the path rather than one
+  between directories. The entries' order carries no meaning,
   as a tree has none: persistence (§1.2 step 8, §7.5), the laws of §8 and
   the tree's empty mark compare snapshots path by path, though `==` compares
   them as lists (§4.5).
@@ -895,7 +910,10 @@ some other value in its place.
   content, non-overlapping line-level hunks). A path unresolved in any of the
   three takes part with all its sides, as when jj rebases a conflicted commit,
   so sides that cancel drop out and a replay can resolve a conflict as well
-  as keep one. It never crashes on content, except where a file meets a
+  as keep one. A conflict it keeps has no pair of sides that cancel
+  (above), so in a stack replayed commit by commit, a conflict each commit
+  inherits is its parent's, whatever conflicts the commits below added. It
+  never crashes on content, except where a file meets a
   directory (below). It crashes if any of the three is not a well-formed
   snapshot (a list of `Entry` records with unique paths, none of them the
   root `./`, and none both a file and a directory as `./a` beside `./a/b`
@@ -1099,9 +1117,14 @@ refs, which only `fetch` and `push` change. The interpreter may run any part
 of the walk through jj-lib's rebase machinery provided the stored result
 equals what the steps above produce. As in §1.2 step 8, steps 3 and 4 may
 compare tree hashes rather than values: files still as loaded from a stored
-tree are that tree's. A persisting run then reads the files of the focus, of
-the commits it writes, and of those whose files it compares with a tree they
-were not loaded from, but not those of the rest of the history.
+tree are that tree's. Step 4 writes a commit whose files are still as
+loaded from a stored tree, its own or another's (`new` gives the child its
+parent's), with that tree as jj stored it, pairs of sides that cancel and
+conflict labels included (§7.3), as jj's own `new` and `describe` keep a
+tree: one built from the files could be another tree for the same files.
+A persisting run then reads the files of the focus, of the commits it
+writes with other files, and of those whose files it compares with a tree
+they were not loaded from, but not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 
@@ -1249,21 +1272,30 @@ that state, §7.2 applies.
   default bookmark target (or of the root commit if the remote has none),
   holding that target's files (see below), and checks it out. The default
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
-  checkout included, records nothing and removes the `DIR` it created and each
-  parent it created that is then empty, or empties the `DIR` it found empty,
-  and nothing else. It removes or empties each only while its path still
-  leads to that directory, so a symlink put in its place, or in place of a
-  directory above it, is not followed: a path that leads elsewhere is left,
-  and the error names it. It requires `user`.
+  checkout included, or that is interrupted while it fetches (§1.3), records
+  nothing and removes the `DIR` it created and each parent it created that is
+  then empty, or empties the `DIR` it found empty, and nothing else. It
+  removes or empties each only while its path still leads to that directory,
+  so a symlink put in its place, or in place of a directory above it, is not
+  followed: a path that leads elsewhere is left, and the error names it. It
+  requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
+`clone` and `remote` store a `URL` that is a local path (one with no scheme
+and no `host:` before its first `/`) as the absolute path it names from the
+current directory, symlinks resolved, as `jj git clone` does (`git clone`
+stores it absolute too), so that `fetch` and `push` reach it from wherever
+they run; any other `URL` is stored unresolved. A `URL` that cannot be
+parsed, or a path that cannot be resolved, is a usage error (exit 2) that
+changes nothing.
+
 Besides jj's own record of the new workspace, `init` and `clone` each record
-at most one operation, described `init` and `clone URL`, holding what they
-imported and the working-copy commit; `undo` never undoes it (§7.7). That
-commit holds its parent's files less any at a path a checkout cannot create
-(§7.5 step 1), such as a committed `.jj` directory: their removal is its
-change.
+at most one operation, described `init` and `clone URL` (`URL` as stored),
+holding what they imported and the working-copy commit; `undo` never undoes
+it (§7.7). That commit holds its parent's files less any at a path a
+checkout cannot create (§7.5 step 1), such as a committed `.jj` directory:
+their removal is its change.
 
 ### 7.9 Identity
 
@@ -2014,9 +2046,12 @@ diffs = \repo ->
   in map (\p -> { path = p, diff = difft p (contentAt p ch.from) (contentAt p ch.to) }) (touched ch)
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
--- readable in the terminal.
+-- readable in the terminal. A focus that changes nothing reads "no changes";
+-- a diff that cannot be rendered (no difft on PATH) is a crash saying so.
 review : Repo -> Text
-review = \repo -> concat (map (\d -> d.diff) (diffs repo)) or "no changes\n"
+review = \repo ->
+  let ds = diffs repo
+  in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
 -- A summary of the focus.
 status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }
