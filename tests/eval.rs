@@ -1044,3 +1044,121 @@ fn operator_as_function() {
     check!(i, cfg, "(.) not not true", Value::Bool(true));
     check!(i, cfg, "(::) 1 [2]", Value::list(vec![Value::int(1), Value::int(2)]));
 }
+
+/// The examples of a markdown file that document a result: the line each
+/// starts on, the expression, and the text after its `=>`. An example starts
+/// at column 0 in a fenced block (a `> ` quote stripped) and continues on the
+/// indented lines below it, and on a line starting `in`; its result follows
+/// `=>`, on its first line or an indented one, and continues on indented
+/// lines. A `--` comment outside a text literal is dropped.
+fn documented_results(md: &str) -> Vec<(usize, String, String)> {
+    fn split(line: &str) -> (String, Option<String>) {
+        let (mut in_text, mut escaped) = (false, false);
+        for (at, c) in line.char_indices() {
+            if in_text {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_text = false,
+                    _ => {}
+                }
+            } else if c == '"' {
+                in_text = true;
+            } else if line[at..].starts_with("--") {
+                return (line[..at].trim_end().to_string(), None);
+            } else if line[at..].starts_with("=>") {
+                let (rest, _) = split(&line[at + 2..]);
+                return (line[..at].trim_end().to_string(), Some(rest.trim().to_string()));
+            }
+        }
+        (line.trim_end().to_string(), None)
+    }
+    let mut out = Vec::new();
+    // the example being read: its line, expression, and result so far
+    let mut cur: Option<(usize, String, Option<String>)> = None;
+    let mut in_block = false;
+    for (n, raw) in md.lines().enumerate() {
+        let line = raw.strip_prefix("> ").unwrap_or(if raw == ">" { "" } else { raw });
+        let fence = line.trim_start().starts_with("```");
+        let empty = line.trim().is_empty();
+        let comment = line.trim_start().starts_with("--");
+        let continues = line.starts_with(' ') || line.starts_with("in ");
+        if fence {
+            in_block = !in_block;
+        }
+        // an example ends at a blank line, at the next one, and with its block
+        if !in_block || empty || !(comment || continues) {
+            if let Some((at, e, Some(r))) = cur.take() {
+                out.push((at, e, r));
+            }
+        }
+        if !in_block || fence || empty || comment {
+            continue;
+        }
+        let (text, result) = split(line);
+        match &mut cur {
+            None if !continues => cur = Some((n + 1, text, result)),
+            None => {}
+            Some((_, _, Some(r))) => {
+                r.push(' ');
+                r.push_str(text.trim());
+            }
+            Some((_, e, r)) => {
+                if !text.trim().is_empty() {
+                    e.push('\n');
+                    e.push_str(&text);
+                }
+                *r = result;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn documented_examples_evaluate_to_their_results() {
+    // docs/language.md listed two records side by side, `[{ id = 1 } { id = 2 }]`,
+    // as a list of two; it is one record updated by the other (§3.4), and
+    // `map (.id)` of it gave `[2]`, not the `[1 2]` documented. Each example
+    // that documents a value must evaluate to it. One whose result is prose
+    // (starting with a word that is no expression) or that names a commit
+    // by its id is not checked here.
+    let (mut i, cfg) = make_interp();
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    for (name, md) in [
+        ("docs/language.md", include_str!("../docs/language.md")),
+        ("docs/base.md", include_str!("../docs/base.md")),
+    ] {
+        for (line, expr, result) in documented_results(md) {
+            let got = ev(&mut i, &cfg, &expr);
+            let want = ev(&mut i, &cfg, &result);
+            let prose = result.starts_with(|c: char| c.is_alphabetic());
+            match (got, want) {
+                (Err(_), Err(_)) => {}
+                // an id names no commit here
+                (Err(e), _) if e == "id resolution" => {}
+                (Ok(_), Err(_)) if prose => {}
+                (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+                    wrong.push(format!("{}:{}: {} => {}: {}", name, line, expr, result, e))
+                }
+                (Ok(got), Ok(want)) => match value_eq(&got, &want) {
+                    Ok(true) => checked += 1,
+                    Ok(false) => wrong.push(format!(
+                        "{}:{}: {} => {}, not {}",
+                        name,
+                        line,
+                        expr,
+                        j::show::show(&i, &got).unwrap(),
+                        result
+                    )),
+                    // functions do not compare
+                    Err(_) => {}
+                },
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // the extraction still finds the examples
+    assert!(checked >= 150, "only {} examples checked", checked);
+}

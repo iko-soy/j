@@ -157,43 +157,6 @@ fn up_of(repo: &Value) -> Result<Value, Crash> {
     ]))
 }
 
-fn refocus_child(repo: &Value, child: &Value) -> Result<Value, Crash> {
-    let children = repo.field("children")?;
-    let children = children.as_list()?;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    let mut found = false;
-    // match by the child's root id: ids are unique per repo (§7.5 validates
-    // this at persist time), and a deep value_eq here would compare the whole
-    // subtree — files included — making by_id quadratic in history size
-    let want_id = id_of(&child.field("root")?).ok();
-    for c in children.iter() {
-        let same = match (&want_id, id_of(&c.field("root")?).ok()) {
-            (Some(w), Some(cid)) => *w == cid,
-            _ => value_eq(c, child)?,
-        };
-        if !found && same {
-            found = true;
-        } else if !found {
-            left.push(c.clone());
-        } else {
-            right.push(c.clone());
-        }
-    }
-    let frame = Value::record(&[
-        ("left", Value::list(left)),
-        ("parent", repo.field("root")?),
-        ("right", Value::list(right)),
-    ]);
-    let mut ctx = repo.field("context")?.as_list()?.to_vec();
-    ctx.insert(0, frame);
-    Ok(Value::record(&[
-        ("children", child.field("children")?),
-        ("context", Value::list(ctx)),
-        ("root", child.field("root")?),
-    ]))
-}
-
 // ----------------------------------------------------------------------
 // tree traversal helpers over Repo values
 // ----------------------------------------------------------------------
@@ -224,12 +187,16 @@ pub fn parent_map(repo: &Value) -> Result<Vec<(String, String)>, Crash> {
     Ok(out)
 }
 
-fn parent_map_rec(loc: &Value, out: &mut Vec<(String, String)>) -> Result<(), Crash> {
-    let pid = id_of(&loc.field("root")?)?;
-    let children = loc.field("children")?;
+/// `tree` is the top location or a subtree below it: only its `root` and
+/// `children` are read. Refocusing on each child instead copied the context
+/// at every level, which is quadratic in the depth of the history, in time
+/// and in what the walk holds at once.
+fn parent_map_rec(tree: &Value, out: &mut Vec<(String, String)>) -> Result<(), Crash> {
+    let pid = id_of(&tree.field("root")?)?;
+    let children = tree.field("children")?;
     for c in children.as_list()?.iter() {
         out.push((id_of(&c.field("root")?)?, pid.clone()));
-        parent_map_rec(&refocus_child(loc, c)?, out)?;
+        parent_map_rec(c, out)?;
     }
     Ok(())
 }
@@ -243,8 +210,14 @@ fn parent_map_rec(loc: &Value, out: &mut Vec<(String, String)>) -> Result<(), Cr
 /// entries a fileset matches first, so a `contract m` that moves nothing
 /// still reorders the parent's files, and comparing them as lists called
 /// that a change. Entries compare with `value_eq`, so lazy blobs still
-/// compare by content id without being read.
+/// compare by content id without being read, and two lists loaded from the
+/// same stored tree (`stored_tree`) are the same without either being read.
 pub fn snapshot_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
+    if let (Some(x), Some(y)) = (stored_tree(a), stored_tree(b)) {
+        if x == y {
+            return Ok(true);
+        }
+    }
     let (a, b) = (a.forced()?, b.forced()?);
     // not lists: no snapshots, left to validation to name (§7.5 step 1)
     let (Value::List(xs), Value::List(ys)) = (&a, &b) else {
@@ -284,6 +257,26 @@ pub fn snapshot_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
         }
     }
     Ok(true)
+}
+
+/// A commit's `files` as it holds them: a lazy list is not read.
+pub fn files_of(commit: &Value) -> Result<Value, Crash> {
+    if let Value::Record(m) = commit {
+        if let Some(files) = m.get("files") {
+            return Ok(files.clone());
+        }
+    }
+    commit.field("files")
+}
+
+/// The name of the stored tree `files` loads, read or not, while they are
+/// the list the backend built from it (`ThunkVal::tree`); `None` for a list
+/// the program built, even one with the same entries.
+pub fn stored_tree(files: &Value) -> Option<&str> {
+    match files {
+        Value::Thunk(t) => t.tree(),
+        _ => None,
+    }
 }
 
 fn entry_path(entry: &Value) -> Option<Vec<String>> {
@@ -420,8 +413,9 @@ fn validate_ids_and_snapshots(repo: &Value, seen: &mut BTreeSet<String>) -> Resu
     validate_tree(&top, seen)
 }
 
-fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> {
-    let root = loc.field("root")?;
+/// `tree` is the top location or a subtree below it, as in `parent_map_rec`
+fn validate_tree(tree: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> {
+    let root = tree.field("root")?;
     let id = id_of(&root)?;
     if !seen.insert(id.clone()) {
         return Err(Crash::new(format!(
@@ -429,7 +423,24 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
             id
         )));
     }
-    let files = root.field("files")?;
+    // a list loaded from a stored tree is a snapshot already: jj's tree
+    // holds each name once, and lists a path as a file or as a directory.
+    // Reading every commit's to check it made each persist read the files
+    // of the whole history
+    let files = files_of(&root)?;
+    if stored_tree(&files).is_none() {
+        validate_snapshot(&files.forced()?)?;
+    }
+    let children = tree.field("children")?;
+    for c in children.as_list()?.iter() {
+        validate_tree(c, seen)?;
+    }
+    Ok(())
+}
+
+/// unique paths, none of them the root `./`, none both a file and a
+/// directory (§7.5 step 1)
+fn validate_snapshot(files: &Value) -> Result<(), Crash> {
     let files = files.as_list()?;
     let mut paths = BTreeSet::new();
     for e in files {
@@ -451,10 +462,6 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
             "persistence: a snapshot has `{}` as both a file and a directory",
             p.join("/")
         )));
-    }
-    let children = loc.field("children")?;
-    for c in children.as_list()?.iter() {
-        validate_tree(&refocus_child(loc, c)?, seen)?;
     }
     Ok(())
 }
@@ -586,7 +593,8 @@ fn long_names(files: &Value) -> Result<BTreeSet<String>, Crash> {
 }
 
 /// Whether commit `new` holds the files commit `old` does. A commit record,
-/// or a lazy `files`, the two share is the same without the tree being read.
+/// or a lazy `files`, the two share, or lazy lists of one stored tree, are
+/// the same without the tree being read.
 fn same_files(old: &Value, new: &Value) -> Result<bool, Crash> {
     if let (Value::Record(a), Value::Record(b)) = (old, new) {
         if std::rc::Rc::ptr_eq(a, b) {
@@ -598,7 +606,7 @@ fn same_files(old: &Value, new: &Value) -> Result<bool, Crash> {
             }
         }
     }
-    snapshot_eq(&old.field("files")?, &new.field("files")?)
+    snapshot_eq(&files_of(old)?, &files_of(new)?)
 }
 
 fn label_set(repo: &Value) -> Result<BTreeSet<(String, String)>, Crash> {
@@ -675,7 +683,7 @@ fn validate_immutable(old: &Value, new: &Value, immutable: &BTreeSet<String>) ->
                 id
             )));
         }
-        if !snapshot_eq(&c.field("files")?, &nc.field("files")?)? {
+        if !snapshot_eq(&files_of(&c)?, &files_of(nc)?)? {
             return Err(Crash::new(format!(
                 "persistence: commit {} is immutable (files changed)",
                 id

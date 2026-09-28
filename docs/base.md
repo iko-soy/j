@@ -261,7 +261,7 @@ decides the result). Operands must be `Bool`.
 ```
 1 == 1 && 2 == 2        => true
 1 == 2 || 3 == 3        => true
-not (1 == 2)            => false
+not (1 == 2)            => true
 not true                => false
 ```
 
@@ -312,7 +312,7 @@ show "hi"               => "\"hi\""
 show [1 "a" true]       => "[1 \"a\" true]"
 show ({ x = 1 })        => "{ x = 1 }"
 show (describe "wip")   => "describe \"wip\""
-show (\x -> x + 1)      => "\x -> (x + 1)"
+show (\x -> x + 1)      => "\\x -> x + 1"
 ```
 
 ---

@@ -322,7 +322,9 @@ Notes:
   a `postfix` (an atom with selectors and updates): `[1 2 3]`,
   `["src" "lexer.rs"]`, `[{ root = c, children = [] }]`. An application or
   operator expression as an element is parenthesised: `[(up repo).root.id]`.
-  Records keep commas.
+  So is a record literal after another element, `[({ a = 1 }) ({ a = 2 })]`:
+  `[{ a = 1 } { a = 2 }]` is the one-element list `[{ a = 2 }]`, the first
+  record updated by the second. Records keep commas.
 - Lambda, `if`, `let`, and `or` extend as far right as possible.
 - Patterns are variables and `_` only. No literal, list, or record patterns.
 - Nesting is bounded: an expression more than 40,000 levels deep is a parse
@@ -1008,7 +1010,9 @@ Within it:
    (Any other path is neither checked out nor written with a name jj has not
    already stored, and a fetched branch can hold any name git can, even one
    above the focus that a snapshot rebases.) Violations crash with a message
-   naming the rule.
+   naming the rule. Files as loaded from a stored tree (§7.2) are such a
+   snapshot already, as a jj tree holds each name once and each path as a
+   file or as a directory, and are not checked again.
 2. **Validate labels.** The set of `(id, label)` pairs in `new` equals the set
    in `old`. Labels are the remote's names (§7.6); a script cannot add, move,
    or remove one. In particular a commit carrying a label cannot be abandoned.
@@ -1065,7 +1069,11 @@ Within it:
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
 of the walk through jj-lib's rebase machinery provided the stored result
-equals what the steps above produce.
+equals what the steps above produce. As in §1.2 step 8, steps 3 and 4 may
+compare tree hashes rather than values: files still as loaded from a stored
+tree are that tree's. A persisting run then reads the files of the focus, of
+the commits it writes, and of those whose files it compares with a tree they
+were not loaded from, but not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 
@@ -1215,7 +1223,10 @@ that state, §7.2 applies.
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
   checkout included, records nothing and removes the `DIR` it created and each
   parent it created that is then empty, or empties the `DIR` it found empty,
-  and nothing else. It requires `user`.
+  and nothing else. It removes or empties each only while its path still
+  leads to that directory, so a symlink put in its place, or in place of a
+  directory above it, is not followed: a path that leads elsewhere is left,
+  and the error names it. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 

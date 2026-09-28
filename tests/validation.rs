@@ -3,14 +3,19 @@
 use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
 use j::eval::Interp;
-use j::value::{Env, Value};
+use j::value::{Crash, Env, ThunkVal, Value};
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
 
 fn commit(id: &str, msg: &str, labels: &[&str], files: Vec<Value>) -> Value {
+    commit_holding(id, msg, labels, Value::list(files))
+}
+
+/// a commit whose `files` is `files` as given, lazy or not
+fn commit_holding(id: &str, msg: &str, labels: &[&str], files: Value) -> Value {
     Value::record(&[
-        ("files", Value::list(files)),
+        ("files", files),
         ("message", Value::text(msg)),
         (
             "labels",
@@ -557,6 +562,73 @@ fn snapshots_compare_path_by_path() {
     // a path listed twice is not a tree, and matches nothing else
     assert!(!eq(vec![a.clone(), a.clone()], vec![a.clone(), c.clone()]));
     assert!(!eq(vec![c.clone(), a.clone()], vec![a.clone(), a.clone()]));
+}
+
+/// `files` as the jj backend loads them from the stored tree `tree` of
+/// commit `id`, holding `entries`
+fn stored_tree(id: &str, tree: &str, entries: Vec<Value>) -> Value {
+    let tree = Some(tree.to_string());
+    Value::Thunk(Rc::new(ThunkVal::stored(id.to_string(), tree, move || Ok(Value::list(entries)))))
+}
+
+/// `files` loaded from the stored tree `tree` of commit `id`, which cannot
+/// be read: forcing them crashes
+fn unreadable_tree(id: &str, tree: &str) -> Value {
+    let tree = Some(tree.to_string());
+    Value::Thunk(Rc::new(ThunkVal::stored(id.to_string(), tree, || {
+        Err(Crash::new("read a stored tree"))
+    })))
+}
+
+#[test]
+fn snapshots_left_as_stored_are_not_read() {
+    // persisting `describe` read the files of every commit in the history:
+    // validation checked each snapshot's paths and compared each immutable
+    // commit's with `old`, entry by entry: over a minute (a debug build) for
+    // 2,500 commits of 3,000 files. A snapshot loaded from a stored tree is one
+    // (§7.3), and two loaded from the same tree are the same. A dirty
+    // working copy's snapshot loads the history afresh, so each repo here
+    // has lazy lists of its own
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let frame = |parent: Value| {
+        Value::record(&[
+            ("left", Value::list(vec![])),
+            ("parent", parent),
+            ("right", Value::list(vec![])),
+        ])
+    };
+    // root -> m (main, so immutable) -> a -> f, the focus
+    let repo = |m_files: Value, message: &str| {
+        let m = commit_holding("kmmmmmmm", "m", &["main"], m_files);
+        let a = commit_holding("kaaaaaaa", "a", &[], unreadable_tree("kaaaaaaa", "ta"));
+        Value::record(&[
+            ("children", Value::list(vec![])),
+            ("context", Value::list(vec![frame(a), frame(m), frame(root.clone())])),
+            ("root", commit("kfffffff", message, &[], vec![entry("f", "1")])),
+        ])
+    };
+    let mut i = make_interp(backend_with(&["kmmmmmmm", "kaaaaaaa", "kfffffff"]));
+    let mut check = |old: &Value, new: &Value| {
+        *i.old_repo.borrow_mut() = Some(old.clone());
+        j::repo::validate_repo(&mut i, new).map(|_| ()).map_err(|c| c.msg)
+    };
+    let old = repo(unreadable_tree("kmmmmmmm", "tm"), "f");
+    let same = repo(unreadable_tree("kmmmmmmm", "tm"), "f");
+    assert!(j::repo::same_repo(&old, &same).unwrap());
+    let described = repo(unreadable_tree("kmmmmmmm", "tm"), "described");
+    assert!(!j::repo::same_repo(&old, &described).unwrap());
+    assert_eq!(check(&old, &described), Ok(()));
+    // loaded from another tree, the files are read and compared: the same
+    // files are unchanged, and other files of an immutable commit refused
+    let old = repo(stored_tree("kmmmmmmm", "tm", vec![entry("m", "1")]), "f");
+    let relisted = repo(stored_tree("kmmmmmmm", "tm2", vec![entry("m", "1")]), "described");
+    assert_eq!(check(&old, &relisted), Ok(()));
+    let edited = repo(stored_tree("kmmmmmmm", "tm2", vec![entry("m", "2")]), "described");
+    let e = check(&old, &edited).unwrap_err();
+    assert!(e.contains("immutable (files changed)"), "{}", e);
+    let listed = repo(Value::list(vec![entry("m", "2")]), "described");
+    let e = check(&old, &listed).unwrap_err();
+    assert!(e.contains("immutable (files changed)"), "{}", e);
 }
 
 #[test]
