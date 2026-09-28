@@ -687,6 +687,68 @@ async fn save_scan(
     locked_ws.finish(op_id).await.map_err(|e| e.to_string())
 }
 
+/// The signal that asked the run to stop while its checkout was not to be
+/// cut short (`Deferral`), or 0
+static DEFERRED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn defer(sig: libc::c_int) {
+    DEFERRED.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// While it lives, SIGINT, SIGTERM, SIGHUP and SIGQUIT, whichever thread
+/// gets them, only note that they came: it lives from the operation's
+/// publishing until the working copy's state is saved, so that a checkout
+/// the user interrupts completes, leaving the working copy current (§1.3).
+/// Dropping it gives each signal back what it did before, and
+/// `raise_deferred` then acts on one that came.
+struct Deferral {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Deferral {
+    fn start() -> Deferral {
+        let mut previous = Vec::new();
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            // SAFETY: the handler only stores to an atomic, which is
+            // async-signal-safe; both actions are initialised before use
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = defer as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &action, &mut old) == 0 {
+                    previous.push((sig, old));
+                }
+            }
+        }
+        Deferral { previous }
+    }
+}
+
+impl Drop for Deferral {
+    fn drop(&mut self) {
+        for (sig, old) in &self.previous {
+            // SAFETY: `old` is the action `sigaction` gave back for `sig`
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// Act on a signal a checkout deferred (§1.3) as it would have acted then:
+/// with its default action, stopping the process, unless it was ignored.
+/// Called once the run has reported what it did.
+pub fn raise_deferred() {
+    let sig = DEFERRED.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if sig != 0 {
+        // a process a signal stops does not flush what it printed
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        // SAFETY: raising a signal whose action `Deferral` gave back
+        unsafe { libc::raise(sig) };
+    }
+}
+
 /// `commit` with `tree` in place of its own, for the working copy to read:
 /// a checkout and a reset read only a commit's tree. It is never written.
 fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
@@ -1294,6 +1356,8 @@ impl JjBackend {
                     .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?,
             }
         }
+        // from here until the state is saved, a signal to stop waits
+        let _deferral = Deferral::start();
         let published = op.is_some();
         let op_id = match op {
             None => self.current_repo().operation().id().clone(),

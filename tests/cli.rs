@@ -899,10 +899,12 @@ fn stopped_mid_checkout(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce()
 
 /// `stopped_mid_checkout`, calling `meanwhile` with the stopped process's
 /// id, which may signal it. The process ignores SIGXFSZ, so that a write
-/// past a file size limit set on it fails (EFBIG) rather than killing it.
+/// past a file size limit set on it fails (EFBIG) rather than killing it,
+/// and dumps no core. A process a signal ended has as its code minus that
+/// signal's number.
 #[cfg(target_os = "linux")]
 fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce(libc::pid_t)) -> Out {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     let mut command = Command::new(j_bin());
     command
         .arg(edit)
@@ -915,6 +917,7 @@ fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnc
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
             Ok(())
         });
     }
@@ -948,7 +951,7 @@ fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnc
         std::panic::resume_unwind(e);
     }
     Out {
-        code: out.status.code().unwrap_or(-1),
+        code: out.status.code().unwrap_or_else(|| -out.status.signal().unwrap()),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
     }
@@ -1019,7 +1022,7 @@ fn an_interrupted_checkout_is_carried_on_by_the_next_run() {
         r.write("mine.txt", "mine\n");
         unsafe { libc::kill(pid, libc::SIGKILL) };
     });
-    assert_eq!(out.code, -1, "{}", out.stderr);
+    assert_eq!(out.code, -libc::SIGKILL, "{}", out.stderr);
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     assert!(in_m(&r) < n);
     assert_eq!(r.read("work.txt"), "my work, edited\n");
@@ -1041,6 +1044,47 @@ fn an_interrupted_checkout_is_carried_on_by_the_next_run() {
     assert_eq!(r.read("mine.txt"), "mine\n");
     r.j(&["id"]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_checkout_asked_to_stop_completes_before_the_run_stops() {
+    // §1.3: with the operation recorded before its checkout, a run stopped
+    // part way through the checkout by Ctrl-C (SIGINT), SIGTERM, SIGHUP or
+    // SIGQUIT left the working directory holding neither the old focus nor
+    // the new one. Such a signal now waits until the checkout and the
+    // working copy's state are saved, and then stops the run as it would
+    // have: the directory holds the focus, and nothing is left to carry on.
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        let r = setup();
+        r.write("keep.txt", "k\n");
+        r.j(&["describe \"base\""]).ok();
+        r.j(&["new"]).ok();
+        r.write("work.txt", "my work\n");
+        r.j(&["describe \"W\""]).ok();
+        r.write("work.txt", "my work, edited\n");
+        let ops = r.j(&["ops"]).ok().stdout.lines().count();
+        let n = 2000;
+        // S, a new child of base: the checkout removes `work.txt` after it
+        // has written `m`
+        let edit = format!("describe \"S\" . ({}) . new . prev", slow_edit("c.files", n));
+        let out = stopped_mid_checkout_as(&r, &edit, n, |pid| {
+            assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+        });
+        assert_eq!(out.code, -sig, "signal {}: {}", sig, out.stderr);
+        assert_eq!(in_m(&r), n, "signal {}", sig);
+        assert_eq!(r.read("zz"), "z\n");
+        assert!(!r.dir.join("work.txt").exists());
+        assert_eq!(r.read("keep.txt"), "k\n");
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+        r.j(&["id"]).ok();
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1, "signal {}", sig);
+        let texts = r.j(&[&texts_by_message(&["[\"work.txt\"]"], &["W"])]).ok().stdout;
+        assert_eq!(
+            texts.split_whitespace().collect::<Vec<_>>().join(" "),
+            r#"[["my work, edited\n"]]"#
+        );
+    }
 }
 
 #[test]

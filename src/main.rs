@@ -107,12 +107,16 @@ fn main() -> ExitCode {
     // evaluation builds deep continuation chains (trampolined, but the final
     // continuation still tears down by recursive Drop), so run the real work
     // on a thread with a large stack to keep very deep histories safe
-    std::thread::Builder::new()
+    let code = std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
         .spawn(run)
         .expect("failed to spawn worker thread")
         .join()
-        .expect("worker thread panicked")
+        .expect("worker thread panicked");
+    // §1.3: a signal to stop that came while the working copy was checked
+    // out takes effect now, once the run has said what it had to
+    j::jj::raise_deferred();
+    code
 }
 
 /// True when stdin has input (or end-of-input) waiting within `ms`
