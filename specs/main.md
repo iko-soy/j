@@ -1122,9 +1122,14 @@ loaded from a stored tree, its own or another's (`new` gives the child its
 parent's), with that tree as jj stored it, pairs of sides that cancel and
 conflict labels included (§7.3), as jj's own `new` and `describe` keep a
 tree: one built from the files could be another tree for the same files.
-A persisting run then reads the files of the focus, of the commits it
-writes with other files, and of those whose files it compares with a tree
-they were not loaded from, but not those of the rest of the history.
+For the same reason a commit step 4 writes whose files are its parent's,
+as `squash`, `rebase` or `abandon` can leave a commit whose files they
+build anew, is written with the parent's tree, labels included, as jj's
+own `squash` or `rebase` leaves a commit it empties: jj takes a commit for
+empty only where its tree is its parent's. A persisting run then reads the
+files of the focus, of the commits it writes with other files, and of
+those whose files it compares with a tree they were not loaded from, but
+not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 

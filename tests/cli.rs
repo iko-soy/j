@@ -3893,6 +3893,92 @@ fn a_conflict_jj_merged_reads_without_the_sides_that_cancel_and_keeps_its_tree()
 }
 
 #[test]
+fn a_commit_left_with_its_parents_files_is_written_with_the_parents_tree() {
+    // `squash`, `rebase` and `abandon` build a commit's files anew, and a
+    // tree built from them holds each conflict less the sides that cancel.
+    // Where the parent is a tree jj merged, which keeps them, the child
+    // left with its parent's files got another tree for them: jj took it
+    // for a change at every conflicted path, `tree` did not mark it empty,
+    // and the checkout rewrote the conflict files without jj's labels
+    // (§7.5). Here the parent is made only with `j`: the snapshot rebases
+    // the stack onto its edited base as jj does
+    let named = |m: &str| format!("(matching (\\c -> c.message == \"{}\") all)", m);
+    let r = setup();
+    r.write("a", "a1\na2\na3\n");
+    r.write("b", "b1\nb2\nb3\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "a1\nA2 one\na3\n");
+    r.j(&["describe \"one\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("b", "b1\nB2 two\nb3\n");
+    r.j(&["describe \"two\""]).ok();
+    r.j(&[&format!("goto {}", named("B"))]).ok();
+    r.write("a", "a1\nA2 B\na3\n");
+    r.write("b", "b1\nB2 B\nb3\n");
+    r.j(&["id"]).ok();
+    let two = format!("head ({} r)", named("two"));
+    let stored = jj_commit(&r, &jj_repo(&r), &two).tree_ids().clone();
+    assert_eq!(stored.iter().count(), 5);
+    // the commit `id` names holds two's tree, and jj takes it for empty
+    let empty_on_two = |id: &str, what: &str| {
+        let repo = jj_repo(&r);
+        let c = jj_commit(&r, &repo, id);
+        assert_eq!(jj_commit(&r, &repo, &two).tree_ids(), &stored, "{}", what);
+        assert_eq!(c.tree_ids(), &stored, "{}", what);
+        assert!(pollster::block_on(c.is_empty(repo.as_ref())).unwrap(), "{}", what);
+        assert_eq!(r.j(&[&format!("\\r -> show (changed (by ({}) r))", id)]).ok().stdout.trim(), "[]");
+    };
+    // squash: two is rewritten with its own files, and the new focus on it
+    // holds them
+    r.j(&[&format!("goto {}", named("two"))]).ok();
+    r.j(&["new"]).ok();
+    let labelled = r.read("a");
+    assert!(labelled.contains("\"two\" (rebased revision)"), "{}", labelled);
+    r.j(&["squash"]).ok();
+    empty_on_two("r.root.id", "squash");
+    assert_eq!(r.read("a"), labelled);
+    // squash into one, whose tree of three terms the list builds again with
+    // the same ones but no labels: the new focus keeps jj's labels too
+    r.j(&[&format!("new . goto {}", named("one"))]).ok();
+    let labelled = r.read("a");
+    assert!(labelled.contains("\"one\" (rebased revision)"), "{}", labelled);
+    r.j(&["squash"]).ok();
+    let repo = jj_repo(&r);
+    let one = jj_commit(&r, &repo, "(up r).root.id").tree();
+    assert_eq!(one.tree_ids().iter().count(), 3);
+    assert_eq!(jj_commit(&r, &repo, "r.root.id").tree().tree_ids_and_labels(), one.tree_ids_and_labels());
+    assert_eq!(r.read("a"), labelled);
+    // rebase: an empty commit replayed onto two
+    r.j(&[&format!("new . goto {}", named("B"))]).ok();
+    r.j(&["describe \"empty\""]).ok();
+    r.j(&[&format!("rebase {}", named("two"))]).ok();
+    empty_on_two("r.root.id", "rebase");
+    // abandon: Y, empty, replayed from X onto two
+    r.j(&[&format!("new . goto {}", named("two"))]).ok();
+    r.write("c", "c\n");
+    r.j(&["describe \"X\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"Y\""]).ok();
+    r.j(&[&format!("goto {}", named("X"))]).ok();
+    r.j(&["abandon"]).ok();
+    empty_on_two(&format!("head ({} r)", named("Y")), "abandon");
+    // a squash that changes the parent's files gives it a tree of its own,
+    // which the new focus holds
+    r.j(&[&format!("new . goto {}", named("two"))]).ok();
+    r.write("d", "d\n");
+    r.j(&["squash"]).ok();
+    let repo = jj_repo(&r);
+    let c = jj_commit(&r, &repo, "r.root.id");
+    let parent = jj_commit(&r, &repo, "(up r).root.id").tree_ids().clone();
+    assert_ne!(parent, stored);
+    assert_eq!(c.tree_ids(), &parent);
+    assert!(pollster::block_on(c.is_empty(repo.as_ref())).unwrap());
+    let parent_files = "\\r -> show (map (.path) (files (up r)))";
+    assert_eq!(r.j(&[parent_files]).ok().stdout.trim(), "[[\"a\"] [\"b\"] [\"d\"]]");
+}
+
+#[test]
 fn a_conflict_whose_sides_left_are_directories_keeps_its_files() {
     // a conflict at `d` whose file sides cancel, leaving directories only.
     // jj keeps it as one conflict at the path; without its file sides it

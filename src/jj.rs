@@ -1608,7 +1608,8 @@ impl JjBackend {
             let message = commit_v.field("message")?.as_text()?.to_string();
             let new_id = match old_stored.commits.get(&id) {
                 None => {
-                    let tree = loaded_trees.tree_to_write(&store, &files_v)?;
+                    let tree =
+                        loaded_trees.tree_to_write(tx.repo(), &files_v, std::slice::from_ref(&parent_jj))?;
                     let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
                         Crash::new(format!("persistence: `{}` is not a valid change id", id))
                     })?;
@@ -1644,7 +1645,7 @@ impl JjBackend {
                     if parent_changed || files_changed || msg_changed {
                         // files the stored tree lists are written as it is
                         let tree = if files_changed {
-                            loaded_trees.tree_to_write(&store, &files_v)?
+                            loaded_trees.tree_to_write(tx.repo(), &files_v, std::slice::from_ref(&parent_jj))?
                         } else {
                             stored_tree
                         };
@@ -3613,10 +3614,16 @@ impl<'a> LoadedTrees<'a> {
         Ok(LoadedTrees { visible, lists })
     }
 
-    /// The tree to write for a commit whose files are `files`: where they
-    /// are still a list loaded from a stored tree, that tree as jj stored
-    /// it, and otherwise the one `build_tree` makes of them
-    fn tree_to_write(&self, store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
+    /// The tree to write for a commit on `parents` whose files are `files`:
+    /// where they are still a list loaded from a stored tree, that tree as
+    /// jj stored it, and otherwise the one `build_tree` makes of them; but
+    /// where either lists the parents' files, the parents' tree
+    fn tree_to_write(&self, repo: &dyn Repo, files: &Value, parents: &[CommitId]) -> Result<MergedTree, Crash> {
+        let tree = self.tree_of(repo.store(), files)?;
+        Ok(block_on(parents_tree_if_same(repo, parents, tree)))
+    }
+
+    fn tree_of(&self, store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
         let loaded = match files {
             Value::Thunk(t) => Some(t),
             Value::List(list) => self.lists.get(&list.identity()),
@@ -3632,6 +3639,47 @@ impl<'a> LoadedTrees<'a> {
         }
         block_on(build_tree(store, &files.forced()?))
     }
+}
+
+/// The tree of `parents`, merged where there are several, as jj's emptiness
+/// takes it, where it lists the files `tree` lists, and otherwise `tree`
+/// (§7.5 step 4). A list holds each conflict less the sides that cancel
+/// (§7.3), and a tree built from it holds no labels, where a tree jj merged
+/// keeps both; so a commit left with its parent's files by `squash`,
+/// `rebase` or `abandon`, which build the files anew, got another tree for
+/// them: jj took it for a change at each conflicted path, the tree's empty
+/// mark (`is_empty`) did not show, and the checkout wrote the conflicts
+/// again with generic labels. Files with no conflict make one tree, so a
+/// resolved parents' tree is not compared, nor one of the same ids, and the
+/// comparison stops at the first path where the two differ. It only
+/// chooses between two trees for the same files, so where the parents'
+/// cannot be read, it is `tree`.
+async fn parents_tree_if_same(repo: &dyn Repo, parents: &[CommitId], tree: MergedTree) -> MergedTree {
+    let mut commits = Vec::with_capacity(parents.len());
+    for id in parents {
+        match repo.store().get_commit_async(id).await {
+            Ok(commit) => commits.push(commit),
+            Err(_) => return tree,
+        }
+    }
+    let Ok(parents_tree) = jj_lib::rewrite::merge_commit_trees(repo, &commits).await else {
+        return tree;
+    };
+    // the same terms: the parents' tree, with jj's labels for them
+    if parents_tree.tree_ids() == tree.tree_ids() {
+        return parents_tree;
+    }
+    if parents_tree.tree_ids().is_resolved() {
+        return tree;
+    }
+    let mut diff = parents_tree.diff_stream(&tree, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        match entry.values {
+            Ok(Diff { before, after }) if value_as_read(&before) == value_as_read(&after) => {}
+            _ => return tree,
+        }
+    }
+    parents_tree
 }
 
 async fn build_tree(store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
@@ -3856,23 +3904,32 @@ async fn conflict_side(
     }
 }
 
+/// The value a list reads where a tree holds `value` (§7.3): a conflict less
+/// each pair of sides that cancel, one added and one removed the same, as jj
+/// simplifies a file conflict to write it out. jj keeps every term of a
+/// merge it cannot resolve, pairs that cancel included, so a replayed
+/// commit's conflict inherited from its parent was not the parent's, and
+/// each commit a rebase replayed above took two more sides for it. Where
+/// only directory sides would be left, the value is kept whole: jj keeps it
+/// as one conflict at the path, and the simplified one would be a conflict
+/// between directories, which jj merges entry by entry. Two values read
+/// the same are the same entry of a list.
+fn value_as_read(value: &MergedTreeValueT) -> std::borrow::Cow<'_, MergedTreeValueT> {
+    match (!value.is_resolved()).then(|| value.simplify()).filter(|v| !v.is_tree()) {
+        Some(simplified) => std::borrow::Cow::Owned(simplified),
+        None => std::borrow::Cow::Borrowed(value),
+    }
+}
+
 async fn merged_value_to_blob(
     store: &Arc<Store>,
     path: &RepoPath,
     value: &jj_lib::backend::MergedTreeValue,
     cache: &BlobCache,
 ) -> Result<Value, Crash> {
-    // a conflict less each pair of sides that cancel, one added and one
-    // removed the same (§7.3), as jj simplifies a file conflict to write it
-    // out. jj keeps every term of a merge it cannot resolve, pairs that
-    // cancel included, so a replayed commit's conflict inherited from its
-    // parent was not the parent's, and each commit a rebase replayed above
-    // took two more sides for it. Where only directory sides would be left,
-    // the value is kept whole: jj keeps it as one conflict at the path, and
-    // the simplified one would be a conflict between directories, which jj
-    // merges entry by entry.
-    let simplified = (!value.is_resolved()).then(|| value.simplify()).filter(|v| !v.is_tree());
-    let value = simplified.as_ref().unwrap_or(value);
+    // the conflict less the sides that cancel (§7.3)
+    let read = value_as_read(value);
+    let value = read.as_ref();
     if let Some(v) = value.as_resolved() {
         return match v {
             Some(tv) => tree_value_to_blob(store, path, tv).await,
