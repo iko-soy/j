@@ -968,14 +968,15 @@ directory.
   file the commit deletes, say), and one where the directory holds what
   the commit does is the commit's (what a checkout cut short had written).
   Either way, where the record does not hold one of the commit's
-  conflicts, a file holding exactly what a checkout writes for it, its
-  markers or its description, is read back as that conflict. With no
-  change there is nothing to snapshot, and a program that persists writes
-  the focus over the files last checked out as usual. A checkout over a
-  stale working copy first removes each tree of empty directories where it
-  writes a file, such as one a failed checkout made for a path it did not
-  reach: a checkout writes no file over a directory. A stale working copy
-  refuses no program.
+  conflicts, a file holding what a checkout writes for it is read back as
+  that conflict: exactly its markers, or a description of the same sides,
+  whatever their labels and less any side it both removes and adds. With
+  no change there is nothing to snapshot, and a program that persists
+  writes the focus over the files last checked out as usual. A checkout
+  over a stale working copy first removes each tree of empty directories
+  where it writes a file, such as one a failed checkout made for a path it
+  did not reach: a checkout writes no file over a directory. A stale
+  working copy refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.

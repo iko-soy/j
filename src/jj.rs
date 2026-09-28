@@ -689,15 +689,16 @@ async fn snapshot_tree(
     .map_err(err)
 }
 
-/// `scanned` with the commit's conflict at each path the working-copy
-/// state records something else at, where the file holds exactly what jj's
-/// checkout writes for that conflict: its markers, or its description where
-/// a side is no file (§7.4). A checkout records the conflict in the state
-/// as it writes the file, so a scan reads such a file back as the conflict;
-/// one cut short, or one over a stale state, records nothing, nor does a
-/// state made again where it was lost, and the scan reads the file as the
-/// text it holds. Each of the commit's conflicts is looked at, and a file
-/// read, only where neither the state nor the scan has the conflict.
+/// `scanned` with the commit's conflict at each path the working-copy state
+/// records something else at, where the file holds what jj's checkout
+/// writes for that conflict (`holds_written`): its markers, or its
+/// description where a side is no file (§7.4). A checkout records the
+/// conflict in the state as it writes the file, so a scan reads such a file
+/// back as the conflict; one cut short, or one over a stale state, records
+/// nothing, nor does a state made again where it was lost, and the scan
+/// reads the file as the text it holds. Each of the commit's conflicts is
+/// looked at, and a file read, only where neither the state nor the scan
+/// has the conflict.
 async fn conflicts_written(
     root: &std::path::Path,
     markers: ConflictMarkerStyle,
@@ -729,9 +730,12 @@ async fn conflicts_written(
     tree.write_tree().await.map_err(err)
 }
 
-/// Whether `disk`, the file at `path`, holds exactly what a checkout writes
-/// there for the conflict `value`, compared byte for byte (j's settings
-/// convert no line endings); nothing is written to the store
+/// Whether `disk`, the file at `path`, holds what a checkout writes there
+/// for the conflict `value`: exactly its markers, compared byte for byte
+/// (j's settings convert no line endings), or, where a side is no file, a
+/// description of the same sides, whatever their labels and less any it
+/// both removes and adds, as a scan reads one back (`files_on_conflicts`);
+/// nothing is written to the store
 async fn holds_written(
     store: &Arc<Store>,
     path: &RepoPath,
@@ -741,25 +745,30 @@ async fn holds_written(
     disk: &std::path::Path,
 ) -> Result<bool, String> {
     use jj_lib::conflicts::{self, MaterializedTreeValue};
-    let Ok(meta) = disk.symlink_metadata() else {
+    let Some(meta) = disk.symlink_metadata().ok().filter(|meta| meta.is_file()) else {
         return Ok(false);
     };
     let written = conflicts::materialize_tree_value(store, path, value, labels)
         .await
         .map_err(|e| e.to_string())?;
-    let bytes: Vec<u8> = match written {
+    match written {
         MaterializedTreeValue::FileConflict(file) => {
             let options = conflicts::ConflictMaterializeOptions {
                 marker_style: markers,
                 marker_len: Some(conflicts::choose_materialized_conflict_marker_len(&file.contents)),
                 merge: store.merge_options().clone(),
             };
-            conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into()
+            let bytes: Vec<u8> =
+                conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into();
+            Ok(meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
         }
-        MaterializedTreeValue::OtherConflict { id, labels } => id.describe(&labels).into_bytes(),
-        _ => return Ok(false),
-    };
-    Ok(meta.is_file() && meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
+        MaterializedTreeValue::OtherConflict { id, .. } => {
+            let unlabelled = id.describe(&jj_lib::conflict_labels::ConflictLabels::unlabeled());
+            let terms = described_terms(unlabelled.as_bytes());
+            Ok(terms.is_some() && std::fs::read(disk).is_ok_and(|b| described_terms(&b) == terms))
+        }
+        _ => Ok(false),
+    }
 }
 
 /// How the working copy writes a conflict, as `settings` say

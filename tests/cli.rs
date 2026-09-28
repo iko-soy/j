@@ -2337,6 +2337,17 @@ fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_c
     r.write("b", &description);
     r.j(&["id"]).ok();
     assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    // and so is it where the working-copy state is lost, and made again
+    // recording no file: nothing is recorded, and `undo` does not refuse
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    std::fs::remove_file(r.dir.join(".jj/working_copy/tree_state")).unwrap();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    r.j(&["redo"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
     // anything else written over it is recorded
     r.write("b", "mine\n");
     r.j(&["describe \"D\""]).ok();
