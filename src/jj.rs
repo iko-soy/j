@@ -11,13 +11,11 @@ use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
-use jj_lib::merged_tree::{MergedTree, TreeDiffEntry};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::backend::{CommitId, FileId, MergedTreeValueExt, TreeId};
 use jj_lib::object_id::ObjectId;
@@ -32,7 +30,7 @@ use jj_lib::transaction::UnpublishedOperation;
 use jj_lib::working_copy::{LockedWorkingCopy, SnapshotError, SnapshotOptions};
 use jj_lib::workspace::Workspace;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -282,17 +280,17 @@ pub struct FileLock(#[allow(dead_code)] std::fs::File);
 struct PendingSnapshot {
     /// repo as loaded at head, before the snapshot
     pre_repo: Arc<ReadonlyRepo>,
-    /// the snapshot's rewritten wc commit and tree, to be folded into the
+    /// the snapshot's tree for the wc commit, to be folded into the
     /// persisting operation (§1.2 step 8, §7.7)
-    new_wc_id: CommitId,
     tree: MergedTree,
     /// false when the wc commit is immutable: the snapshot then belongs to
     /// the focus's new child (§7.2), and the wc commit is kept as stored
     fold_into_wc: bool,
-    /// the repo at the snapshot's own operation, written but not published:
-    /// a failed checkout that cannot be put back publishes it alone (§7.5
-    /// step 7, `JjBackend::record_snapshot`)
-    repo: Arc<ReadonlyRepo>,
+    /// the tree the scan found in the working directory, which `persist`'s
+    /// checkout starts from: `tree` itself, unless the working copy was
+    /// stale and `tree` merges the directory's changes onto the commit
+    /// (`snapshot_tree`)
+    scanned: MergedTree,
 }
 
 /// How every scan of the working directory reads it (§7.4): each file
@@ -469,7 +467,7 @@ fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<Files
         if !below_dirs || value.to_file_merge().is_some() {
             continue;
         }
-        // what jj's checkout writes for it, as `holds_written` compares
+        // what jj's checkout writes for it (§7.4)
         let written = value.describe(tree.labels());
         let Ok(disk) = path.to_fs_path(root) else {
             continue;
@@ -486,428 +484,77 @@ fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<Files
     Ok(files)
 }
 
-/// Why a run is refused over a stale working copy whose directory has
-/// changed from `state`, the tree its working-copy state records, to
-/// `scanned` (§7.4), naming the first few of the paths it changed and what
-/// to do: set the changes aside so that the directory holds `state` again,
-/// which a persisting run checks the focus out from, then bring them back
-async fn stale_message(state: &MergedTree, scanned: &MergedTree) -> String {
-    const SHOWN: usize = 3;
-    let mut paths = Vec::new();
-    let mut count = 0;
+/// The tree a snapshot records in the working-copy commit, whose tree is
+/// `wc`, where the working copy's state records `state` and a scan of the
+/// working directory found `scanned` (§7.4): `scanned` itself where the
+/// state is the commit's. Where it is not, the state is stale (a checkout
+/// that failed or was cut short after its operation was recorded, a `fetch`
+/// that rebased the commit, jj run with `--ignore-working-copy` or from
+/// another workspace), and what the directory holds is a change to `state`
+/// rather than to the commit: that change is replayed onto the commit, a
+/// three-way merge with `state` as the base, in which a path both changed
+/// differently is a conflict. What a checkout cut short wrote is the
+/// commit's own content, which the merge takes as it is: where the
+/// directory holds what the commit does, the base is taken to hold it too,
+/// so that a conflict the state records there, whose sides would not
+/// cancel against the commit's, does not make one of a change both made.
+async fn snapshot_tree(wc: &MergedTree, state: &MergedTree, scanned: &MergedTree) -> Result<MergedTree, String> {
+    if state.tree_ids() == wc.tree_ids() {
+        return Ok(scanned.clone());
+    }
+    if scanned.tree_ids() == state.tree_ids() {
+        return Ok(wc.clone());
+    }
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    // the paths where the directory holds something other than the commit
+    let mut apart = std::collections::HashSet::new();
+    let mut diff = wc.diff_stream(scanned, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        entry.values.map_err(err)?;
+        apart.insert(entry.path);
+    }
+    // the base: the state, but for what the directory changed as the
+    // commit did
+    let mut base = MergedTreeBuilder::new(state.clone());
+    let mut same = false;
     let mut diff = state.diff_stream(scanned, &EverythingMatcher);
-    while let Some(TreeDiffEntry { path, .. }) = diff.next().await {
-        if paths.len() < SHOWN {
-            paths.push(format!("`{}`", path.as_internal_file_string()));
+    while let Some(entry) = diff.next().await {
+        let Diff { after, .. } = entry.values.map_err(err)?;
+        if !apart.contains(&entry.path) {
+            base.set_or_remove(entry.path, after);
+            same = true;
         }
-        count += 1;
     }
-    let at = if paths.is_empty() {
-        String::new()
-    } else if count > paths.len() {
-        format!(", at {} and {} more", paths.join(", "), count - paths.len())
-    } else {
-        format!(", at {}", paths.join(", "))
-    };
-    format!(
-        "the working copy is stale: its commit was changed without updating the working \
-         directory (by jj with --ignore-working-copy, or from another workspace), and the \
-         directory has changed since{}; recording that would undo the commit's change, so \
-         nothing was recorded. To record your changes, move them out of the directory so that \
-         it holds what it did before them, run a command that changes the repository, such as \
-         `j new`, which writes the focus there, then put them back",
-        at
-    )
+    let base = if same { base.write_tree().await.map_err(err)? } else { state.clone() };
+    MergedTree::merge(Merge::from_removes_adds(
+        vec![(base, "last checkout".to_string())],
+        vec![
+            (wc.clone(), "working-copy commit".to_string()),
+            (scanned.clone(), "working directory".to_string()),
+        ],
+    ))
+    .await
+    .map_err(err)
 }
 
-/// What the working directory holds along a checkout's footprint, the
-/// paths whose value differs between the tree it holds and the focus,
-/// recorded before the checkout runs so that one failing part way can be
-/// put back (§7.5 step 7), and nothing else with it
-struct Footprint {
-    /// the directories the checkout may create: each parent of a path the
-    /// focus adds that is not a directory yet
-    new_dirs: BTreeSet<RepoPathBuf>,
-    /// where the filesystem folds case, each parent of a path the focus
-    /// adds that is a directory listed under another spelling (its own
-    /// name, or one above it): the checkout may remove that directory, as
-    /// the focus removes what it holds, and create it again under the
-    /// focus's spelling
-    respelled: BTreeSet<RepoPathBuf>,
-    /// each path the focus adds that already holds something other than a
-    /// directory (an ignored file), by device and inode: the checkout
-    /// leaves that alone. Where the filesystem folds case, a path whose
-    /// other spelling the focus removes is not one: what is found there is
-    /// that tracked file, which the checkout removes.
-    occupied: HashMap<RepoPathBuf, (u64, u64)>,
-    /// whether the filesystem folds case (`Backend::folds_case`), so that a
-    /// path names whatever file has its name in another case
-    folds_case: bool,
-}
-
-/// The device and inode of what `path` holds, unless it is a directory
-fn file_identity(root: &std::path::Path, path: &RepoPath) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = path.to_fs_path(root).ok()?.symlink_metadata().ok()?;
-    (!meta.is_dir()).then(|| (meta.dev(), meta.ino()))
-}
-
-impl Footprint {
-    /// Look on disk along the paths `focus` adds to `on_disk`: one `lstat`
-    /// per directory they pass through, and one per path added to a
-    /// directory that exists; where case folds, also one listing of each
-    /// directory above one that exists. The diff is the checkout's own.
-    async fn of(
-        root: &std::path::Path,
-        on_disk: &MergedTree,
-        focus: &MergedTree,
-        folds_case: bool,
-    ) -> Result<Footprint, String> {
-        let is_dir_now = |path: &RepoPath| {
-            path.to_fs_path(root)
-                .is_ok_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
-        };
-        let mut new_dirs = BTreeSet::new();
-        let mut respelled = BTreeSet::new();
-        let mut listed = HashMap::new();
-        let mut occupied = HashMap::new();
-        // the paths the focus removes, in lower case, where case folds
-        let mut removed = HashSet::new();
-        // whether each directory looked at so far is one on disk
-        let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
-        let mut diff = on_disk.diff_stream(focus, &EverythingMatcher);
-        while let Some(TreeDiffEntry { path, values }) = diff.next().await {
-            let Diff { before, after } = values.map_err(|e| e.to_string())?;
-            if folds_case && after.is_absent() {
-                removed.insert(path.as_internal_file_string().to_lowercase());
-            }
-            if !(before.is_absent() && after.is_present()) {
-                continue;
-            }
-            // the parents not looked at yet, deepest first, below one that
-            // was (or the root)
-            let parent = path.parent().expect("a file path has a parent");
-            let mut unseen: Vec<&RepoPath> = parent
-                .ancestors()
-                .take_while(|d| !d.is_root() && !dirs.contains_key(*d))
-                .collect();
-            let seen = unseen.last().map_or(parent, |d| d.parent().unwrap());
-            let mut is_dir = seen.is_root() || dirs[seen];
-            while let Some(d) = unseen.pop() {
-                // nothing below a non-directory is a directory
-                is_dir = is_dir && is_dir_now(d);
-                if !is_dir {
-                    new_dirs.insert(d.to_owned());
-                } else if folds_case && !d.to_fs_path(root).is_ok_and(|p| spelled(root, &p, &mut listed)) {
-                    respelled.insert(d.to_owned());
-                }
-                dirs.insert(d.to_owned(), is_dir);
-            }
-            if is_dir {
-                if let Some(id) = file_identity(root, &path) {
-                    occupied.insert(path, id);
-                }
-            }
-        }
-        occupied.retain(|path, _| !removed.contains(&path.as_internal_file_string().to_lowercase()));
-        Ok(Footprint { new_dirs, respelled, occupied, folds_case })
-    }
-}
-
-/// Put back what a checkout from `on_disk` to `focus` that failed part way
-/// wrote (§7.5 step 7): give each path of its footprint that holds what the
-/// checkout writes there, or nothing, what `on_disk` holds there, and
-/// remove the directories it created while they are empty. Anything else a
-/// path holds is left alone and not read into the store: a file saved
-/// meanwhile, however it was saved, an ignored file that was there before
-/// (`Footprint::occupied`, still the same file), or, where case folds, the
-/// file of the path's other spelling. Before anything is written, the
-/// files the checkout wrote where `on_disk` holds none are removed, and
-/// then the directories it created: on a full disk that frees what writing
-/// the rest back takes, and where case folds a name the focus changes only
-/// in case is out of the way of the file it replaced. Each is removed on
-/// its own rather than by a checkout, which also removes every directory
-/// above that it leaves empty, one that was there before the run too. A
-/// path something is in the way of fails the put-back, and so does one the
-/// focus adds inside a nested repository that is left holding something,
-/// as no run records that.
-async fn put_back(
-    wc: &mut dyn LockedWorkingCopy,
-    root: &std::path::Path,
-    on_disk: &Commit,
-    focus: &Commit,
-    footprint: &Footprint,
-    settings: &UserSettings,
+/// Save the working copy's state as a scan that found `scanned` left it:
+/// at `head`, the operation the repository is at, where that is the
+/// working-copy commit's tree `wc`; otherwise at the operation it was
+/// saved at before, so that it stays stale for jj too, which takes a state
+/// saved at the head for a current one and would record the directory
+/// into the commit whole (§7.4)
+async fn save_scan(
+    mut locked_ws: jj_lib::workspace::LockedWorkspace<'_>,
+    scanned: &MergedTree,
+    wc: &MergedTree,
+    head: &OperationId,
 ) -> Result<(), String> {
-    // how the working copy writes a conflict
-    let marker_style = TreeStateSettings::try_from_user_settings(settings)
-        .map_err(|e| e.to_string())?
-        .conflict_marker_style;
-    // the paths, recomputed rather than kept through a checkout that
-    // succeeds, each with what the directory held there and the focus holds
-    let mut paths = Vec::new();
-    let mut diff = on_disk.tree().diff_stream(&focus.tree(), &EverythingMatcher);
-    while let Some(TreeDiffEntry { path, values }) = diff.next().await {
-        let Diff { before, after } = values.map_err(|e| e.to_string())?;
-        paths.push((path, before, after));
-    }
-    // where case folds, the paths that fold together, whose files are told
-    // apart by how their directories list them (`spelled`)
-    let mut twins = HashSet::new();
-    if footprint.folds_case {
-        let mut folded: HashMap<String, Vec<&RepoPath>> = HashMap::new();
-        for (path, _, _) in &paths {
-            folded.entry(path.as_internal_file_string().to_lowercase()).or_default().push(path);
-        }
-        twins.extend(folded.into_values().filter(|p| p.len() > 1).flatten().map(|p| p.to_owned()));
-    }
-    let mut listed: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
-    let mut real_dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
-    // the tree the working-copy state is to record: `on_disk`, with each
-    // path to write back present where it holds what the checkout wrote
-    // (`stand_in`), and absent where it holds nothing
-    let mut state = MergedTreeBuilder::new(on_disk.tree());
-    let mut write_back = false;
-    let mut in_the_way = 0;
-    let mut problems = Vec::new();
-    // the paths the focus adds inside a nested repository that are left
-    // holding something
-    let mut nested = Vec::new();
-    let labels = focus.tree().labels().clone();
-    for (path, before, after) in paths {
-        if let Some(&id) = footprint.occupied.get(&path) {
-            if file_identity(root, &path) == Some(id) {
-                continue;
-            }
-        }
-        let disk = path.to_fs_path(root).map_err(|e| e.to_string())?;
-        let mut meta = disk.symlink_metadata().ok().filter(|m| !m.is_dir());
-        if meta.is_some() && twins.contains(&path) && !spelled(root, &disk, &mut listed) {
-            meta = None;
-        }
-        let Some(meta) = meta else {
-            if before.is_present() {
-                state.set_or_remove(path, Merge::absent());
-                write_back = true;
-            }
-            continue;
-        };
-        // a write cut short leaves the start of the focus's file, but none
-        // is taken for one where an ignored file was
-        let partly = !footprint.occupied.contains_key(&path);
-        let store = focus.store();
-        let value = after.clone();
-        if !holds_written(store, &path, value, &labels, marker_style, &disk, &meta, partly).await? {
-            // left alone, and recorded by the next run, unless none reads it
-            if before.is_absent() && in_nested_repo(root, &path) {
-                nested.push(path);
-            }
-            continue;
-        }
-        if before.is_present() {
-            state.set_or_remove(path, stand_in(&before, &after));
-            write_back = true;
-        } else if !below_real_dirs(root, &path, &mut real_dirs) {
-            // a symlink above it, which the checkout writes no file through
-            in_the_way += 1;
-        } else {
-            match std::fs::remove_file(&disk) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => problems.push(format!("cannot remove `{}`: {}", path.as_internal_file_string(), e)),
-            }
-        }
-    }
-    // the directories the checkout created, and, where case folds, those it
-    // created again under the focus's spelling
-    if footprint.respelled.is_empty() {
-        remove_new_dirs(root, &footprint.new_dirs);
+    let op_id = if scanned.tree_ids() == wc.tree_ids() {
+        head.clone()
     } else {
-        let mut made = footprint.new_dirs.clone();
-        let again = footprint.respelled.iter().filter(|d| d.to_fs_path(root).is_ok_and(|p| spelled(root, &p, &mut listed)));
-        made.extend(again.cloned());
-        remove_new_dirs(root, &made);
-    }
-    if write_back {
-        // a reset writes nothing, and reads no file
-        let written = async {
-            let tree = state.write_tree().await.map_err(|e| e.to_string())?;
-            wc.reset(&with_tree(on_disk, tree)).await.map_err(|e| e.to_string())?;
-            wc.check_out(on_disk).await.map_err(|e| e.to_string())
-        };
-        match written.await {
-            Ok(stats) => in_the_way += stats.skipped_files,
-            Err(e) => problems.insert(0, e),
-        }
-    }
-    match in_the_way {
-        0 => {}
-        1 => problems.insert(0, "something is in the way of 1 path".to_string()),
-        n => problems.insert(0, format!("something is in the way of {} paths", n)),
-    }
-    if let Some(first) = nested.first() {
-        let first = first.as_internal_file_string();
-        problems.push(match nested.len() {
-            1 => format!(
-                "something the checkout did not write is left at `{}`, in a nested repository, which no run records",
-                first
-            ),
-            n => format!(
-                "something the checkout did not write is left at `{}` and {} more paths in nested repositories, which no run records",
-                first,
-                n - 1
-            ),
-        });
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(problems.join("; "))
-    }
-}
-
-/// Whether each directory above `path` below `root` is one on disk, not a
-/// symlink to one, so that what is done at `path` is done there. Each is
-/// looked at once, into `dirs`.
-fn below_real_dirs(root: &std::path::Path, path: &RepoPath, dirs: &mut HashMap<RepoPathBuf, bool>) -> bool {
-    let parent = path.parent().expect("a file path has a parent");
-    parent.ancestors().take_while(|d| !d.is_root()).all(|d| match dirs.get(d) {
-        Some(&is_dir) => is_dir,
-        None => {
-            let meta = d.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
-            let is_dir = meta.is_some_and(|m| m.is_dir());
-            dirs.insert(d.to_owned(), is_dir);
-            is_dir
-        }
-    })
-}
-
-/// Whether a directory above `path` below `root` holds `.git` or `.jj`: a
-/// nested repository, whose files no scan reads (§7.4)
-fn in_nested_repo(root: &std::path::Path, path: &RepoPath) -> bool {
-    let parent = path.parent().expect("a file path has a parent");
-    parent.ancestors().take_while(|d| !d.is_root()).any(|d| {
-        d.to_fs_path(root)
-            .is_ok_and(|dir| [".git", ".jj"].iter().any(|name| dir.join(name).symlink_metadata().is_ok()))
-    })
-}
-
-/// Whether each name along `disk` below `root` is listed by its directory
-/// under that spelling, where a name in another case would find the same
-/// file. Each directory is listed once, into `listed`.
-fn spelled(
-    root: &std::path::Path,
-    disk: &std::path::Path,
-    listed: &mut HashMap<PathBuf, HashSet<std::ffi::OsString>>,
-) -> bool {
-    let Ok(below) = disk.strip_prefix(root) else {
-        return false;
+        locked_ws.locked_wc().old_operation_id().clone()
     };
-    let mut dir = root.to_owned();
-    for name in below {
-        let names = listed.entry(dir.clone()).or_insert_with(|| {
-            std::fs::read_dir(&dir)
-                .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
-                .unwrap_or_default()
-        });
-        if !names.contains(name) {
-            return false;
-        }
-        dir.push(name);
-    }
-    true
-}
-
-/// The value the working-copy state records, while it is put back, for a
-/// path holding what the checkout wrote where `on_disk` holds `before` and
-/// the focus `after`: present, so that a checkout removes the file; other
-/// than `before`, so that one to `on_disk` writes `before` back; and
-/// resolved, so that no conflict elsewhere in the tree changes its number
-/// of sides, which would make the checkout write that path too. The state
-/// is not saved, and no checkout reads the value.
-fn stand_in(
-    before: &jj_lib::backend::MergedTreeValue,
-    after: &jj_lib::backend::MergedTreeValue,
-) -> jj_lib::backend::MergedTreeValue {
-    // it differs from `before`, as the diff found
-    if after.is_resolved() {
-        return after.clone();
-    }
-    if let Some(TreeValue::File { id, executable, copy_id }) = before.as_normal() {
-        let executable = !executable;
-        return Merge::normal(TreeValue::File { id: id.clone(), executable, copy_id: copy_id.clone() });
-    }
-    let side = after.iter().flatten().map(|v| Merge::normal(v.clone())).find(|v| v != before);
-    side.unwrap_or_else(|| after.clone())
-}
-
-/// Whether `disk`, the file at `path` whose `lstat` gave `meta`, holds what
-/// a checkout writes there for `value`: all of it, or, with `partly`, a
-/// start of it. It is compared byte for byte with what jj's checkout writes
-/// (j's settings convert no line endings), and nothing is written to the
-/// store. The executable bit is not compared.
-#[allow(clippy::too_many_arguments)]
-async fn holds_written(
-    store: &Arc<Store>,
-    path: &RepoPath,
-    value: jj_lib::backend::MergedTreeValue,
-    labels: &jj_lib::conflict_labels::ConflictLabels,
-    marker_style: ConflictMarkerStyle,
-    disk: &std::path::Path,
-    meta: &std::fs::Metadata,
-    partly: bool,
-) -> Result<bool, String> {
-    use futures::AsyncReadExt;
-    use jj_lib::conflicts::{self, MaterializedTreeValue};
-    use std::io::Read;
-    let written = conflicts::materialize_tree_value(store, path, value, labels)
-        .await
-        .map_err(|e| e.to_string())?;
-    let bytes: Vec<u8> = match written {
-        MaterializedTreeValue::File(mut file) => {
-            let mut bytes = Vec::new();
-            file.reader.read_to_end(&mut bytes).await.map_err(|e| e.to_string())?;
-            bytes
-        }
-        MaterializedTreeValue::FileConflict(file) => {
-            let options = conflicts::ConflictMaterializeOptions {
-                marker_style,
-                marker_len: Some(conflicts::choose_materialized_conflict_marker_len(&file.contents)),
-                merge: store.merge_options().clone(),
-            };
-            conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into()
-        }
-        MaterializedTreeValue::OtherConflict { id, labels } => id.describe(&labels).into_bytes(),
-        MaterializedTreeValue::Symlink { target, .. } if meta.is_symlink() => {
-            return Ok(disk.read_link().is_ok_and(|t| t.as_os_str() == target.as_str()));
-        }
-        // a file holding the target, where the filesystem has no symlinks
-        MaterializedTreeValue::Symlink { target, .. } => target.into_bytes(),
-        // no file is written there
-        _ => return Ok(false),
-    };
-    let len = meta.len();
-    if !meta.is_file() || len > bytes.len() as u64 || (!partly && len < bytes.len() as u64) {
-        return Ok(false);
-    }
-    // a piece at a time, to the end, as the file may have grown since
-    let Ok(mut file) = std::fs::File::open(disk) else {
-        return Ok(false);
-    };
-    let mut buf = vec![0; bytes.len().min(1 << 16) + 1];
-    let mut at = 0;
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => return Ok(partly || at == bytes.len()),
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Ok(false),
-        };
-        if bytes.get(at..at + n) != Some(&buf[..n]) {
-            return Ok(false);
-        }
-        at += n;
-    }
+    locked_ws.finish(op_id).await.map_err(|e| e.to_string())
 }
 
 /// `commit` with `tree` in place of its own, for the working copy to read:
@@ -923,30 +570,6 @@ fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
             ..commit.store_commit().as_ref().clone()
         }),
     )
-}
-
-/// Remove the directories of `dirs` (`Footprint::new_dirs`) that are
-/// directories now, deepest first, each only while it is empty. One whose
-/// parent is also in `dirs` is looked at only once that parent is a
-/// directory, so no path is followed through a symlink found there.
-fn remove_new_dirs(root: &std::path::Path, dirs: &BTreeSet<RepoPathBuf>) {
-    let mut found: HashSet<&RepoPath> = HashSet::new();
-    let mut remove = Vec::new();
-    // parents come first
-    for dir in dirs {
-        let parent = dir.parent().expect("a directory below the root has a parent");
-        if dirs.contains(parent) && !found.contains(parent) {
-            continue;
-        }
-        let Ok(path) = dir.to_fs_path(root) else { continue };
-        if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            found.insert(dir);
-            remove.push(path);
-        }
-    }
-    for path in remove.iter().rev() {
-        let _ = std::fs::remove_dir(path);
-    }
 }
 
 #[derive(Clone)]
@@ -1169,71 +792,45 @@ impl JjBackend {
         Ok(Some((loaded_at_child, current_at_child)))
     }
 
-    /// Snapshot the working copy into the wc commit; returns the repo at the
-    /// snapshot operation (unpublished but written), or the pre-snapshot repo
-    /// if nothing changed.
+    /// Snapshot the working directory into the working-copy commit (§7.4);
+    /// return the repo at the snapshot's operation, written but not
+    /// published, or the repo as loaded when there is nothing to record.
     async fn snapshot_repo(
         &self,
     ) -> Result<(Arc<ReadonlyRepo>, Option<PendingSnapshot>), OpenError> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
-        let loader = ws_guard.repo_loader().clone();
         let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
         let old_tree = locked_ws.locked_wc().old_tree().clone();
-        let new_tree = scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options())
+        let scanned = scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options())
             .await
             .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
-        let changed = new_tree.tree_ids() != old_tree.tree_ids();
-        if !changed {
-            locked_ws
-                .finish(self.current_repo().operation().id().clone())
+        // the repo build_interp loaded at head from the workspace's own
+        // loader, whose store the scanned tree lives in
+        let head = self.current_repo();
+        let wc_commit = self.wc_commit(&head).await?;
+        let tree = snapshot_tree(&wc_commit.tree(), &old_tree, &scanned)
+            .await
+            .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
+        if tree.tree_ids() == wc_commit.tree().tree_ids() {
+            // nothing to record: the directory holds the commit's files, or,
+            // where the state is stale, the state's, or changes to them the
+            // commit already has, such as what a checkout cut short wrote.
+            // What was scanned is saved, at the operation the state is
+            // stale since where it still is.
+            save_scan(locked_ws, &scanned, &wc_commit.tree(), head.operation().id())
                 .await
                 .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
-            return Ok((self.current_repo(), None));
+            return Ok((head, None));
         }
-        // the snapshotted tree lives in the workspace's store; drive the
-        // transaction from the workspace's repo loader so stores match
-        let ws_repo = loader
-            .load_at_head()
-            .await
-            .map_err(|e| (2, format!("cannot reload the repository: {}", e)))?;
-        let wc_commit = self.wc_commit(&ws_repo).await?;
-        // The working copy is stale when jj changed its commit without
-        // updating the directory or its state (a command run with
-        // `--ignore-working-copy`, or one in another workspace that rewrote
-        // this workspace's commit). The directory's changes are then
-        // changes to the tree the state records, not to the commit, and
-        // recording the directory into the commit would silently undo what
-        // jj did to it; so, as jj does, refuse, dropping the lock without
-        // saving anything (§7.4). A directory holding the commit's files has
-        // nothing to record, and its scanned state is saved as the commit's.
-        // Snapshots of this directory that failed checkouts recorded alone
-        // (§7.5 step 7, `record_snapshot`) leave the state behind too, but
-        // there the directory's changes are changes to them.
-        let wc_tree = wc_commit.tree();
-        if old_tree.tree_ids() != wc_tree.tree_ids() {
-            if new_tree.tree_ids() == wc_tree.tree_ids() {
-                locked_ws
-                    .finish(ws_repo.operation().id().clone())
-                    .await
-                    .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
-                return Ok((self.current_repo(), None));
-            }
-            if !self.only_snapshots_since(&ws_repo, &old_tree).await? {
-                return Err((2, stale_message(&old_tree, &new_tree).await));
-            }
-        }
-        let mut tx = ws_repo.start_transaction();
+        let mut tx = head.start_transaction();
         tx.set_is_snapshot(true);
-        // marks it as this workspace's own snapshot, for the check above
-        // when a failed checkout records it alone
-        tx.set_workspace_name(&self.inner.workspace_name);
         let new_wc = tx
             .repo_mut()
             .rewrite_commit(&wc_commit)
-            .set_tree(new_tree)
+            .set_tree(tree)
             .write()
             .await
             .map_err(|e| (2, format!("cannot write the snapshot commit: {}", e)))?;
@@ -1250,7 +847,6 @@ impl JjBackend {
             .write("snapshot working copy")
             .await
             .map_err(|e| (2, format!("cannot write the snapshot operation: {}", e)))?;
-        let op_id = unpublished.operation().id().clone();
         let new_repo = unpublished.leave_unpublished();
         // Release the lock *without* finishing: `finish` saves the scanned
         // tree state to disk, which would record the working directory as
@@ -1262,61 +858,13 @@ impl JjBackend {
         // the directory again and finishes against the operation that
         // actually recorded the tree (§7.4/§7.7).
         drop(locked_ws);
-        let _ = op_id;
         let pending = PendingSnapshot {
-            pre_repo: self.current_repo(),
-            new_wc_id: new_wc.id().clone(),
+            pre_repo: head,
             tree: new_wc.tree().clone(),
             fold_into_wc: true,
-            repo: new_repo.clone(),
+            scanned,
         };
         Ok((new_repo, Some(pending)))
-    }
-
-    /// Whether each operation from `repo`'s back to the last one at which
-    /// the working-copy commit's tree was `state`, the tree the working-copy
-    /// state records, is a snapshot of this workspace: the state was then
-    /// left behind only by snapshots of the directory itself, as a failed
-    /// checkout records one alone (§7.5 step 7, `record_snapshot`), and the
-    /// directory's changes since are changes to them (§7.4). The walk stops
-    /// at the first operation that is anything else.
-    async fn only_snapshots_since(
-        &self,
-        repo: &Arc<ReadonlyRepo>,
-        state: &MergedTree,
-    ) -> Result<bool, OpenError> {
-        let loader = repo.loader();
-        let mut op = repo.operation().clone();
-        loop {
-            let meta = op.metadata();
-            if !meta.is_snapshot || meta.workspace_name.as_ref() != Some(&self.inner.workspace_name) {
-                return Ok(false);
-            }
-            let [parent_id] = op.parent_ids() else {
-                return Ok(false);
-            };
-            let parent = loader
-                .load_operation(parent_id)
-                .await
-                .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
-            let view = loader
-                .op_store()
-                .read_view(parent.view_id())
-                .await
-                .map_err(|e| (2, format!("cannot load an operation view: {}", e)))?;
-            let Some(wc_id) = view.wc_commit_ids.get(&self.inner.workspace_name) else {
-                return Ok(false);
-            };
-            let wc = repo
-                .store()
-                .get_commit_async(wc_id)
-                .await
-                .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
-            if wc.tree().tree_ids() == state.tree_ids() {
-                return Ok(true);
-            }
-            op = parent;
-        }
     }
 
     async fn wc_commit(&self, repo: &Arc<ReadonlyRepo>) -> Result<Commit, OpenError> {
@@ -1526,90 +1074,73 @@ impl JjBackend {
         let unpublished = block_on(tx.write(desc))
             .map_err(|e| Crash::new(format!("cannot write the operation: {}", e)))?;
 
-        // §7.4/§7.5 step 7: check out the focus to the working directory,
-        // and only then publish the operation
+        // §7.4/§7.5 step 7: publish the operation, then check the focus out
         let focus_commit = block_on(store.get_commit_async(&focus_jj))
             .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
-        // the working directory holds the snapshot's tree; when it was not
-        // folded (an immutable wc commit, §7.2) the snapshot's own unpublished
-        // commit carries that tree. With no snapshot it holds the tree the
-        // working-copy state records, as `snapshot_repo` just found: the
-        // focus as loaded, unless jj moved the working-copy commit without
-        // updating the directory (`--ignore-working-copy`, a command in
-        // another workspace). The checkout then starts from that stale tree
-        // and writes the focus. Taking the directory to hold the focus, it
-        // would find it did not, describe the focus without writing it (a
-        // reset), and the next run would record the stale files into the
-        // focus (§7.4).
-        let on_disk = match (snapshot_wc, &pending) {
-            (Some(c), _) => c,
-            (None, Some(p)) => block_on(store.get_commit_async(&p.new_wc_id))
-                .map_err(|e| Crash::new(format!("cannot read the snapshot commit: {}", e)))?,
-            (None, None) => {
-                let wc = block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?;
+        // the checkout starts from what the working directory holds: the
+        // tree the run's snapshot scanned, or, where it had nothing to
+        // record, the tree the working-copy state records, as
+        // `snapshot_repo` left it. That is the focus as loaded unless the
+        // state is stale (§7.4), when the checkout writes the focus over it;
+        // taking the directory to hold the focus instead, it would find it
+        // did not, describe the focus without writing it (a reset), and the
+        // next run would record the stale files into the focus.
+        let on_disk = match pending {
+            Some(p) => p.scanned,
+            None => {
                 let state = self.inner.workspace.lock().unwrap().working_copy().tree().cloned();
-                match state {
-                    Ok(tree) if tree.tree_ids() != wc.tree().tree_ids() => with_tree(&wc, tree),
-                    // a state that cannot be read fails the checkout,
-                    // which reads it again when it locks
-                    _ => wc,
-                }
+                // a state that cannot be read fails the checkout, which
+                // reads it again when it locks
+                state.or_else(|_| block_on(self.wc_commit(&base)).map(|c| c.tree()).map_err(|e| Crash::new(e.1)))?
             }
         };
-        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), pending.as_ref()))?;
-
-        Ok(())
+        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), Some(", and `j undo` goes back")))
     }
 
-    /// Check `commit` out, then publish `op` and record it as the operation
-    /// the working copy is at; with no `op` it stays at the head. `on_disk`
-    /// is the commit whose tree the working directory holds: a persisting
-    /// run's snapshot (§7.4), the tree the working-copy state records when
-    /// the run snapshotted nothing, or the focus `undo`/`redo` start from.
-    /// A checkout that fails publishes nothing (§7.5 step 7, §7.7), and
-    /// leaves the saved state as it was, so the next run snapshots the
-    /// directory into the commit it came from; what the checkout had
-    /// already written is put back first (`put_back`), when the directory
-    /// held exactly `on_disk`. When it cannot be, `snapshot`, the one the
-    /// run took, is recorded alone, as the directory may no longer hold
-    /// the uncommitted edits the checkout wrote over.
+    /// Check `commit` out: write its files to the working directory and
+    /// save the working copy's state as holding them (§7.4). `op`, the
+    /// operation that makes it the working-copy commit, is published first,
+    /// as jj does (§7.5 step 7); with none, `commit` is the head's own.
+    /// `on_disk` is the tree the directory holds, which the checkout starts
+    /// from: what a persisting run's snapshot scanned, or the tree the
+    /// working-copy state records where it scanned nothing to record, or
+    /// what `undo`'s look found; with none, the state as it is. A checkout
+    /// that fails, or is cut short, after `op` is published leaves `op`
+    /// recorded and the state stale, recording `on_disk`: the next run
+    /// takes what the checkout wrote for the commit's own and carries on
+    /// (`snapshot_tree`), as the crash says, with `back` naming the way
+    /// back; with no `back` it says nothing of the operation (a clone that
+    /// fails removes it).
     async fn checkout(
         &self,
         commit: &Commit,
-        on_disk: Option<&Commit>,
+        on_disk: Option<&MergedTree>,
         op: Option<UnpublishedOperation>,
-        snapshot: Option<&PendingSnapshot>,
+        back: Option<&str>,
     ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
-        // `snapshot_repo` released its lock without saving what it scanned,
-        // so the state just loaded still describes the tree recorded before
-        // the edits, and jj checks out by diffing that tree against the new
-        // one: a path whose recorded content equals the focus's would keep
-        // the user's edit, a file created since would stay, and a file
-        // replaced by a directory (or back) would leave state contradicting
-        // the tree. Scan the directory again first, as `snapshot_repo` did,
-        // so the checkout diffs from what is actually on disk (§7.4). A scan
-        // keeps what the state knows of each file where a reset to the
-        // snapshot's tree would forget it: a conflict whose sides hold
-        // marker-like lines is materialized with longer markers, and a
-        // forgotten length makes the next snapshot read those markers back
-        // at 7 characters, fail to parse them and record the edited conflict
-        // as resolved text, markers and all (§7.4). The scan also tells
-        // whether the directory still holds `on_disk`, which a failed
-        // checkout is put back to: then what the directory holds along the
-        // checkout's footprint is recorded first, as only that is put back.
-        let mut footprint = Err("it changed while the program ran".to_string());
+        // A persisting run's snapshot released its lock without saving what
+        // it scanned, so the state just loaded may still describe the tree
+        // recorded before the edits, and jj checks out by diffing that tree
+        // against the new one: a path whose recorded content equals the
+        // focus's would keep the user's edit, a file created since would
+        // stay, and a file replaced by a directory (or back) would leave
+        // state contradicting the tree. Scan the directory again first, as
+        // the snapshot did, so the checkout diffs from what is actually on
+        // disk (§7.4). A scan keeps what the state knows of each file where
+        // a reset to the snapshot's tree would forget it: a conflict whose
+        // sides hold marker-like lines is materialized with longer markers,
+        // and a forgotten length makes the next snapshot read those markers
+        // back at 7 characters, fail to parse them and record the edited
+        // conflict as resolved text, markers and all (§7.4).
         if let Some(on_disk) = on_disk {
             let old_tree = locked_ws.locked_wc().old_tree().clone();
             match scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()).await {
-                Ok(scanned) if scanned.tree_ids() == on_disk.tree().tree_ids() => {
-                    let folds_case = self.folds_case();
-                    footprint = Footprint::of(&root, &on_disk.tree(), &commit.tree(), folds_case).await;
-                }
+                Ok(scanned) if scanned.tree_ids() == on_disk.tree_ids() => {}
                 // the directory changed while the program ran, or can no
                 // longer be scanned (an entry appeared, vanished or cannot
                 // be read; a failed scan leaves the state as it was):
@@ -1617,103 +1148,68 @@ impl JjBackend {
                 // paths it changes are re-read by the next run.
                 _ => locked_ws
                     .locked_wc()
-                    .reset(on_disk)
+                    .reset(&with_tree(commit, on_disk.clone()))
                     .await
                     .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?,
             }
         }
-        let published = match locked_ws.locked_wc().check_out(commit).await {
-            Err(e) => Err(format!("cannot check out the focus: {}", e)),
-            Ok(_) => match op {
-                None => Ok(None),
-                Some(op) => op
+        let published = op.is_some();
+        let op_id = match op {
+            None => self.current_repo().operation().id().clone(),
+            Some(op) => {
+                let repo = op
                     .publish()
                     .await
-                    .map(Some)
-                    .map_err(|e| format!("cannot publish the operation: {}", e)),
-            },
-        };
-        let op_id = match published {
-            Ok(Some(repo)) => {
+                    .map_err(|e| Crash::new(format!("cannot publish the operation: {}", e)))?;
                 let op_id = repo.operation().id().clone();
                 *self.inner.repo.lock().unwrap() = repo;
                 op_id
             }
-            Ok(None) => self.current_repo().operation().id().clone(),
-            Err(mut msg) => {
-                // nothing is recorded (§7.7). The lock is dropped without
-                // saving, so the state still describes the tree recorded at
-                // the head, as it did before the run.
-                if let Some(on_disk) = on_disk {
-                    let restored = match &footprint {
-                        Ok(f) => {
-                            let repo = self.current_repo();
-                            put_back(locked_ws.locked_wc(), &root, on_disk, commit, f, repo.settings()).await
-                        }
-                        Err(e) => Err(e.clone()),
-                    };
-                    if let Err(e) = restored {
-                        msg.push_str(&format!(
-                            "; the working directory may hold part of it and could not be put back: {}",
-                            e
-                        ));
-                        if let Some(p) = snapshot {
-                            match self.record_snapshot(p).await {
-                                Ok(()) => msg.push_str(
-                                    "; the working directory's uncommitted edits are recorded, as `j id` records them",
-                                ),
-                                Err(e) => msg.push_str(&format!(
-                                    "; nor could the working directory's uncommitted edits be recorded: {}",
-                                    e
-                                )),
-                            }
-                        }
-                    }
-                }
-                return Err(Crash::new(msg));
-            }
         };
+        // what a crash from here on says: the state is left stale, which the
+        // next run carries on from (§7.5 step 7)
+        let carry_on = |what: &str| match back {
+            None => String::new(),
+            Some(back) if published => {
+                format!("; the operation is recorded, but {}: the next command carries on from there{}", what, back)
+            }
+            Some(_) => format!("; {}: the next command carries on from there", what),
+        };
+        // A checkout cut short leaves the directory holding `on_disk` but
+        // where it wrote, and the next run takes what it holds for changes
+        // to the state (`snapshot_tree`). So the state records `on_disk`
+        // first, at the operation it was saved at, which leaves it stale
+        // until the checkout completes: were it left recording the tree
+        // before the run's snapshot, the snapshot's changes, now in the
+        // operation, would be taken for new ones and replayed onto the
+        // focus too. It is saved only once `op` is published: a state
+        // recording the snapshot, beside a head that does not, would lose
+        // it (§7.4).
+        if on_disk.is_some_and(|t| t.tree_ids() != locked_ws.locked_wc().old_tree().tree_ids()) {
+            let old_op = locked_ws.locked_wc().old_operation_id().clone();
+            let saved = match locked_ws.finish(old_op).await {
+                Ok(()) => ws_guard.start_working_copy_mutation().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            locked_ws = match saved {
+                Ok(locked) => locked,
+                Err(e) => {
+                    let what = "the working directory was not updated";
+                    return Err(Crash::new(format!("cannot save the working copy's state: {}{}", e, carry_on(what))));
+                }
+            };
+        }
+        if let Err(e) = locked_ws.locked_wc().check_out(commit).await {
+            let what = "the working directory was only partly updated";
+            return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what))));
+        }
         // the state names the operation it was checked out at, so it is
         // saved only once that operation is published
-        locked_ws
-            .finish(op_id)
-            .await
-            .map_err(|e| Crash::new(format!("cannot finish the checkout: {}", e)))?;
+        if let Err(e) = locked_ws.finish(op_id).await {
+            let what = "the working copy's record of what the directory holds was not updated";
+            return Err(Crash::new(format!("cannot save the working copy's state: {}{}", e, carry_on(what))));
+        }
         Ok(())
-    }
-
-    /// Record the snapshot `p` alone, as `j id` does (§7.2, §7.4): in the
-    /// working-copy commit, the operation the snapshot already wrote, or,
-    /// where that commit is immutable, in a new child of it. For a failed
-    /// checkout that could not be put back (§7.5 step 7), so that no
-    /// uncommitted edit it wrote over is lost; the working-copy state is
-    /// left as it was, and the next run records what the directory holds.
-    /// The operation is marked as a snapshot of this workspace, so that
-    /// `snapshot_repo` does not take the state it leaves for a stale one.
-    async fn record_snapshot(&self, p: &PendingSnapshot) -> Result<(), String> {
-        let repo = if p.fold_into_wc {
-            p.repo.clone()
-        } else {
-            let mut tx = p.pre_repo.start_transaction();
-            tx.set_is_snapshot(true);
-            tx.set_workspace_name(&self.inner.workspace_name);
-            let wc = self.wc_commit(&p.pre_repo).await.map_err(|e| e.1)?;
-            let child = tx
-                .repo_mut()
-                .new_commit(vec![wc.id().clone()], p.tree.clone())
-                .write()
-                .await
-                .map_err(|e| e.to_string())?;
-            tx.repo_mut()
-                .set_wc_commit(self.inner.workspace_name.clone(), child.id().clone())
-                .map_err(|e| e.to_string())?;
-            tx.write("snapshot working copy").await.map_err(|e| e.to_string())?.leave_unpublished()
-        };
-        // as `UnpublishedOperation::publish` does
-        let heads = repo.op_heads_store();
-        let _lock = heads.lock().await.map_err(|e| e.to_string())?;
-        let op = repo.operation();
-        heads.update_op_heads(op.parent_ids(), op.id()).await.map_err(|e| e.to_string())
     }
 
     fn user_signature(&self, cfg: &Config) -> Result<Signature, Crash> {
@@ -2016,7 +1512,7 @@ impl JjBackend {
 
     pub fn cmd_undo(&self, redo: bool) -> Result<(), OpenError> {
         let base = self.head_repo()?;
-        self.check_wc_clean(&base)?;
+        let on_disk = self.check_wc_clean(&base)?;
         let loader = self.repo_loader();
         let mut cur = base.operation().clone();
         let target_op_id: OperationId;
@@ -2133,50 +1629,48 @@ impl JjBackend {
         tx.repo_mut().set_view(target_view.clone());
         let unpublished = block_on(tx.write(&marker))
             .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
-        // the restored focus is checked out before the operation is
-        // published, so a checkout that fails records nothing (§7.7)
+        // the operation is published, then the restored focus checked out
+        // from what the directory holds (§7.7)
         let wc_id = &target_view.wc_commit_ids[WorkspaceName::DEFAULT];
         let wc_commit = block_on(base.store().get_commit_async(wc_id))
             .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
-        let on_disk = block_on(self.wc_commit(&base))?;
-        block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished), None))
+        let back = if redo { ", and `j undo` goes back" } else { ", and `j redo` goes back" };
+        block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished), Some(back)))
             .map_err(|c| (1, c.msg))?;
         Ok(())
     }
 
-    /// refuse if the working directory differs from the focused commit's
-    /// files (§7.7): reserved commands never snapshot, so compare the locked
-    /// working copy's recorded tree with the focus commit's tree
-    fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<(), OpenError> {
+    /// Refuse, as `undo` and `redo` do before anything else (§7.7), when the
+    /// working directory holds changes the working-copy commit does not:
+    /// what a snapshot would record (§7.4), which their checkout would write
+    /// over. Otherwise return the tree the directory holds, which that
+    /// checkout starts from: the commit's, or, where the working-copy state
+    /// is stale, the state's with any changes to it the commit already has,
+    /// such as what a checkout cut short wrote. Reserved commands never
+    /// snapshot, so nothing is recorded either way.
+    fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<MergedTree, OpenError> {
         let dirty = (1, "working copy has changes not in @; run `j id` to record them or discard them".to_string());
-        let wc_commit = block_on(self.wc_commit(base))?;
-        // snapshot the working directory (without persisting anything) and
-        // compare against the focused commit's files (§7.7)
+        let wc_tree = block_on(self.wc_commit(base))?.tree();
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
         let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
         let old_tree = locked_ws.locked_wc().old_tree().clone();
-        let new_tree = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()))
+        let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
-        let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
-        if same {
-            // the scanned tree is the one already recorded: saving the state
-            // only refreshes the mtime cache
-            block_on(locked_ws.finish(base.operation().id().clone()))
-                .map_err(|e| (2, format!("cannot finish: {}", e)))?;
-        } else {
-            // the working copy differs from @ and this command records
-            // nothing: drop the lock without saving, or the state would claim
-            // the directory was snapshotted and hide the changes from the next
+        let recorded = block_on(snapshot_tree(&wc_tree, &old_tree, &scanned))
+            .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
+        if recorded.tree_ids() != wc_tree.tree_ids() {
+            // drop the lock without saving, or the state would claim the
+            // directory was snapshotted and hide the changes from the next
             // run (§7.7)
-            drop(locked_ws);
-        }
-        drop(ws_guard);
-        if !same {
             return Err(dirty);
         }
-        Ok(())
+        // saving the state only refreshes what it knows of each file, or
+        // takes in what the commit already has
+        block_on(save_scan(locked_ws, &scanned, &wc_tree, base.operation().id()))
+            .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        Ok(scanned)
     }
 
     /// The operation log for `ops` (§7.7), one line per operation, newest
@@ -2293,7 +1787,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
         .as_resolved()
         .cloned()
         .flatten();
-    create_initial_wc_commit(&backend, cfg, tx, "init", head, had_git)?;
+    create_initial_wc_commit(&backend, cfg, tx, "init", head, had_git, Some(""))?;
     Ok(())
 }
 
@@ -2427,19 +1921,21 @@ fn clone_into(
     });
     // the fetch and the working-copy commit are one operation, the one undo
     // never undoes (§7.7)
-    create_initial_wc_commit(&backend, cfg, tx, &format!("clone {}", url), head, false)?;
+    create_initial_wc_commit(&backend, cfg, tx, &format!("clone {}", url), head, false, None)?;
     Ok(())
 }
 
 /// §7.8: after init/clone, create a working-copy commit as a child of
-/// `head` (the root commit when there is none), check it out, and only
-/// then record it in `tx` with what the command has imported. The commit
-/// holds its parent's files less any a checkout cannot create
-/// (`checkout_tree`), so it is empty unless the parent has one. `adopt`
-/// says the working directory already holds a checkout of the parent (init
-/// over an existing git repository): the working copy is then reset to the
-/// commit instead of written, so no file is touched and what the directory
-/// holds beyond the parent is the next snapshot's change.
+/// `head` (the root commit when there is none), record it in `tx` with
+/// what the command has imported, and check it out. The commit holds its
+/// parent's files less any a checkout cannot create (`checkout_tree`), so
+/// it is empty unless the parent has one. `adopt` says the working
+/// directory already holds a checkout of the parent (init over an existing
+/// git repository): the working copy is then reset to the commit instead of
+/// written, so no file is touched and what the directory holds beyond the
+/// parent is the next snapshot's change. `back` is what a checkout that
+/// fails says (`JjBackend::checkout`): none for a clone, which then removes
+/// what it made.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
@@ -2447,6 +1943,7 @@ fn create_initial_wc_commit(
     description: &str,
     head: Option<CommitId>,
     adopt: bool,
+    back: Option<&str>,
 ) -> Result<(), OpenError> {
     let store = tx.base_repo().store().clone();
     let parent = head.unwrap_or_else(|| store.root_commit_id().clone());
@@ -2466,7 +1963,7 @@ fn create_initial_wc_commit(
             } else {
                 None
             };
-            block_on(backend.checkout(&existing, None, op, None)).map_err(|c| (1, c.msg))?;
+            block_on(backend.checkout(&existing, None, op, back)).map_err(|c| (1, c.msg))?;
             return Ok(());
         }
         if existing.id() != store.root_commit_id() {
@@ -2503,10 +2000,10 @@ fn create_initial_wc_commit(
         .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
     // an adopted directory is reset to the commit, not checked out over:
     // checking out from the empty tree jj's init recorded would recreate
-    // the files the user deleted there. Anything else is written, and the
-    // operation published only once it is (§7.7).
-    let on_disk = if adopt { Some(&wc) } else { None };
-    block_on(backend.checkout(&wc, on_disk, Some(unpublished), None)).map_err(|c| (1, c.msg))?;
+    // the files the user deleted there. Anything else is written, once the
+    // operation is published (§7.5 step 7).
+    let on_disk = if adopt { Some(wc.tree()) } else { None };
+    block_on(backend.checkout(&wc, on_disk.as_ref(), Some(unpublished), back)).map_err(|c| (1, c.msg))?;
     Ok(())
 }
 

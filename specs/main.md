@@ -81,8 +81,7 @@ they are reachable only inside larger expressions.
 3. Load and validate `config.j` (§6), except for its `Id` literals. If it is
    missing or invalid, exit 3.
 4. Build the current repository value `r` (§7.2). This includes snapshotting
-   the working directory into the focused commit (§7.4), and exits 2 where
-   the working copy is stale and the directory has changed (§7.4).
+   the working directory into the focused commit (§7.4).
 5. Resolve every `Id` literal in `config.j` and in the expression (§4.10).
    A failure in `config.j` is a configuration error (exit 3); one in the
    expression is a crash (exit 1). Nothing has been evaluated.
@@ -120,9 +119,12 @@ Two consequences worth knowing:
 ### 1.3 Interrupts
 
 There is no timeout. A non-terminating expression runs until interrupted.
-Interrupting `j` (SIGINT) kills it; because nothing is written until
-evaluation completes, an interrupted run persists nothing and leaves the
-working directory untouched.
+Interrupting `j` (SIGINT) kills it. Nothing is written until the operation
+is recorded (§7.5 step 7), so a run interrupted before then persists
+nothing and leaves the working directory untouched. One interrupted while it
+checks the focus out, after that, leaves the operation recorded and the
+working directory partly updated, as a checkout that fails does: the next
+run carries on from there (§7.4), and `j undo` goes back.
 
 ### 1.4 Exit status
 
@@ -942,21 +944,22 @@ directory.
   or printing program leaves the working copy and the repository exactly as
   before (but see §7.5 step 7); `j id` is the way to record the working
   directory and nothing else (§1.2).
-- **A stale working copy.** jj can change the working-copy commit without
-  updating the working directory (a command run with
+- **A stale working copy.** The working copy is stale when the files last
+  checked out are not the working-copy commit's: jj changed the commit
+  without updating the working directory (a command run with
   `--ignore-working-copy`, or one in another workspace that rewrites this
-  workspace's commit). The directory then started from the files last
-  checked out, not the commit's, and what has changed in it since is a
-  change to those. With no such change there is nothing to snapshot, and a
-  program that persists writes the focus over them as usual; nor is there
-  where the directory holds the commit's files. Any other change is not
-  recorded, as recording the directory into the commit would undo what jj
-  did to it: the program exits 2 before evaluation, recording nothing, and
-  names the changed paths. Moving those changes out of the way, running a
-  program that persists, and putting them back records them onto the
-  focus. The snapshot that a failed checkout records alone (§7.5 step 7)
-  leaves the working copy behind in the same way, but there what has
-  changed is a change to that snapshot, and it is snapshotted as usual.
+  workspace's commit), `fetch` rebased it (§7.6), or a checkout failed or
+  was cut short after its operation was recorded (§7.5 step 7). The
+  directory then started from the files last checked out, and what has
+  changed in it since is a change to those, which the snapshot replays
+  onto the commit: a three-way merge with the files last checked out as
+  the base, in which a path that the directory and the commit both
+  changed, differently, is a conflict (an edit to a file the commit
+  deletes, say), and one where the directory holds what the commit does is
+  the commit's (what a checkout cut short had written). With no change
+  there is nothing to snapshot, and a program that persists writes the
+  focus over the files last checked out as usual. A stale working copy
+  refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
@@ -1026,41 +1029,25 @@ Within it:
    `new.root.id`. (`abandon` and `squash` end with `new` for this reason, so
    they are safe on a commit directly above `main`; navigation onto `main`
    is written `new . goto trunk`.)
-7. Perform the checkout of §7.4, then commit the operation. A checkout
-   that fails (a path the filesystem cannot hold, a full disk), or an
-   operation that then cannot be committed, crashes without committing
-   it, so nothing is recorded. Unless the working directory changed while
-   the program ran, what the checkout wrote is then put back. The put-back
-   changes only a path at which the focus differs from the working
-   directory and that now holds exactly what the checkout writes there
-   (the focus's content, all of it or, except where an ignored file was,
-   the start of it that a write cut short leaves), or nothing, and gives
-   it back what the directory held there; and a directory the checkout
-   created, which it removes while empty. The files the checkout added
-   are removed first, each on its own, and then the directories it
-   created, before anything is written: the space they took is then free
-   for the rest (a full disk), a name the focus changes only in case is
-   put back where the filesystem folds case, and no directory that was
-   there before is removed. No file is read into the repository. Anything
-   else is left alone: a file created or edited meanwhile keeps its
-   content, at such a path too and however it was saved (even by renaming
-   a new file over the old); an ignored file stays, even where a
-   `.gitignore` the checkout wrote no longer ignores it, and where the
-   focus adds a file of that name (the checkout does not write over it)
-   even if it holds the focus's content; and so does, where the
-   filesystem folds case, the file of a path's other spelling. When
-   something left alone is in the way of a path, the crash says the
-   directory could not be put back, and the next run records what it
-   holds. A path the focus adds inside a nested repository (§7.4) is put
-   back the same way, but as no run records what is left there, the crash
-   names such a path when something is left at it. Whenever the directory
-   is not put back in full (it changed while the program ran, something
-   is in the way, the put-back itself fails), the changes the run
-   snapshotted from it (§7.4), if any, are recorded alone, as `j id`
-   records them (§7.2), in an operation described
-   `snapshot working copy`, and the crash says so: no uncommitted edit the
-   checkout wrote over is lost. This is the one crash that records
-   anything.
+7. Record the operation, then perform the checkout of §7.4, as jj does.
+   An operation that cannot be recorded crashes before the checkout, so
+   nothing is recorded or written. A checkout that fails (a path the
+   filesystem cannot hold, a full disk) crashes with the operation
+   recorded and the working directory partly updated, and says so; so does
+   one that completes but whose record of what it wrote cannot be saved.
+   Nothing is put back: the working copy is left stale (§7.4), recording
+   the files the directory held when the checkout began, so the next run
+   takes what the checkout wrote for the focus's own and what else has
+   changed since for a change to the focus, the next program that persists
+   writes the rest of the focus, and `j undo` goes back. A file saved
+   meanwhile at a path the checkout writes, before or after it wrote
+   there, and a file a full disk cut short, are conflicts with the
+   focus's content there, so neither is lost. The checkout reads no file
+   into the repository and removes none it does not replace: an ignored
+   file where the focus adds one stays, holding what it held, and so does
+   anything inside a nested repository. No uncommitted edit the checkout
+   writes over is lost, as the operation holds the run's snapshot of the
+   directory (§7.4). This is the one crash that records anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
@@ -1077,7 +1064,11 @@ language: `fetch` and `push` are the only things that change them.
   each remote bookmark `name` is the label `name` on the commit it points at;
   labels for bookmarks that no longer exist on the remote are removed; commits
   reachable from remote bookmarks become visible. Fetching never moves the
-  focus or touches the working directory. It records one operation.
+  focus or touches the working directory. It records one operation. When
+  the import rewrites or abandons the focus or a commit below it, the focus
+  is rebased as jj rebases descendants, and the working copy is then stale
+  (§7.4): the next run records what has changed in the directory onto the
+  rebased focus, and the next program that persists writes its files.
 - **`push EXPR`** evaluates `EXPR` (§1.1); a function result is applied to
   the recorded repository. The value must be a list whose elements are records
   of two shapes:
@@ -1163,11 +1154,13 @@ which there was no repository, exit 1 with `j: nothing to undo`.
 it records an operation restoring the view of the operation that undo
 discarded, marked as a redo. Otherwise exit 1 with `j: nothing to redo`.
 
-Both refuse, before doing anything, if the working directory differs from the
-focused commit's files: `j: working copy has changes not in @; run \`j id\`
-to record them or discard them`. Both check out the restored focus before
-recording their operation; when that checkout fails they record nothing,
-and what it wrote is put back as §7.5 step 7 says.
+Both refuse, before doing anything, if the working directory holds a change
+the focused commit does not, as a snapshot would find it (§7.4; a stale
+working copy holds none where the directory holds what was last checked out
+or what the commit has): `j: working copy has changes not in @; run \`j id\`
+to record them or discard them`. Both record their operation and then check
+out the restored focus, as persistence does (§7.5 step 7): a checkout that
+fails leaves the operation recorded, and `redo` or `undo` goes back.
 Undoing a `push` restores the recorded labels and leaves the remote untouched.
 
 **`ops`** prints the operation log, newest first, one line each: relative
@@ -1195,7 +1188,8 @@ that state, §7.2 applies.
   and checked out; the current head is git's `HEAD`, also when it is
   detached. Over an existing git repository the checkout writes no file: the
   working directory is taken as it is, and what it holds beyond the head
-  becomes the working-copy commit's change. It exits 2 if the directory is
+  becomes the working-copy commit's change. A checkout that fails leaves the
+  operation recorded, as §7.5 step 7 says. It exits 2 if the directory is
   already inside a jj repository, or if `.git` exists but is not a directory
   (a git worktree or submodule). It requires `user` (§7.9).
 - **`clone URL [DIR]`** creates `DIR` and its missing parents (exit 2 if

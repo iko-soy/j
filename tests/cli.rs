@@ -691,14 +691,28 @@ fn names_the_filesystem_holds_are_accepted_at_any_length() {
 const CONTENT_OF_A: &str =
     "\\r -> show (map (\\c -> [c.message (contentAt [\"a\"] c.files)]) (commits (top r)))";
 
+/// An expression showing, for the commit with each of `messages`, the text
+/// at each of `paths` (in the language's syntax), in that order: siblings
+/// made or rewritten by one operation are listed in no order of their own
+fn texts_by_message(paths: &[&str], messages: &[&str]) -> String {
+    let texts: Vec<String> = paths.iter().map(|p| format!("(text (contentAt {} f))", p)).collect();
+    let messages: Vec<String> = messages.iter().map(|m| format!("\"{}\"", m)).collect();
+    format!(
+        "\\r -> show (map (\\m -> let f = (focus (goto (matching (\\c -> c.message == m) all) r)).files in [{}]) [{}])",
+        texts.join(" "),
+        messages.join(" ")
+    )
+}
+
 #[test]
-fn a_checkout_that_fails_records_nothing() {
-    // §7.5 step 7, §7.7: the operation was published before the checkout,
-    // so a checkout the filesystem refused (a path longer than PATH_MAX
-    // here; a name longer than a smaller NAME_MAX, a full disk) crashed
-    // with the operation recorded and the working directory half written.
-    // The working copy was never advanced, so the next run snapshotted
-    // the uncommitted edit, now overwritten on disk, into the new focus.
+fn a_checkout_that_fails_is_recorded_and_undone() {
+    // §7.5 step 7, §7.7: the operation was published only once the checkout
+    // had completed, so a checkout the filesystem refused (a path longer
+    // than PATH_MAX here; a name longer than a smaller NAME_MAX, a full
+    // disk) was put back file by file, and a put-back can fail as well. The
+    // operation is now published first, as jj does, and a checkout that
+    // fails leaves it recorded: the crash says so, the next run takes what
+    // the checkout wrote for the focus's own, and `j undo` goes back.
     let r = setup();
     r.write("a", "p\n");
     r.j(&["describe \"P\""]).ok();
@@ -717,25 +731,28 @@ fn a_checkout_that_fails_records_nothing() {
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops, "the failed checkout was recorded");
-    assert_eq!(r.j(&["log"]).ok().stdout, log);
-    // the checkout wrote P's `a` before it failed; the edit is put back
-    assert_eq!(r.read("a"), "x2\n");
-    // and the directories it made for the deep path are gone: left empty,
-    // they grew past PATH_MAX once the workspace moved deeper, and every
-    // run failed to scan them
-    assert!(!r.dir.join("d".repeat(250)).exists());
-    // and recorded where it was made
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert!(out.stderr.contains("only partly updated"), "{}", out.stderr);
+    assert!(out.stderr.contains("`j undo` goes back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    // the checkout wrote P's `a` before it failed
+    assert_eq!(r.read("a"), "p\n");
+    // which is not recorded into P, nor into X, which holds the edit the
+    // run recorded
     r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     let files = r.j(&[CONTENT_OF_A]).ok().stdout;
     assert_eq!(files.trim(), r#"[["" (blob "")] ["P" (blob "p\n")] ["X" (blob "x2\n")]]"#);
+    r.j(&["undo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn undo_whose_checkout_fails_records_nothing() {
-    // §7.7: `undo` and `redo` published their operation before checking the
-    // restored focus out, and so recorded it when that failed
+fn an_undo_whose_checkout_fails_is_recorded_and_redone() {
+    // §7.7: `undo` and `redo` publish their operation before checking the
+    // restored focus out, as every run does (§7.5 step 7); a checkout that
+    // fails leaves it recorded, and `j redo` goes back
     let r = setup();
     r.write("a", "one\n");
     // a file as deep as this workspace can hold (PATH_MAX, 4096 bytes with
@@ -762,14 +779,18 @@ fn undo_whose_checkout_fails_records_nothing() {
     let out = r.j(&["undo"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops, "the failed undo was recorded");
-    // the checkout wrote `a` before it failed; it is put back, so the
-    // working directory still equals the focus and there is nothing to record
-    assert_eq!(r.read("a"), "two\n");
-    // nor is any of the directories it made on the way to `f`
-    assert!(!r.dir.join("d".repeat(250)).exists());
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert!(out.stderr.contains("`j redo` goes back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    // the checkout wrote `a` before it failed, which the next run takes for
+    // the restored focus's own
+    assert_eq!(r.read("a"), "one\n");
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["redo"]).ok();
+    assert_eq!(r.read("a"), "two\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 /// Path components, in the language's syntax, of a path under `first` far
@@ -779,19 +800,20 @@ fn too_deep(first: &str) -> String {
 }
 
 #[test]
-fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
-    // §7.5 step 7: the put-back scanned the whole directory, tracking every
-    // file the `.gitignore` the failed checkout had just written did not
-    // ignore, and checked the run's starting tree out over that. A file
-    // that `.gitignore` had stopped ignoring was deleted though nothing had
-    // written it, even one at a path the focus adds, which the checkout
-    // leaves alone; a file the checkout wrote that it newly ignored stayed,
-    // and the next run recorded it.
+fn a_failed_checkout_leaves_ignored_files_alone() {
+    // §7.5 step 7: a failed checkout was put back, which scanned the whole
+    // directory with the `.gitignore` the checkout had just written, and so
+    // could read into the store, or delete, an ignored file; a checkout
+    // that fails is now left as it is, for the next run to carry on from.
+    // An ignored file where the focus adds one is left alone by the
+    // checkout, which writes no file over one, by the runs after it, which
+    // read none, and by `j undo`, which takes back only what was written.
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
-    r.write("secret.env", "API_KEY=hunter2\n");
+    let secret = "API_KEY=hunter2\n";
+    r.write("secret.env", secret);
     r.write("local.env", "mine\n");
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
@@ -800,7 +822,7 @@ fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
     // parenthesised: side by side, the second would update the first (§3).
     let edit = format!(
         "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\".gitignore\"]) c.files ++ [\
-         ({{ path = [\".gitignore\"], content = blob \"build/\\n\" }}) \
+         ({{ path = [\".gitignore\"], content = blob \"*.env\\n*.log\\n\" }}) \
          ({{ path = [\"build\" \"out\"], content = blob \"built\\n\" }}) \
          ({{ path = [\"local.env\"], content = blob \"committed\\n\" }}) \
          ({{ path = [{}], content = blob \"deep\" }})] }})",
@@ -812,63 +834,72 @@ fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.read(".gitignore"), "*.env\n");
-    assert_eq!(r.read("secret.env"), "API_KEY=hunter2\n");
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read(".gitignore"), "*.env\n*.log\n");
+    assert_eq!(r.read("build/out"), "built\n");
+    assert_eq!(r.read("secret.env"), secret);
     assert_eq!(r.read("local.env"), "mine\n");
+    r.j(&["log"]).ok();
+    assert!(!has_blob(&r, secret));
+    assert!(!has_blob(&r, "mine\n"));
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read(".gitignore"), "*.env\n");
     assert!(!r.dir.join("build").exists());
-    assert!(!r.dir.join("zz").exists());
-    // the working directory is as it was, so there is nothing to record
+    assert_eq!(r.read("secret.env"), secret);
+    assert_eq!(r.read("local.env"), "mine\n");
+    assert!(!has_blob(&r, secret));
+    assert!(!has_blob(&r, "mine\n"));
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
     assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
 #[test]
-fn a_failed_checkout_keeps_the_directories_that_were_there() {
-    // §7.5 step 7: the put-back removed what the checkout had written at the
-    // paths the focus adds with a checkout, which also removes each
-    // directory it leaves empty, so the empty directories the user had made
-    // before the run under such a path went too
+fn undoing_a_failed_checkout_keeps_the_ignored_files_where_it_wrote() {
+    // §7.5 step 7, §7.7: `j undo` after a failed checkout removes the files
+    // it added and, as any checkout does, the directories that leaves
+    // empty; one holding an ignored file is not, and stays, file and all
     let r = setup();
+    r.write(".gitignore", "*.log\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     std::fs::create_dir(r.dir.join("logs")).unwrap();
-    std::fs::create_dir_all(r.dir.join("uploads/tmp")).unwrap();
+    r.write("logs/old.log", "old\n");
+    let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    // `logs/x` and `uploads/tmp/y` are written, then the deep path fails
+    // `logs/x` is written, then the deep path fails
     let edit = format!(
         "mapRoot (\\c -> c {{ files = c.files ++ [\
          ({{ path = [\"logs\" \"x\"], content = blob \"x\\n\" }}) \
-         ({{ path = [\"uploads\" \"tmp\" \"y\"], content = blob \"y\\n\" }}) \
          ({{ path = [{}], content = blob \"deep\" }})] }})",
         too_deep("zz")
     );
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("logs/x"), "x\n");
+    r.j(&["undo"]).ok();
     assert!(!r.dir.join("logs/x").exists());
-    assert!(!r.dir.join("uploads/tmp/y").exists());
-    assert!(!r.dir.join("zz").exists());
-    assert!(r.dir.join("logs").is_dir());
-    assert!(r.dir.join("uploads/tmp").is_dir());
+    assert_eq!(r.read("logs/old.log"), "old\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
-/// Run `edit`, whose checkout writes `m/0` … `m/<n-1>` and then fails (or
-/// whose operation then fails to publish), and call `meanwhile` with the
-/// process stopped while it writes them, after the scan it starts from and
-/// before its put-back looks at what is there
+/// Run `edit`, whose checkout writes `m/0` … `m/<n-1>` and more after them,
+/// and call `meanwhile` with the process stopped while it writes `m`, once
+/// its operation is published
 #[cfg(target_os = "linux")]
 fn stopped_mid_checkout(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce()) -> Out {
     stopped_mid_checkout_as(r, edit, n, |_| meanwhile())
 }
 
 /// `stopped_mid_checkout`, calling `meanwhile` with the stopped process's
-/// id. The process ignores SIGXFSZ, so that a write past a file size limit
-/// set on it fails (EFBIG) rather than killing it.
+/// id, which may signal it. The process ignores SIGXFSZ, so that a write
+/// past a file size limit set on it fails (EFBIG) rather than killing it.
 #[cfg(target_os = "linux")]
 fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce(libc::pid_t)) -> Out {
     use std::os::unix::process::CommandExt;
@@ -902,8 +933,7 @@ fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnc
         assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
     }
     assert!(libc::WIFSTOPPED(status), "exited before it was stopped");
-    // all of `m` is written before the checkout fails, and the put-back
-    // removes `m/0` first: this is before the checkout failed
+    // all of `m` is written before anything after it
     let written = std::fs::read_dir(r.dir.join("m")).unwrap().count();
     let in_time = first.exists() && written < n;
     let done = if in_time {
@@ -936,6 +966,18 @@ fn slow_failing_edit(files: &str, n: usize) -> String {
     )
 }
 
+/// An edit giving the focus `files` (the language's syntax, over the focus
+/// `c`), the empty files `m/0` … `m/<n-1>`, and `zz`, which is not empty:
+/// a file created is written in full, and only `zz` is cut short by a
+/// full disk (`fill_disk`)
+#[cfg(target_os = "linux")]
+fn slow_edit(files: &str, n: usize) -> String {
+    format!(
+        "mapRoot (\\c -> c {{ files = {} ++ map (\\i -> {{ path = [\"m\" (show i)], content = blob \"\" }}) (range 0 {}) ++ [{{ path = [\"zz\"], content = blob \"z\\n\" }}] }})",
+        files, n
+    )
+}
+
 /// Leave the stopped process `pid` no room to write: from here on each
 /// write that would make a file longer than nothing fails, as on a full
 /// disk, while it can still create, empty and remove files
@@ -945,19 +987,77 @@ fn fill_disk(pid: libc::pid_t) {
     assert_eq!(unsafe { libc::prlimit(pid, libc::RLIMIT_FSIZE, &none, std::ptr::null_mut()) }, 0);
 }
 
+/// The number of files in `m`
+#[cfg(target_os = "linux")]
+fn in_m(r: &Repo) -> usize {
+    std::fs::read_dir(r.dir.join("m")).map_or(0, |d| d.count())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_interrupted_checkout_is_carried_on_by_the_next_run() {
+    // §1.3, §7.5 step 7: the checkout ran before the operation was
+    // published, so a run killed part way through it (SIGKILL here; a crash,
+    // a power cut) left the working copy at the commit the user was on,
+    // and the next run recorded into that commit the files the checkout had
+    // written. The operation is now published first: the next run takes
+    // those files for the focus's own, records only what changed meanwhile,
+    // and a run that changes the repository finishes the checkout.
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("work.txt", "my work\n");
+    r.j(&["describe \"W\""]).ok();
+    r.write("work.txt", "my work, edited\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // S, a new child of base: `work.txt`, after `m`, is still there when
+    // the run is killed
+    let edit = format!("describe \"S\" . ({}) . new . prev", slow_edit("c.files", n));
+    let out = stopped_mid_checkout_as(&r, &edit, n, |pid| {
+        r.write("mine.txt", "mine\n");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    });
+    assert_eq!(out.code, -1, "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert!(in_m(&r) < n);
+    assert_eq!(r.read("work.txt"), "my work, edited\n");
+    // W holds the edit, and S only what was made meanwhile
+    let paths = "\\r -> show (map (\\m -> map (\\e -> e.path) (restrict (neg (under ./m)) \
+                 (focus (goto (matching (\\c -> c.message == m) all) r)).files)) [\"base\" \"W\" \"S\"])";
+    let paths = r.j(&[paths]).ok().stdout;
+    assert_eq!(
+        paths.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[[["keep.txt"]] [["keep.txt"] ["work.txt"]] [["keep.txt"] ["mine.txt"] ["zz"]]]"#
+    );
+    let text = "\\r -> text (contentAt [\"work.txt\"] (files (goto (matching (\\c -> c.message == \"W\") all) r)))";
+    assert_eq!(r.j(&[text]).ok().stdout, "my work, edited\n");
+    r.j(&["describe \"S2\""]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert!(!r.dir.join("work.txt").exists());
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    assert_eq!(r.read("mine.txt"), "mine\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn a_failed_checkout_keeps_what_changed_meanwhile() {
     // §7.5 step 7: the put-back rescanned the whole directory, so a file
-    // edited or created while the checkout ran was recorded in its scan,
-    // then reverted or deleted by checking the starting tree out over it,
-    // though the focus did not touch that path
+    // edited or created while the checkout ran could be taken back with
+    // what the checkout wrote. Nothing is put back now, and the next run
+    // records what changed meanwhile into the focus, beside what the
+    // checkout wrote and the file the full disk cut short.
     let r = setup();
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    let out = stopped_mid_checkout(&r, &slow_failing_edit("c.files", n), n, || {
+    let out = stopped_mid_checkout_as(&r, &slow_edit("c.files", n), n, |pid| {
+        fill_disk(pid);
         r.write("keep.txt", "edited meanwhile\n");
         r.write("mine.txt", "mine\n");
         std::fs::create_dir(r.dir.join("notes")).unwrap();
@@ -965,30 +1065,36 @@ fn a_failed_checkout_keeps_what_changed_meanwhile() {
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     assert_eq!(r.read("keep.txt"), "edited meanwhile\n");
     assert_eq!(r.read("mine.txt"), "mine\n");
     assert_eq!(r.read("notes/todo.md"), "my notes\n");
-    assert!(!r.dir.join("m").exists());
-    assert!(!r.dir.join("zz").exists());
-    // the next run records them into the commit they were made on
     r.j(&["id"]).ok();
-    let paths = r.j(&["\\r -> show (map (\\e -> e.path) (files r))"]).ok().stdout;
-    assert_eq!(paths.trim(), r#"[["keep.txt"] ["mine.txt"] ["notes" "todo.md"]]"#);
-    let texts = r.j(&["\\r -> show (map (\\e -> text e.content) (files r))"]).ok().stdout;
-    assert_eq!(texts.trim(), r#"["edited meanwhile\n" "mine\n" "my notes\n"]"#);
+    let texts = "\\r -> show (map (\\e -> [e.path (text e.content)]) (restrict (neg (under ./m)) (files r)))";
+    let texts = r.j(&[texts]).ok().stdout;
+    let texts = texts.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        texts.starts_with(r#"[[["keep.txt"] "edited meanwhile\n"] [["mine.txt"] "mine\n"] [["notes" "todo.md"] "my notes\n"] [["zz"] "#),
+        "{}",
+        texts
+    );
+    assert_eq!(in_m(&r), n);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn a_failed_checkout_keeps_what_was_saved_meanwhile_where_it_wrote() {
     // §7.5 step 7: the put-back gave each path the focus changes back what
-    // the directory held there, whatever the path held by then, so a file
-    // saved meanwhile at such a path, after the checkout wrote it or before
-    // it got there, was reverted or deleted. A path is put back only while
-    // it holds what the checkout wrote: the focus's content, or the start
-    // of it that a write cut short (by a full disk) leaves.
+    // the directory held there, so a file saved meanwhile at such a path,
+    // after the checkout wrote it or before it got there, was lost unless
+    // the put-back recognised what the checkout had written. Nothing is put
+    // back now: the next run takes the directory for a change to what it
+    // held when the checkout began, and what was saved meanwhile where the
+    // checkout writes is a conflict with the focus's content, neither lost.
+    // So is the file the full disk cut short.
     let r = setup();
     r.write("a.txt", "a\n");
     r.write("b.txt", "b\n");
@@ -996,35 +1102,40 @@ fn a_failed_checkout_keeps_what_was_saved_meanwhile_where_it_wrote() {
     r.write("b.txt", "b edited\n");
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    // `a.txt` and `b.txt` are written before `m`, `n.txt` after it
+    // `a.txt` and `b.txt` are written before `m`, `n.txt` after it, and
+    // then `zz` fails on the full disk
     let files = "[({ path = [\"a.txt\"], content = blob \"focus a\\n\" }) \
-                 ({ path = [\"b.txt\"], content = blob \"focus b, and more\\n\" }) \
+                 ({ path = [\"b.txt\"], content = blob \"focus b\\n\" }) \
                  ({ path = [\"n.txt\"], content = blob \"focus n\\n\" })]";
-    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
+    let out = stopped_mid_checkout_as(&r, &slow_edit(files, n), n, |pid| {
+        fill_disk(pid);
         r.write("a.txt", "mine a\n");
-        r.write("b.txt", "focus b");
+        r.write("b.txt", "mine b\n");
         r.write("n.txt", "mine n\n");
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     assert_eq!(r.read("a.txt"), "mine a\n");
-    assert_eq!(r.read("b.txt"), "b edited\n");
+    assert_eq!(r.read("b.txt"), "mine b\n");
     assert_eq!(r.read("n.txt"), "mine n\n");
-    assert!(!r.dir.join("m").exists());
-    // the next run records what was saved into the commit it was saved on
+    assert_eq!(r.read("zz"), "");
     r.j(&["id"]).ok();
-    let texts = r.j(&["\\r -> show (map (\\e -> [e.path (text e.content)]) (files r))"]).ok().stdout;
-    assert_eq!(
-        texts.trim(),
-        r#"[[["a.txt"] "mine a\n"] [["b.txt"] "b edited\n"] [["n.txt"] "mine n\n"]]"#
-    );
+    let conflicted = r.j(&["\\r -> show (conflicted (files r))"]).ok().stdout;
+    assert_eq!(conflicted.trim(), r#"[["a.txt"] ["b.txt"] ["n.txt"] ["zz"]]"#);
+    for (path, mine, focus) in [("a.txt", "mine a", "focus a"), ("b.txt", "mine b", "focus b"), ("n.txt", "mine n", "focus n")] {
+        let text = r.read(path);
+        assert!(text.contains(mine) && text.contains(focus), "{}: {}", path, text);
+    }
+    assert!(r.read("zz").contains("z\n"), "{}", r.read("zz"));
+    assert_eq!(in_m(&r), n);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 /// Whether the repository's git store holds `content` as a loose object,
 /// as each object j writes is
-#[cfg(target_os = "linux")]
 fn has_blob(r: &Repo, content: &str) -> bool {
     let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content.as_bytes())
         .unwrap()
@@ -1034,12 +1145,14 @@ fn has_blob(r: &Repo, content: &str) -> bool {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn an_ignored_file_replaced_meanwhile_where_the_focus_adds_one_is_left_alone() {
+fn an_ignored_file_saved_meanwhile_where_the_focus_adds_one_is_left_alone() {
     // §7.5 step 7: an ignored file at a path the focus adds is left alone,
-    // as the checkout does not write over it, but it was known by its
-    // inode: one an editor saved meanwhile by renaming a new file over it
-    // was taken for the checkout's own, read into the store and deleted.
-    // One still there is left alone even if it holds the focus's content.
+    // as the checkout does not write over it. The put-back knew the file by
+    // its inode, so one an editor saved meanwhile by renaming a new file
+    // over it was taken for the checkout's own, read into the store and
+    // deleted. Neither the failed checkout nor the runs after it read or
+    // remove such a file; one the checkout wrote, where one was removed
+    // meanwhile, stays ignored.
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
@@ -1048,10 +1161,11 @@ fn an_ignored_file_replaced_meanwhile_where_the_focus_adds_one_is_left_alone() {
     r.write("local.env", "SECRET=v1\n");
     r.write("o.env", "o\n");
     r.write("p.env", "p\n");
+    let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
     // the checkout skips `k.env` and `local.env` before `m`, and `o.env`
-    // and `p.env` after it
+    // after it
     let files = "c.files ++ [({ path = [\"k.env\"], content = blob \"committed k\\n\" }) \
                  ({ path = [\"local.env\"], content = blob \"committed\\n\" }) \
                  ({ path = [\"o.env\"], content = blob \"committed o\\n\" }) \
@@ -1060,55 +1174,112 @@ fn an_ignored_file_replaced_meanwhile_where_the_focus_adds_one_is_left_alone() {
     let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
         r.write("local.env.tmp", saved);
         std::fs::rename(r.dir.join("local.env.tmp"), r.dir.join("local.env")).unwrap();
-        // the start of the focus's content, which is not taken for a write
-        // cut short where an ignored file was
         r.write("o.env.tmp", "committed");
         std::fs::rename(r.dir.join("o.env.tmp"), r.dir.join("o.env")).unwrap();
-        // removed, so the checkout writes the focus's `p.env`, which is its
-        // own to put back
+        // removed, so the checkout writes the focus's `p.env`
         std::fs::remove_file(r.dir.join("p.env")).unwrap();
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.read("k.env"), "committed k\n");
-    assert_eq!(r.read("local.env"), saved);
-    assert_eq!(r.read("o.env"), "committed");
-    assert!(!r.dir.join("p.env").exists());
-    assert!(!r.dir.join("m").exists());
-    assert!(!has_blob(&r, saved));
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let unchanged = |r: &Repo| {
+        assert_eq!(r.read("k.env"), "committed k\n");
+        assert_eq!(r.read("local.env"), saved);
+        assert_eq!(r.read("o.env"), "committed");
+        assert_eq!(r.read("p.env"), "committed p\n");
+        assert!(!has_blob(r, saved));
+        assert!(!has_blob(r, "committed"));
+    };
+    unchanged(&r);
     // the run wrote the focus's objects before its checkout
     assert!(has_blob(&r, "committed p\n"));
+    r.j(&["log"]).ok();
+    unchanged(&r);
+    r.j(&["undo"]).ok();
+    unchanged(&r);
+    assert!(!r.dir.join("m").exists());
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+/// Run `edit`, which must take a while to evaluate, over a directory with a
+/// change to record, and call `meanwhile` with the process stopped once the
+/// snapshot's operation is written, before it publishes one
+#[cfg(target_os = "linux")]
+fn stopped_before_publish(r: &Repo, edit: &str, meanwhile: impl FnOnce()) -> Out {
+    let ops_dir = r.dir.join(".jj/repo/op_store/operations");
+    let heads_dir = r.dir.join(".jj/repo/op_heads/heads");
+    let count = || std::fs::read_dir(&ops_dir).unwrap().count();
+    let heads = || {
+        let mut names: Vec<_> = std::fs::read_dir(&heads_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        names
+    };
+    let (before, published) = (count(), heads());
+    let mut child = Command::new(j_bin())
+        .arg(edit)
+        .current_dir(&r.dir)
+        .env("XDG_CONFIG_HOME", &r.cfg)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    while count() == before {
+        assert!(child.try_wait().unwrap().is_none(), "exited before its snapshot");
+        std::thread::yield_now();
+    }
+    let mut status = 0;
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+        assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
+    }
+    assert!(libc::WIFSTOPPED(status), "exited before it was stopped");
+    let in_time = heads() == published;
+    let done = if in_time {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(meanwhile))
+    } else {
+        Ok(())
+    };
+    unsafe { libc::kill(pid, if in_time { libc::SIGCONT } else { libc::SIGKILL }) };
+    let out = child.wait_with_output().unwrap();
+    assert!(in_time, "stopped too late: an operation was published");
+    if let Err(e) = done {
+        std::panic::resume_unwind(e);
+    }
+    Out {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_failed_publish_reads_no_ignored_file_into_the_store() {
-    // §7.5 step 7: once a checkout has completed, the working-copy state
-    // tracks the ignored file it skipped at a path the focus adds. When
-    // publishing the operation then failed, the put-back's scan read that
-    // file into the store, though it left it alone.
+fn a_run_that_fails_to_publish_writes_nothing() {
+    // §7.5 step 7: the operation is published before the checkout, so one
+    // that fails to publish records nothing and writes nothing: the
+    // directory, its ignored files and its uncommitted edit are as they
+    // were, and none of the ignored files is read into the store
     let r = setup();
     r.write(".gitignore", "*.env\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     let secret = "SECRET=hunter2\n";
     r.write("local.env", secret);
+    r.write("keep.txt", "my uncommitted edit\n");
+    let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    let n = 2000;
-    let edit = format!(
-        "mapRoot (\\c -> c {{ files = c.files ++ [({{ path = [\"b\"], content = blob \"b\\n\" }}) \
-         ({{ path = [\"local.env\"], content = blob \"committed\\n\" }})] \
-         ++ map (\\i -> {{ path = [\"m\" (show i)], content = blob \"m\\n\" }}) (range 0 {}) }})",
-        n
-    );
+    let edit = "mapRoot (\\c -> c { message = show (foldl (+) 0 (range 0 300000)), \
+                files = c.files ++ [({ path = [\"b\"], content = blob \"b\\n\" }) \
+                ({ path = [\"local.env\"], content = blob \"committed\\n\" })] })";
     // a file where jj keeps its operation heads: publishing fails
     let heads = r.dir.join(".jj/repo/op_heads/heads");
     let aside = heads.with_extension("aside");
-    let out = stopped_mid_checkout(&r, &edit, n, || {
+    let out = stopped_before_publish(&r, edit, || {
         std::fs::rename(&heads, &aside).unwrap();
         std::fs::write(&heads, "").unwrap();
     });
@@ -1116,200 +1287,176 @@ fn a_failed_publish_reads_no_ignored_file_into_the_store() {
     std::fs::rename(&aside, &heads).unwrap();
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot publish"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert!(!out.stderr.contains("recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
     assert_eq!(r.read("local.env"), secret);
+    assert_eq!(r.read("keep.txt"), "my uncommitted edit\n");
     assert!(!r.dir.join("b").exists());
-    assert!(!r.dir.join("m").exists());
     assert!(!has_blob(&r, secret));
+    // the run wrote the focus's objects before it tried to publish
     assert!(has_blob(&r, "committed\n"));
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let text = r.j(&["\\r -> text (contentAt [\"keep.txt\"] (files r))"]).ok().stdout;
+    assert_eq!(text, "my uncommitted edit\n");
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_checkout_that_fills_the_disk_is_put_back() {
-    // §7.5 step 7: the put-back wrote the trees its checkouts read to the
-    // store before it removed anything, so a checkout that had used up the
-    // disk could not be put back at all: the files it had added stayed, and
-    // the next run recorded them. What the checkout added is removed first,
-    // and where it replaced nothing, nothing is written.
+fn a_checkout_that_fills_the_disk_is_recorded_and_carried_on_from() {
+    // §7.5 step 7: a checkout that used up the disk was put back, and the
+    // put-back had to write too; where it could not, the edit the checkout
+    // had written over was recorded alone, or lost. The operation, which
+    // holds the edit, is recorded before the checkout begins, and the next
+    // run takes what the checkout wrote for the focus's own, and the file
+    // it cut short for a conflict with what the focus holds there.
     let r = setup();
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
     r.write("keep.txt", "my uncommitted edit\n");
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    let out = stopped_mid_checkout_as(&r, &slow_failing_edit("c.files", n), n, fill_disk);
+    let out = stopped_mid_checkout_as(&r, &slow_edit("c.files", n), n, fill_disk);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert!(!r.dir.join("m").exists());
-    assert_eq!(r.read("keep.txt"), "my uncommitted edit\n");
-    // the next run records the edit into the commit it was made on
-    r.j(&["id"]).ok();
-    let texts = r.j(&["\\r -> show (map (\\e -> [e.path (text e.content)]) (files r))"]).ok().stdout;
-    assert_eq!(texts.trim(), r#"[[["keep.txt"] "my uncommitted edit\n"]]"#);
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn a_failed_checkout_that_cannot_be_put_back_records_the_edits_it_overwrote() {
-    // §7.5 step 7: a checkout records nothing until it has completed, so
-    // when one that had written over an uncommitted edit could not be put
-    // back, the edit was in no file and no commit. Here the disk is full:
-    // what the checkout added is removed, but the file it replaced cannot
-    // be written back. The snapshot the run started from is recorded
-    // instead, as `j id` records it.
-    let r = setup();
-    r.write("a.txt", "a\n");
-    r.j(&["describe \"base\""]).ok();
-    r.write("a.txt", "my uncommitted edit\n");
-    let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    let n = 2000;
-    // `a.txt` is written before `m`
-    let files = "[{ path = [\"a.txt\"], content = blob \"focus a\\n\" }]";
-    let out = stopped_mid_checkout_as(&r, &slow_failing_edit(files, n), n, fill_disk);
-    assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
-    assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
-    // what it added is gone, what it replaced is still there
-    assert!(!r.dir.join("m").exists());
-    assert_eq!(r.read("a.txt"), "focus a\n");
-    // the next run records what the directory holds; undoing that gives
-    // the edit back
+    assert_eq!(r.read("keep.txt"), "my uncommitted edit\n");
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "");
     r.j(&["id"]).ok();
-    r.j(&["undo"]).ok();
-    assert_eq!(r.read("a.txt"), "my uncommitted edit\n");
-    let texts = r.j(&["\\r -> show (map (\\c -> [c.message (contentAt [\"a.txt\"] c.files)]) (commits (top r)))"]).ok().stdout;
-    assert_eq!(texts.trim(), r#"[["" (blob "")] ["base" (blob "my uncommitted edit\n")]]"#);
+    let conflicted = r.j(&["\\r -> show (conflicted (files r))"]).ok().stdout;
+    assert_eq!(conflicted.trim(), r#"[["zz"]]"#);
+    let text = r.j(&["\\r -> text (contentAt [\"keep.txt\"] (files r))"]).ok().stdout;
+    assert_eq!(text, "my uncommitted edit\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_put_back_that_something_blocks_says_so() {
-    // §7.5 step 7: jj's checkout skips a path something is in the way of
-    // without failing, and the put-back did not look, so where it could not
-    // write a file back the crash said nothing and the next run recorded
-    // the file as deleted. Here what is in the way is a file created
-    // meanwhile in the directory the failed checkout made of `a`, which
-    // the put-back used to delete.
+fn a_fetch_after_a_failed_checkout_leaves_every_command_working() {
+    // §7.4, §7.6: when a checkout that filled the disk could not be put
+    // back, the snapshot it had written over was recorded alone, leaving
+    // the working-copy state behind the commit; one `j fetch` or `j push`
+    // after that, and every run, `j log` included, exited 2 as over a stale
+    // working copy, and `j undo` was refused. A failed checkout now leaves
+    // its operation recorded and the state stale, which refuses nothing.
     let r = setup();
-    r.write("a", "precious\n");
-    r.j(&["describe \"base\""]).ok();
-    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.write("a", "a\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"W\""]).ok();
+    r.write("a", "my uncommitted edit\n");
     let n = 2000;
-    // `a` becomes a directory holding `a/x`, then `m` is written
-    let files = "filter (\\e -> e.path /= [\"a\"]) c.files ++ [{ path = [\"a\" \"x\"], content = blob \"x\\n\" }]";
-    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
-        r.write("a/mine", "mine\n");
-    });
+    // S, a new child of B, writes `a` before `m`
+    let files = "[{ path = [\"a\"], content = blob \"s\\n\" }]";
+    let edit = format!("describe \"S\" . ({}) . new . prev", slow_edit(files, n));
+    let out = stopped_mid_checkout_as(&r, &edit, n, fill_disk);
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
-    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    // what it wrote is gone, and what is in the way of `a` is kept
-    assert!(!r.dir.join("a/x").exists());
-    assert!(!r.dir.join("m").exists());
-    assert!(!r.dir.join("zz").exists());
-    assert_eq!(r.read("a/mine"), "mine\n");
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    let origin = r.cfg.join("origin.git");
+    let git = Command::new("git").args(["init", "-q", "--bare"]).arg(&origin).status().unwrap();
+    assert!(git.success());
+    r.j(&["remote", origin.to_str().unwrap()]).ok();
+    r.j(&["fetch"]).ok();
+    r.j(&["log"]).ok();
+    let texts = r.j(&[&texts_by_message(&["[\"a\"]"], &["B", "W", "S"])]).ok().stdout;
+    assert_eq!(
+        texts.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[["a\n"] ["my uncommitted edit\n"] ["s\n"]]"#
+    );
+    r.j(&["id"]).ok();
+    r.j(&["describe \"S2\""]).ok();
+    r.j(&["goto (matching (\\c -> c.message == \"W\") all)"]).ok();
+    assert_eq!(r.read("a"), "my uncommitted edit\n");
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("a"), "s\n");
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_failed_put_back_records_the_edits_of_an_immutable_focus_in_a_child() {
-    // §7.5 step 7, §7.2: when a failed checkout cannot be put back, the
-    // snapshot the run started from is recorded as `j id` records it. An
-    // immutable working-copy commit is not rewritten: a new child of it
-    // holds the snapshot.
+fn a_failed_checkout_keeps_the_edit_of_an_immutable_focus_in_a_child() {
+    // §7.2, §7.5 step 7: with an immutable working-copy commit, a checkout
+    // that filled the disk could not be put back, and the snapshot it had
+    // written over, recorded instead in a new child of the commit, needed
+    // room on the disk as well: the uncommitted edit was lost. The
+    // operation that holds the child is now recorded before the checkout.
     let r = setup();
     let cfg = r.cfg.join("j/config.j");
     let config = std::fs::read_to_string(&cfg).unwrap();
     let immutable = "immutable = ancestorsOf trunk\n";
     assert!(config.contains(immutable));
-    let config = config.replace(immutable, "immutable = matching (\\c -> c.message == \"base\") all\n");
+    let config = config.replace(immutable, "immutable = matching (\\c -> c.message == \"W\") all\n");
     std::fs::write(&cfg, config).unwrap();
-    r.write("a", "precious\n");
-    r.j(&["describe \"base\""]).ok();
-    r.write("a", "precious, my uncommitted edit\n");
+    r.write("a", "a\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"W\""]).ok();
+    r.write("a", "my uncommitted edit\n");
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    // `a` becomes a directory holding `a/x`, and a file made in it
-    // meanwhile is in the way of writing `a` back
-    let files = "filter (\\e -> e.path /= [\"a\"]) c.files ++ [{ path = [\"a\" \"x\"], content = blob \"x\\n\" }]";
-    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
-        r.write("a/mine", "mine\n");
-    });
+    // from the child of W that holds the edit, S, a new child of B
+    let files = "[{ path = [\"a\"], content = blob \"s\\n\" }]";
+    let edit = format!("describe \"S\" . ({}) . new . prev . prev", slow_edit(files, n));
+    let out = stopped_mid_checkout_as(&r, &edit, n, fill_disk);
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
-    assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
-    assert_eq!(r.read("a/mine"), "mine\n");
-    // the next run records what the directory holds; undoing that gives
-    // the edit back, in a child of `base`, which is as it was
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(
+        files.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[["" (blob "")] ["B" (blob "a\n")] ["W" (blob "a\n")] ["" (blob "my uncommitted edit\n")] ["S" (blob "s\n")]]"#
+    );
+    r.j(&["goto (matching (\\c -> contentAt [\"a\"] c.files == blob \"my uncommitted edit\\n\") all)"]).ok();
+    assert_eq!(r.read("a"), "my uncommitted edit\n");
+}
+
+#[test]
+fn checkouts_that_fail_in_a_row_leave_each_edit_in_its_commit() {
+    // §7.4, §7.5 step 7: a failed checkout leaves the working-copy state
+    // stale, recording what the directory held when the checkout began, so
+    // the runs after it take only what changed since for their changes:
+    // here an uncommitted edit before each of two failed checkouts, each
+    // recorded into the commit it was made on
+    let r = setup();
+    r.write("a", "a\n");
+    r.write("d", "d\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"W\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let deep = format!("{{ path = [{}], content = blob \"deep\" }}", too_deep("zz"));
+    // N1, a new child of W, then N2, a new child of W beside it
+    for (path, edit, name, to) in [("a", "edit 1\n", "N1", "new"), ("d", "edit 2\n", "N2", "new . prev")] {
+        r.write(path, edit);
+        let e = format!("describe \"{}\" . mapRoot (\\c -> c {{ files = c.files ++ [{}] }}) . {}", name, deep, to);
+        let out = r.j(&[&e]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    }
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    // N2's `d` was written before its path under `zz` failed
+    assert_eq!(r.read("a"), "edit 1\n");
+    assert_eq!(r.read("d"), "d\n");
     r.j(&["id"]).ok();
-    r.j(&["undo"]).ok();
-    assert_eq!(r.read("a"), "precious, my uncommitted edit\n");
-    let texts = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    let texts = r.j(&[&texts_by_message(&["[\"a\"]", "[\"d\"]"], &["base", "W", "N1", "N2"])]).ok().stdout;
     assert_eq!(
         texts.split_whitespace().collect::<Vec<_>>().join(" "),
-        r#"[["" (blob "")] ["base" (blob "precious\n")] ["" (blob "precious, my uncommitted edit\n")]]"#
+        r#"[["a\n" "d\n"] ["edit 1\n" "d\n"] ["edit 1\n" "edit 2\n"] ["edit 1\n" "d\n"]]"#
     );
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn put_backs_that_fail_in_a_row_leave_the_next_run_recording_the_directory() {
-    // §7.4, §7.5 step 7: a snapshot that a failed checkout records alone
-    // leaves the working-copy state behind the commit, as jj leaves a
-    // stale one. The directory's changes since are changes to the
-    // snapshots recorded since the state was the commit's, here two in a
-    // row, so the next run records them onto those rather than refusing
-    // them as it does over a stale working copy; undoing gives each edit
-    // back.
-    let r = setup();
-    r.write("a", "precious\n");
-    r.write("d", "cherished\n");
-    r.j(&["describe \"base\""]).ok();
-    let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    let n = 2000;
-    // each time a file becomes a directory, and a file made in it
-    // meanwhile is in the way of writing the file back
-    for (path, edit) in [("a", "edit 1\n"), ("d", "edit 2\n")] {
-        r.write(path, edit);
-        let files = format!(
-            "filter (\\e -> e.path /= [\"{0}\"]) c.files ++ [{{ path = [\"{0}\" \"x\"], content = blob \"x\\n\" }}]",
-            path
-        );
-        let out = stopped_mid_checkout(&r, &slow_failing_edit(&files, n), n, || {
-            r.write(&format!("{}/mine", path), "mine\n");
-        });
-        assert_eq!(out.code, 1, "{}", out.stderr);
-        assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
-    }
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
-    r.j(&["id"]).ok();
-    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
-    assert_eq!(paths.trim(), r#"[["" []] ["base" [["a" "mine"] ["d" "mine"]]]]"#);
-    r.j(&["undo"]).ok();
-    assert_eq!(r.read("d"), "edit 2\n");
-    r.j(&["undo"]).ok();
-    assert_eq!(r.read("a"), "edit 1\n");
-    assert_eq!(r.read("d"), "cherished\n");
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn a_failed_checkout_says_what_it_leaves_in_a_nested_repository() {
+fn a_failed_checkout_leaves_a_nested_repository_alone() {
     // §7.5 step 7: no run reads a directory holding `.git` or `.jj`, so
-    // what a put-back leaves there is not recorded by the next run either.
-    // The put-back left a file saved there meanwhile without a word, and,
-    // while it scanned, every file the failed checkout wrote there. A file
-    // holding what the checkout wrote is removed; anything else left
-    // there, the crash names.
+    // what a checkout writes there is never recorded; the put-back removed
+    // what a failed one had written there and named what it left. Nothing
+    // there is removed now: not what was there before, not what was saved
+    // meanwhile, and, by `j undo`, not what the checkout wrote either.
     let r = setup();
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
@@ -1327,28 +1474,25 @@ fn a_failed_checkout_says_what_it_leaves_in_a_nested_repository() {
         r.write("lib/y.c", "mine\n");
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
-    assert!(out.stderr.contains("nested repository"), "{}", out.stderr);
-    assert!(out.stderr.contains("`lib/y.c`"), "{}", out.stderr);
-    assert!(!out.stderr.contains("lib/x.c"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert!(!r.dir.join("lib/x.c").exists());
-    assert_eq!(r.read("lib/y.c"), "mine\n");
-    assert_eq!(r.read("lib/own.c"), "own\n");
-    assert!(!r.dir.join("m").exists());
-    r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["undo"]).ok();
     assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.read("lib/own.c"), "own\n");
+    assert_eq!(r.read("lib/y.c"), "mine\n");
+    assert_eq!(r.read("lib/x.c"), "x\n");
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_put_back_removes_nothing_through_a_symlink() {
-    // §7.5 step 7: the put-back removes the files the checkout added one by
-    // one, and the checkout writes none through a symlink, so none is
-    // removed through one: a directory the checkout made, replaced
-    // meanwhile by a symlink to another holding the same file, is in the
-    // way of that path
+fn a_failed_checkout_removes_nothing_through_a_symlink() {
+    // §7.5 step 7, §7.7: the put-back removed what the checkout had added
+    // one file at a time; a directory the checkout made, replaced meanwhile
+    // by a symlink to one elsewhere holding the same file, was in the way.
+    // Nothing is removed after a failed checkout now, and the symlink is
+    // the user's change, which `j undo` refuses to write over.
     let r = setup();
     // where the filesystem holds no symlink, none is followed
     if std::os::unix::fs::symlink("x", r.dir.join("probe")).is_err() {
@@ -1368,80 +1512,52 @@ fn a_put_back_removes_nothing_through_a_symlink() {
         std::os::unix::fs::symlink(&elsewhere, r.dir.join("d")).unwrap();
     });
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("working copy has changes not in @"), "{}", out.stderr);
     assert_eq!(std::fs::read_to_string(elsewhere.join("f")).unwrap(), "f\n");
     assert!(r.dir.join("d").symlink_metadata().unwrap().is_symlink());
-    assert!(!r.dir.join("m").exists());
 }
 
 #[test]
-fn a_file_a_failed_checkout_replaced_by_a_directory_comes_back() {
-    // §7.5 step 7: the checkout removed the file `zz`, uncommitted edit and
-    // all, and made directories for a path under it until the path grew
-    // too long. The put-back's scan does not see empty directories, and jj
-    // skipped writing the file over them without an error, so the crash
-    // said nothing and the next run recorded `zz` as deleted.
+#[cfg(target_os = "linux")]
+fn a_checkout_whose_state_fails_to_save_is_carried_on_from() {
+    // §7.4, §7.5 step 7: a checkout that completed, but whose working-copy
+    // state could not then be saved, left the state behind the commit, and
+    // once any file was edited every run was refused as over a stale
+    // working copy. The next run takes the directory for the focus's files
+    // now, and records only the edit.
     let r = setup();
-    r.write("zz", "precious\n");
-    r.write("a", "k\n");
-    r.j(&["describe \"W\""]).ok();
-    r.write("zz", "edited, not yet recorded\n");
-    let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    let edit = format!(
-        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\"zz\"]) c.files ++ [{{ path = [{}], content = blob \"deep\" }}] }})",
-        too_deep("zz")
-    );
-    let out = r.j(&[&edit]);
-    assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.read("zz"), "edited, not yet recorded\n");
-    r.j(&["id"]).ok();
-    let files = r.j(&["\\r -> show (map (\\c -> [c.message (contentAt [\"zz\"] c.files)]) (commits (top r)))"]).ok().stdout;
-    assert_eq!(files.trim(), r#"[["" (blob "")] ["W" (blob "edited, not yet recorded\n")]]"#);
-}
-
-#[test]
-fn a_failed_checkout_puts_back_a_conflict_it_wrote() {
-    // §7.5 step 7: a path is put back only while it holds what the checkout
-    // wrote there, which for a conflict is its markers, made longer than
-    // any line of its sides that looks like one (§7.4); taken for something
-    // saved meanwhile, it would be left, and the next run would record it
-    let r = setup();
-    r.write("a.txt", "base\n");
     r.write("keep.txt", "k\n");
     r.j(&["describe \"base\""]).ok();
-    r.j(&["new"]).ok();
-    r.write("a.txt", "<<<<<<< left\n");
-    r.j(&["describe \"left\""]).ok();
-    r.j(&["new . goto parents"]).ok();
-    r.write("a.txt", "right\n");
-    r.j(&["describe \"right\""]).ok();
-    r.j(&["rebase siblings"]).ok();
-    assert_eq!(r.j(&["\\r -> show (conflicted (files r))"]).ok().stdout.trim(), "[[\"a.txt\"]]");
-    let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
-    // the conflict is written to `c.txt` and over `keep.txt` too, then the
-    // deep path fails
-    let conflict = "(filter (\\e -> e.path == [\"a.txt\"]) c.files)";
-    let edit = format!(
-        "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\"keep.txt\"]) c.files \
-         ++ map (\\e -> e {{ path = [\"c.txt\"] }}) {0} ++ map (\\e -> e {{ path = [\"keep.txt\"] }}) {0} \
-         ++ [{{ path = [{1}], content = blob \"deep\" }}] }})",
-        conflict,
-        too_deep("zz")
-    );
-    let out = r.j(&[&edit]);
+    let n = 2000;
+    // a directory where the state is saved: saving it fails
+    let state = r.dir.join(".jj/working_copy/tree_state");
+    let aside = state.with_extension("aside");
+    let out = stopped_mid_checkout(&r, &slow_edit("c.files", n), n, || {
+        std::fs::rename(&state, &aside).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("x"), "").unwrap();
+    });
+    std::fs::remove_dir_all(&state).unwrap();
+    std::fs::rename(&aside, &state).unwrap();
     assert_eq!(out.code, 1, "{}", out.stderr);
-    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert!(!r.dir.join("c.txt").exists());
-    assert_eq!(r.read("keep.txt"), "k\n");
+    assert!(out.stderr.contains("cannot save the working copy's state"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    r.write("keep.txt", "edited\n");
+    r.j(&["log"]).ok();
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    let texts = r.j(&["\\r -> show (map (\\e -> text e.content) (restrict (neg (under ./m)) (files r)))"]).ok().stdout;
+    assert_eq!(texts.trim(), r#"["edited\n" "z\n"]"#);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 /// Whether `dir`'s filesystem folds case, judged as the backend judges it:
@@ -1453,16 +1569,17 @@ fn folds_case(dir: &std::path::Path) -> bool {
 }
 
 #[test]
-fn a_failed_case_only_rename_is_put_back() {
+fn a_failed_case_only_rename_keeps_the_edits() {
     // §7.5 step 7: the put-back checked the tree back out in one go, in
     // path order. Where the filesystem folds case, a focus renaming
     // `README` to `readme` had removed `README` and written `readme` when
     // its checkout failed; the put-back wrote `README` first, which
     // `readme` was in the way of, then removed `readme`, so neither
     // spelling was left and the uncommitted edit was lost, as was a file
-    // in a directory renamed only in case. Run with TMPDIR on such a mount
-    // (exFAT through FUSE) to take that case; elsewhere the two names are
-    // two files.
+    // in a directory renamed only in case. Nothing is put back now: the
+    // edits are in the focus, and on disk under one spelling or the other.
+    // Run with TMPDIR on such a mount (exFAT through FUSE) to take that
+    // case; elsewhere the two names are two files.
     let rename = |from: &str, to: &str| {
         format!("map (\\e -> if e.path == {} then e {{ path = {} }} else e)", from, to)
     };
@@ -1486,7 +1603,7 @@ fn a_failed_case_only_rename_is_put_back() {
     // the checkout fails after the renames (at `zz`), or before them (at
     // `A`), when `readme` and `docs` name the untouched `README` and `Docs`
     // where case folds
-    for first in ["zz", "A"] {
+    for (first, readme, docs) in [("zz", "readme", "docs"), ("A", "README", "Docs")] {
         let r = setup();
         r.write("README", "hello\n");
         std::fs::create_dir(r.dir.join("Docs")).unwrap();
@@ -1499,18 +1616,24 @@ fn a_failed_case_only_rename_is_put_back() {
         let out = r.j(&[&edit(first)]);
         assert_eq!(out.code, 1, "{}", out.stderr);
         assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-        assert!(!out.stderr.contains("put back"), "{}: {}", first, out.stderr);
-        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-        assert_eq!(listed(&r.dir), ["Docs", "README", "notes"], "{}", first);
-        assert_eq!(listed(&r.dir.join("Docs")), ["a"], "{}", first);
-        assert_eq!(r.read("README"), "hello, my uncommitted edit\n");
-        assert_eq!(r.read("Docs/a"), "a, my uncommitted edit\n");
-        // the next run records the edits into the commit they were made on
+        assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+        let mut names = vec![docs.to_string(), readme.to_string(), "notes".to_string(), first.to_string()];
+        names.sort();
+        assert_eq!(listed(&r.dir), names, "{}", first);
+        assert_eq!(listed(&r.dir.join(docs)), ["a"], "{}", first);
+        assert_eq!(r.read(readme), "hello, my uncommitted edit\n");
+        assert_eq!(r.read(&format!("{}/a", docs)), "a, my uncommitted edit\n");
+        // the next run records nothing: the edits are in the focus
         r.j(&["id"]).ok();
-        let texts = r.j(&["\\r -> show (map (\\e -> [e.path (text e.content)]) (files r))"]).ok().stdout;
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+        let texts = r
+            .j(&["\\r -> show [(contentAt [\"docs\" \"a\"] (files r)) (contentAt [\"readme\"] (files r)) (contentAt [\"notes\"] (files r))]"])
+            .ok()
+            .stdout;
         assert_eq!(
             texts.split_whitespace().collect::<Vec<_>>().join(" "),
-            r#"[[["Docs" "a"] "a, my uncommitted edit\n"] [["README"] "hello, my uncommitted edit\n"] [["notes"] "n\n"]]"#
+            r#"[(blob "a, my uncommitted edit\n") (blob "hello, my uncommitted edit\n") (blob "n\n")]"#
         );
     }
 }
@@ -1851,8 +1974,9 @@ fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
 
     let r = conflict_at("a/b", &[]);
     assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
-    // a checkout that writes the file `a` over the conflicted directory
-    // and then fails is put back, which scans the file over that directory
+    // a checkout that writes the file `a` over the conflicted directory,
+    // and then fails, leaves the file there: the next run scans it over
+    // that directory, which the working-copy state still records
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let edit = format!(
         "\\r -> mapRoot (\\c -> c {{ files = [({{ path = ./a, content = blob \"f\" }}) \
@@ -1862,9 +1986,14 @@ fn a_file_replacing_a_directory_with_a_conflict_inside_is_recorded() {
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.read("a"), "f");
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["undo"]).ok();
     assert!(r.read("a/b").contains("<<<<<<<"), "{}", r.read("a/b"));
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\" \"b\"]]");
     std::fs::remove_dir_all(r.dir.join("a")).unwrap();
     r.write("a", "file\n");
     // `undo` scans to refuse a working directory not recorded
@@ -2714,15 +2843,12 @@ fn a_run_over_a_stale_working_copy_writes_the_focus() {
 }
 
 #[test]
-fn a_failed_checkout_over_a_stale_working_copy_is_put_back() {
-    // §7.5 step 7: the rescan did not find the focus as loaded, so a
-    // checkout that failed over a stale working copy was not put back: the
-    // crash said the directory had changed while the program ran, and the
-    // directories made for the deep path stayed. The directory holds what
-    // the working-copy state records, and is put back to that. (Checked out
-    // from there without a put-back, it would keep `a` written and `b`
-    // removed, and the next run would record B with `z`, not reached, as A
-    // holds it.)
+fn a_failed_checkout_over_a_stale_working_copy_is_carried_on_from() {
+    // §7.4, §7.5 step 7: a checkout that fails over a stale working copy
+    // leaves it stale, recording what the directory held when the
+    // checkout began, so the next run takes what the checkout wrote for
+    // the focus's own; `j undo` goes back, and checks out B, which the
+    // directory did not hold before
     let r = stale_working_copy();
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
@@ -2735,51 +2861,82 @@ fn a_failed_checkout_over_a_stale_working_copy_is_put_back() {
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
-    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.read("a"), "1\n");
-    assert_eq!(r.read("b"), "b\n");
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("a"), "2\n");
+    assert!(!r.dir.join("b").exists());
     assert!(!r.dir.join("z").exists());
-    assert!(!r.dir.join("m").exists());
     r.j(&["id"]).ok();
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let files = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["A" (blob "1\n")] ["B" (blob "2\n")]]"#);
+    let z = r.j(&["\\r -> show (contentAt [\"z\"] (files r))"]).ok().stdout;
+    assert_eq!(z.trim(), r#"blob "z\n""#);
+    r.j(&["undo"]).ok();
     assert_eq!(r.j(&["log"]).ok().stdout, log);
-    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
-    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B" [["a"] ["z"]]]]"#);
+    assert_eq!(r.read("a"), "2\n");
+    assert!(!r.dir.join("b").exists());
+    assert_eq!(r.read("z"), "z\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 #[test]
-fn a_stale_working_copy_with_changes_is_refused() {
+fn a_stale_working_copy_with_changes_records_them_onto_the_focus() {
     // §7.4: the snapshot read the directory against the stale state and
     // recorded all of it into the focus, so one new file beside A's files
-    // undid B: `a` back to 1, `b` back, `z` gone. Such a run now exits 2
-    // and records nothing, printing or not, and the way out it names works.
+    // undid B; then every run, printing or not, was refused until the
+    // directory was put back by hand. What the directory holds is a change
+    // to what the state records, and only that change is recorded, onto
+    // the focus.
     let r = stale_working_copy();
-    let ops = r.j(&["ops"]).ok().stdout.lines().count();
     r.write("notes.txt", "note\n");
-    for expr in ["describe \"B2\"", "id", "log"] {
-        let out = r.j(&[expr]);
-        assert_eq!(out.code, 2, "{}: {}", expr, out.stderr);
-        assert!(out.stderr.contains("the working copy is stale"), "{}", out.stderr);
-        assert!(out.stderr.contains("notes.txt"), "{}", out.stderr);
-        assert!(out.stderr.contains("nothing was recorded"), "{}", out.stderr);
-    }
-    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
-    assert_eq!(r.read("a"), "1\n");
-    assert_eq!(r.read("b"), "b\n");
-    assert!(!r.dir.join("z").exists());
-    assert_eq!(r.read("notes.txt"), "note\n");
-    // move the change aside, let a run that changes the repository write
-    // the focus, and put the change back
-    std::fs::remove_file(r.dir.join("notes.txt")).unwrap();
-    r.j(&["describe \"B2\""]).ok();
-    assert_eq!(r.read("a"), "2\n");
-    r.write("notes.txt", "note\n");
+    let paths = r.j(&["\\r -> show (map (\\e -> e.path) (files r))"]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["a"] ["notes.txt"] ["z"]]"#);
     r.j(&["id"]).ok();
     let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
-    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B2" [["a"] ["notes.txt"] ["z"]]]]"#);
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["a"] ["b"]]] ["B" [["a"] ["notes.txt"] ["z"]]]]"#);
     let files = r.j(&[CONTENT_OF_A]).ok().stdout;
-    assert_eq!(files.trim(), r#"[["" (blob "")] ["A" (blob "1\n")] ["B2" (blob "2\n")]]"#);
+    assert_eq!(files.trim(), r#"[["" (blob "")] ["A" (blob "1\n")] ["B" (blob "2\n")]]"#);
+    // and the focus is checked out
+    assert_eq!(r.read("a"), "2\n");
+    assert!(!r.dir.join("b").exists());
+    assert_eq!(r.read("z"), "z\n");
+    assert_eq!(r.read("notes.txt"), "note\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+}
+
+#[test]
+fn an_edit_over_a_stale_working_copy_to_a_file_the_focus_changed_is_a_conflict() {
+    // §7.4: B changed `a` since the state was checked out, and so did the
+    // user, differently: neither change is lost
+    let r = stale_working_copy();
+    r.write("a", "mine\n");
+    r.j(&["id"]).ok();
+    let conflicted = r.j(&["\\r -> show (conflicted (files r))"]).ok().stdout;
+    assert_eq!(conflicted.trim(), r#"[["a"]]"#);
+    let text = r.read("a");
+    assert!(text.contains("mine\n") && text.contains("2\n"), "{}", text);
+}
+
+#[test]
+fn a_stale_working_copy_without_changes_is_undone_and_redone() {
+    // §7.4, §7.7: `undo` and `redo` refuse only a directory holding changes
+    // no commit has, and a directory holding what the stale state records
+    // holds none
+    let r = stale_working_copy();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["undo"]).ok();
+    r.j(&["redo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.read("a"), "2\n");
+    assert!(!r.dir.join("b").exists());
+    assert_eq!(r.read("z"), "z\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
 }
 
 #[test]

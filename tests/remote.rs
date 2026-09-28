@@ -1273,6 +1273,126 @@ fn fetch_brings_new_commits() {
     assert!(out.stdout.contains("moved"), "{}", out.stdout);
 }
 
+/// A clone `w` of `env`'s remote, whose master holds `one`, then `s` and
+/// `t`, each adding the file of its name, and `seed`, a git clone a
+/// collaborator pushes from; the clone's working-copy commit is an empty
+/// child of `t`
+fn clone_above_s_and_t(env: &Env) -> (PathBuf, PathBuf) {
+    let seed = env.dir.join("seed");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
+    for name in ["s", "t"] {
+        std::fs::write(seed.join(name), format!("{}\n", name)).unwrap();
+        git(&seed, &["add", name]);
+        git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", name]);
+    }
+    git(&seed, &["push", "-q", "origin", "master"]);
+    let w = env.dir.join("w");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), w.to_str().unwrap()]).ok();
+    (w, seed)
+}
+
+/// Have the collaborator in `seed` replace `t` on master by `u`, as a
+/// force-push does: the next fetch abandons `t`
+fn force_push_dropping_t(seed: &PathBuf) {
+    git(seed, &["reset", "-q", "--hard", "HEAD~1"]);
+    std::fs::write(seed.join("u"), "u\n").unwrap();
+    git(seed, &["add", "u"]);
+    git(seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "u"]);
+    git(seed, &["push", "-qf", "origin", "master"]);
+}
+
+const PARENT_MESSAGE: &str = "\\r -> (focus (prev r)).message";
+const FOCUS_PATHS: &str = "\\r -> show (map (\\e -> e.path) (files r))";
+
+#[test]
+fn a_fetch_that_abandons_the_working_copys_parent_records_later_edits_onto_it() {
+    // §7.4, §7.6: fetch never touches the working directory, so when its
+    // import abandons the commit the working-copy commit is built on (a
+    // force-push, a deleted branch, a squash-merge upstream), the
+    // working-copy commit is rebased and the working copy left stale.
+    // Every snapshotting run, printing ones too, then exited 2 once the
+    // directory held an edit, blaming jj --ignore-working-copy or another
+    // workspace, and `undo` exited 1: only restoring the directory by hand
+    // got the repository going again. The directory's changes since the
+    // last checkout are now recorded onto the rebased commit.
+    let env = setup();
+    let (w, seed) = clone_above_s_and_t(&env);
+    std::fs::write(w.join("mine"), "mine\n").unwrap();
+    std::fs::write(w.join("s"), "s\nedited\n").unwrap();
+    force_push_dropping_t(&seed);
+    env.j(&w, &["fetch"]).ok();
+    assert_eq!(std::fs::read_to_string(w.join("t")).unwrap(), "t\n");
+    // a printing run shows the edits on the rebased commit, `t` gone
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "s");
+    let paths = env.j(&w, &[FOCUS_PATHS]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["a.txt"] ["mine"] ["s"]]"#);
+    // `undo` refuses to write over edits no commit holds, as ever
+    let out = env.j(&w, &["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("changes not in @"), "{}", out.stderr);
+    // `j id` records them, and writes the rebased commit's files
+    env.j(&w, &["id"]).ok();
+    assert!(!w.join("t").exists());
+    assert_eq!(std::fs::read_to_string(w.join("mine")).unwrap(), "mine\n");
+    assert_eq!(std::fs::read_to_string(w.join("s")).unwrap(), "s\nedited\n");
+    let texts = env.j(&w, &["\\r -> show (map (\\e -> [e.path (text e.content)]) (files r))"]).ok().stdout;
+    assert_eq!(
+        texts.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[[["a.txt"] "one\n"] [["mine"] "mine\n"] [["s"] "s\nedited\n"]]"#
+    );
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "s");
+    // the directory holds the focus now, so there is nothing more to record
+    let ops = env.j(&w, &["ops"]).ok().stdout.lines().count();
+    env.j(&w, &["id"]).ok();
+    assert_eq!(env.j(&w, &["ops"]).ok().stdout.lines().count(), ops);
+}
+
+#[test]
+fn a_fetch_that_abandons_the_working_copys_parent_is_undone_and_redone() {
+    // §7.6, §7.7: after such a fetch, a directory with no edit in it was
+    // refused by `undo` and `redo` too, as holding changes not in @
+    let env = setup();
+    let (w, seed) = clone_above_s_and_t(&env);
+    force_push_dropping_t(&seed);
+    env.j(&w, &["fetch"]).ok();
+    env.j(&w, &["undo"]).ok();
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "t");
+    assert_eq!(std::fs::read_to_string(w.join("t")).unwrap(), "t\n");
+    let ops = env.j(&w, &["ops"]).ok().stdout.lines().count();
+    env.j(&w, &["id"]).ok();
+    assert_eq!(env.j(&w, &["ops"]).ok().stdout.lines().count(), ops);
+    // redoing the fetch checks the rebased commit out, without `t`
+    env.j(&w, &["redo"]).ok();
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "s");
+    assert!(!w.join("t").exists());
+    env.j(&w, &["id"]).ok();
+    assert_eq!(env.j(&w, &["ops"]).ok().stdout.lines().count(), ops + 1);
+}
+
+#[test]
+fn an_edit_to_a_file_a_fetch_abandoned_is_kept_as_a_conflict() {
+    // §7.4, §7.6: the working-copy commit is pushed as `wip`, and the
+    // branch deleted upstream: the fetch abandons the commit itself, and a
+    // new empty one takes its place on `one`. An edit made since to the
+    // file `wip` held is not lost: the commit gets it as a conflict between
+    // its deletion and the edit.
+    let env = setup();
+    let w = env.dir.join("w");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), w.to_str().unwrap()]).ok();
+    std::fs::write(w.join("mine"), "mine\n").unwrap();
+    env.j(&w, &["describe \"wip\""]).ok();
+    env.j(&w, &["push (label \"wip\" here)"]).ok();
+    git(&env.dir, &["--git-dir", env.remote.to_str().unwrap(), "branch", "-D", "wip"]);
+    env.j(&w, &["fetch"]).ok();
+    std::fs::write(w.join("mine"), "mine\nand more\n").unwrap();
+    assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "one");
+    env.j(&w, &["id"]).ok();
+    let conflicted = env.j(&w, &["\\r -> show (conflicted (files r))"]).ok().stdout;
+    assert_eq!(conflicted.trim(), r#"[["mine"]]"#);
+    let text = std::fs::read_to_string(w.join("mine")).unwrap();
+    assert!(text.contains("and more"), "{}", text);
+}
+
 #[test]
 fn fetch_without_origin_is_exit_1() {
     let env = setup();
