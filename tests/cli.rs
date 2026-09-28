@@ -3451,6 +3451,56 @@ fn an_edit_over_a_stale_working_copy_to_a_file_the_focus_changed_is_a_conflict()
 }
 
 #[test]
+fn a_directory_swapped_with_a_file_after_a_failed_checkout_is_kept() {
+    // §7.4: over a stale working copy, the snapshot merged what the
+    // directory changed with what the commit changed. Where the user had
+    // put a directory in place of a file the commit changes, or a file in
+    // place of a directory holding one, that merge gave one conflict at the
+    // path between files and a directory, whose directory side j reads as
+    // empty, and the next checkout wrote jj's description of it there,
+    // deleting the files the directory held. The snapshot now takes what
+    // the directory holds at such a path, as over a working copy that is
+    // not stale; the commit's change there is left in the operation before.
+    for (before, after) in [("z", "z/new"), ("z/x", "z")] {
+        let r = setup();
+        std::fs::create_dir_all(r.dir.join(before).parent().unwrap()).unwrap();
+        r.write(before, "1\n");
+        r.j(&["describe \"A\""]).ok();
+        // the checkout fails at the path under `m`, before it reaches `z`
+        let path: Vec<String> = before.split('/').map(|c| format!("\"{}\"", c)).collect();
+        let edit = format!(
+            "mapRoot (\\c -> c {{ files = [({{ path = [{}], content = blob \"2\\n\" }}) ({{ path = [{}], content = blob \"deep\" }})] }})",
+            path.join(" "),
+            too_deep("m")
+        );
+        let out = r.j(&[&edit]);
+        assert_eq!(out.code, 1, "{}: {}", before, out.stderr);
+        assert!(out.stderr.contains("the operation is recorded"), "{}: {}", before, out.stderr);
+        assert_eq!(r.read(before), "1\n");
+        let ops = r.j(&["ops"]).ok().stdout.lines().count();
+        if before == "z" {
+            std::fs::remove_file(r.dir.join("z")).unwrap();
+        } else {
+            std::fs::remove_dir_all(r.dir.join("z")).unwrap();
+        }
+        std::fs::create_dir_all(r.dir.join(after).parent().unwrap()).unwrap();
+        r.write(after, "mine\n");
+        // the path the checkout failed on is left out of the focus
+        r.j(&["mapRoot (\\c -> c { files = restrict (neg (under ./m)) c.files })"]).ok();
+        assert_eq!(r.read(after), "mine\n", "{}", before);
+        let path: Vec<String> = after.split('/').map(|c| format!("\"{}\"", c)).collect();
+        let paths = r.j(&[FOCUS_PATHS]).ok().stdout;
+        assert_eq!(paths.trim(), format!("[[{}]]", path.join(" ")), "{}", before);
+        let conflicted = r.j(&["\\r -> show (conflicted (files r))"]).ok().stdout;
+        assert_eq!(conflicted.trim(), "[]", "{}", before);
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+        r.j(&["id"]).ok();
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1, "{}", before);
+        assert_eq!(r.read(after), "mine\n", "{}", before);
+    }
+}
+
+#[test]
 fn a_stale_working_copy_without_changes_is_undone_and_redone() {
     // §7.4, §7.7: `undo` and `redo` refuse only a directory holding changes
     // no commit has, and a directory holding what the stale state records

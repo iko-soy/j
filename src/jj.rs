@@ -632,7 +632,9 @@ fn files_on_conflicts(
 /// `--ignore-working-copy` or from another workspace), and what the
 /// directory holds is a change to `state` rather than to the commit: that
 /// change is replayed onto the commit, a three-way merge with `state` as
-/// the base, in which a path both changed differently is a conflict. What a
+/// the base, in which a path both changed differently is a conflict, but
+/// for one setting a directory against anything else, which takes what the
+/// working directory holds there, as where the state is current. What a
 /// checkout cut short wrote is the commit's own content, which the merge
 /// takes as it is: where the directory holds what the commit does, the base
 /// is taken to hold it too, so that a conflict the state records there,
@@ -678,7 +680,7 @@ async fn snapshot_tree(
         }
     }
     let base = if same { base.write_tree().await.map_err(err)? } else { state.clone() };
-    MergedTree::merge(Merge::from_removes_adds(
+    let merged = MergedTree::merge(Merge::from_removes_adds(
         vec![(base, "last checkout".to_string())],
         vec![
             (wc.clone(), "working-copy commit".to_string()),
@@ -686,7 +688,27 @@ async fn snapshot_tree(
         ],
     ))
     .await
-    .map_err(err)
+    .map_err(err)?;
+    // A conflict setting a directory against a file, a symlink or nothing,
+    // which jj keeps at the path itself, cannot be a blob that lists the
+    // directory's entries (§7.3), and a checkout would write jj's
+    // description of it in place of what the directory holds there,
+    // removing a directory's files: take what the directory holds, as a
+    // snapshot over a current state does. The commit's change there is
+    // left in the operation before. A tree with no conflict is not walked.
+    let mut kept = MergedTreeBuilder::new(merged.clone());
+    let mut mixed = false;
+    for (path, value) in merged.conflicts() {
+        if value.map_err(err)?.iter().any(|term| matches!(term, Some(TreeValue::Tree(_)))) {
+            let held = scanned.path_value(&path).await.map_err(err)?;
+            kept.set_or_remove(path, held);
+            mixed = true;
+        }
+    }
+    if !mixed {
+        return Ok(merged);
+    }
+    kept.write_tree().await.map_err(err)
 }
 
 /// `scanned` with the commit's conflict at each path the working-copy state
