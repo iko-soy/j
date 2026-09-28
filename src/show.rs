@@ -453,6 +453,9 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
     let mut cmd = std::process::Command::new("difft");
     cmd.arg(&old).arg(&new);
     cmd.stdin(std::process::Stdio::null());
+    // stdout is the rendering; what difft says on stderr is j's, so one
+    // that fails explains itself rather than leaving a blank page (§7.10)
+    cmd.stderr(std::process::Stdio::inherit());
     if std::env::var_os("DFT_COLOR").is_none() && stdout_is_tty() {
         cmd.env("DFT_COLOR", "always");
     }

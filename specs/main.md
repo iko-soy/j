@@ -1335,9 +1335,11 @@ program.
    inherited unchanged, except: if `DFT_COLOR` is unset and `j`'s stdout is a
    terminal, set `DFT_COLOR=always`; if `DFT_WIDTH` is unset and `j`'s stdout
    is a terminal, set it to the terminal width.
-3. Capture stdout. Delete the temporary directory.
+3. Capture stdout; the program's stderr is `j`'s own, so what it says there
+   reaches the user. Delete the temporary directory.
 4. Return stdout as `Text`. A non-zero exit status is not an error (difftastic
-   uses it to signal "differences found" under some options); a failure to
+   uses it to signal "differences found" under some options), so what a
+   `difft` that fails printed, even nothing, is the result; a failure to
    execute the program is a crash naming it.
 
 All rendering options are difftastic's own, set through its `DFT_*`
@@ -2065,7 +2067,8 @@ diffs = \repo ->
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
 -- readable in the terminal. A focus that changes nothing reads "no changes";
--- a diff that cannot be rendered (no difft on PATH) is a crash saying so.
+-- a difft that cannot be run (not on PATH) is a crash saying so, and
+-- otherwise whatever difft prints, even nothing, is the page.
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo

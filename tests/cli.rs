@@ -632,10 +632,21 @@ fn review_says_no_changes_only_when_nothing_changed() {
     let out = review(&bin);
     assert_eq!(out.code, 1, "stdout: {}", out.stdout);
     assert!(out.stderr.contains("cannot execute `difft`"), "{}", out.stderr);
+    use std::os::unix::fs::PermissionsExt;
+    // a difft that runs and fails renders what it printed, nothing here,
+    // and its complaint reaches the terminal instead of being dropped (§7.10)
+    let failing = r.cfg.join("failing");
+    std::fs::create_dir_all(&failing).unwrap();
+    let stub = failing.join("difft");
+    std::fs::write(&stub, "#!/bin/sh\necho 'error: invalid value for --color' >&2\nexit 2\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = review(&failing);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stderr, "error: invalid value for --color\n");
+    assert_eq!(out.stdout.trim(), "");
     // with a difft, each changed path's rendering, in order
     let stub = bin.join("difft");
     std::fs::write(&stub, "#!/bin/sh\nprintf '%s -> %s\\n' \"${1##*/}\" \"${2##*/}\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     r.write("g", "world\n");
     assert_eq!(review(&bin).ok().stdout, "old-f -> new-f\nold-g -> new-g\n");
