@@ -956,14 +956,19 @@ directory.
   `--ignore-working-copy`, or one in another workspace that rewrites this
   workspace's commit), `fetch` rebased it (§7.6), or a checkout failed or
   was cut short after its operation was recorded (§7.5 step 7). The
-  directory then started from the files last checked out, and what has
-  changed in it since is a change to those, which the snapshot replays
-  onto the commit: a three-way merge with the files last checked out as
-  the base, in which a path that the directory and the commit both
-  changed, differently, is a conflict (an edit to a file the commit
-  deletes, say), and one where the directory holds what the commit does is
-  the commit's (what a checkout cut short had written). A file holding
-  exactly what a checkout writes for one of the commit's conflicts, its
+  working copy's record of the files last checked out names the operation
+  it was saved at, and one saved at the head operation is current whatever
+  files it records, as jj takes it: where the record was lost, and jj made
+  it again recording no file, the snapshot records the directory as it
+  is. Over a stale working copy, the directory started from the files last
+  checked out, and what has changed in it since is a change to those,
+  which the snapshot replays onto the commit: a three-way merge with the
+  files last checked out as the base, in which a path that the directory
+  and the commit both changed, differently, is a conflict (an edit to a
+  file the commit deletes, say), and one where the directory holds what
+  the commit does is the commit's (what a checkout cut short had written).
+  Either way, where the record does not hold one of the commit's
+  conflicts, a file holding exactly what a checkout writes for it, its
   markers or its description, is read back as that conflict. With no
   change there is nothing to snapshot, and a program that persists writes
   the focus over the files last checked out as usual. A checkout over a

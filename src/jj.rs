@@ -621,28 +621,37 @@ fn files_on_conflicts(
 /// The tree a snapshot records in the working-copy commit, whose tree is
 /// `wc`, where the working copy's state records `state` and a scan of the
 /// working directory found `scanned` (§7.4): `scanned` itself where the
-/// state is the commit's. Where it is not, the state is stale (a checkout
-/// that failed or was cut short after its operation was recorded, a `fetch`
-/// that rebased the commit, jj run with `--ignore-working-copy` or from
-/// another workspace), and what the directory holds is a change to `state`
-/// rather than to the commit: that change is replayed onto the commit, a
-/// three-way merge with `state` as the base, in which a path both changed
-/// differently is a conflict. What a checkout cut short wrote is the
-/// commit's own content, which the merge takes as it is: where the
-/// directory holds what the commit does, the base is taken to hold it too,
-/// so that a conflict the state records there, whose sides would not
-/// cancel against the commit's, does not make one of a change both made.
-/// That includes a conflict the checkout wrote, which the scan read as its
-/// text (`conflicts_written`).
+/// state is the commit's, and also where it is `current`, saved at the
+/// operation the repository is at, which jj takes for the files last
+/// checked out whatever it records: one lost, which jj makes again
+/// recording no file, or one put in its place. Such a state may record none
+/// of the commit's conflicts, so a file holding what a checkout wrote for
+/// one is read back as it there (`conflicts_written`). Otherwise the state
+/// is stale (a checkout that failed or was cut short after its operation
+/// was recorded, a `fetch` that rebased the commit, jj run with
+/// `--ignore-working-copy` or from another workspace), and what the
+/// directory holds is a change to `state` rather than to the commit: that
+/// change is replayed onto the commit, a three-way merge with `state` as
+/// the base, in which a path both changed differently is a conflict. What a
+/// checkout cut short wrote is the commit's own content, which the merge
+/// takes as it is: where the directory holds what the commit does, the base
+/// is taken to hold it too, so that a conflict the state records there,
+/// whose sides would not cancel against the commit's, does not make one of
+/// a change both made. That includes a conflict the checkout wrote, which
+/// the scan read as its text (`conflicts_written`).
 async fn snapshot_tree(
     root: &std::path::Path,
     markers: ConflictMarkerStyle,
     wc: &MergedTree,
     state: &MergedTree,
+    current: bool,
     scanned: &MergedTree,
 ) -> Result<MergedTree, String> {
     if state.tree_ids() == wc.tree_ids() {
         return Ok(scanned.clone());
+    }
+    if current {
+        return conflicts_written(root, markers, wc, state, scanned).await;
     }
     if scanned.tree_ids() == state.tree_ids() {
         return Ok(wc.clone());
@@ -685,10 +694,10 @@ async fn snapshot_tree(
 /// checkout writes for that conflict: its markers, or its description where
 /// a side is no file (§7.4). A checkout records the conflict in the state
 /// as it writes the file, so a scan reads such a file back as the conflict;
-/// one cut short, or one over a stale state, records nothing, and the scan
-/// reads the file as the text it holds. Each of the commit's conflicts is
-/// looked at, and a file read, only where neither the state nor the scan
-/// has the conflict.
+/// one cut short, or one over a stale state, records nothing, nor does a
+/// state made again where it was lost, and the scan reads the file as the
+/// text it holds. Each of the commit's conflicts is looked at, and a file
+/// read, only where neither the state nor the scan has the conflict.
 async fn conflicts_written(
     root: &std::path::Path,
     markers: ConflictMarkerStyle,
@@ -1136,8 +1145,9 @@ impl JjBackend {
         // loader, whose store the scanned tree lives in
         let head = self.current_repo();
         let wc_commit = self.wc_commit(&head).await?;
+        let current = locked_ws.locked_wc().old_operation_id() == head.operation().id();
         let tree = match marker_style(head.settings()) {
-            Ok(markers) => snapshot_tree(&root, markers, &wc_commit.tree(), &old_tree, &scanned).await,
+            Ok(markers) => snapshot_tree(&root, markers, &wc_commit.tree(), &old_tree, current, &scanned).await,
             Err(e) => Err(e),
         }
         .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
@@ -1460,12 +1470,16 @@ impl JjBackend {
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
         // whether the working copy is stale (§7.4), as a checkout that failed
-        // or was cut short leaves it (§7.5 step 7)
+        // or was cut short leaves it (§7.5 step 7): its state records other
+        // files than the working-copy commit, and was saved at an operation
+        // before the head's
         let stale = match on_disk {
             None => false,
             Some(_) => {
-                let wc = self.wc_commit(&self.current_repo()).await.map_err(|e| Crash::new(e.1))?;
+                let head = self.current_repo();
+                let wc = self.wc_commit(&head).await.map_err(|e| Crash::new(e.1))?;
                 wc.tree().tree_ids() != locked_ws.locked_wc().old_tree().tree_ids()
+                    && locked_ws.locked_wc().old_operation_id() != head.operation().id()
             }
         };
         // A persisting run's snapshot released its lock without saving what
@@ -1996,11 +2010,13 @@ impl JjBackend {
     /// Refuse, as `undo` and `redo` do before anything else (§7.7), when the
     /// working directory holds changes the working-copy commit does not:
     /// what a snapshot would record (§7.4), which their checkout would write
-    /// over. Otherwise return the tree the directory holds, which that
-    /// checkout starts from: the commit's, or, where the working-copy state
-    /// is stale, the state's with any changes to it the commit already has,
-    /// such as what a checkout cut short wrote. Reserved commands never
-    /// snapshot, so nothing is recorded either way.
+    /// over. Otherwise return the tree the directory holds, as scanned,
+    /// which that checkout starts from: the commit's, but for the text
+    /// written for a conflict the state does not record, as one lost and
+    /// made again records none, or, where the working-copy state is stale,
+    /// the state's with any changes to it the commit already has, such as
+    /// what a checkout cut short wrote. Reserved commands never snapshot,
+    /// so nothing is recorded either way.
     fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<MergedTree, OpenError> {
         let dirty = (1, "working copy has changes not in @; run `j id` to record them or discard them".to_string());
         let wc_tree = block_on(self.wc_commit(base))?.tree();
@@ -2012,8 +2028,9 @@ impl JjBackend {
         let old_tree = locked_ws.locked_wc().old_tree().clone();
         let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
+        let current = locked_ws.locked_wc().old_operation_id() == base.operation().id();
         let recorded = match marker_style(base.settings()) {
-            Ok(markers) => block_on(snapshot_tree(&root, markers, &wc_tree, &old_tree, &scanned)),
+            Ok(markers) => block_on(snapshot_tree(&root, markers, &wc_tree, &old_tree, current, &scanned)),
             Err(e) => Err(e),
         }
         .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;

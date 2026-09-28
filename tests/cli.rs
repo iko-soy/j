@@ -3197,6 +3197,75 @@ fn a_stale_working_copy_holding_the_focus_records_nothing() {
 }
 
 #[test]
+fn a_lost_working_copy_state_records_the_directory_as_it_is() {
+    // §7.4: jj makes a new working-copy state, recording no file, where it
+    // finds none, at the operation the working copy names: the head's. It
+    // was taken for a stale one, as it records other files than the
+    // commit, and the snapshot merged the directory onto the commit with
+    // no file as the base: each file edited since the last checkout became
+    // a conflict of the edit with the commit's content, and each one
+    // deleted came back. A state saved at the head operation is current,
+    // and the directory is recorded as it is, as jj records it.
+    let r = setup();
+    r.write("f", "1\n");
+    r.write("h", "gone\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("f", "2\n");
+    std::fs::remove_file(r.dir.join("h")).unwrap();
+    std::fs::remove_file(r.dir.join(".jj/working_copy/tree_state")).unwrap();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("f"), "2\n");
+    assert!(!r.dir.join("h").exists());
+    let paths = r.j(&[PATHS_BY_COMMIT]).ok().stdout;
+    assert_eq!(paths.trim(), r#"[["" []] ["A" [["f"] ["h"]]] ["" [["f"]]]]"#);
+    let f = r.j(&["\\r -> show (contentAt [\"f\"] (files r))"]).ok().stdout;
+    assert_eq!(f.trim(), r#"blob "2\n""#);
+    // and the state is saved again, with nothing left to record
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+}
+
+#[test]
+fn a_conflict_left_as_written_stays_when_the_working_copy_state_is_lost() {
+    // §7.4: a working-copy state made again where it was lost records no
+    // conflict, so the scan reads each file the checkout wrote for one as
+    // the text of its markers. A file holding exactly what a checkout
+    // writes for one of the commit's conflicts is read back as that
+    // conflict: a directory nobody touched has nothing to record, and
+    // `undo` and `redo` do not refuse it.
+    let r = setup();
+    r.write("a.txt", "base\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a.txt", "<<<<<<< left\n");
+    r.j(&["describe \"left\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a.txt", "right\n");
+    r.j(&["describe \"right\""]).ok();
+    r.j(&["rebase siblings"]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+    let written = r.read("a.txt");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    std::fs::remove_file(r.dir.join(".jj/working_copy/tree_state")).unwrap();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    r.j(&["undo"]).ok();
+    r.j(&["redo"]).ok();
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    assert_eq!(r.read("a.txt"), written);
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a.txt\"]]");
+}
+
+#[test]
 fn replay_carries_conflicts_through() {
     // replay unwrapped each input tree's ids as resolved, so every rebase,
     // squash or abandon that replayed a snapshot holding a conflict panicked
