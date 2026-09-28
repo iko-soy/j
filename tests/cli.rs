@@ -2267,12 +2267,54 @@ fn a_file_written_over_a_conflict_with_a_side_that_is_no_file_is_recorded() {
     assert_eq!(r.read("a"), "resolved\n");
 }
 
+/// The repository `r` as jj-lib loads it at its head operation, for what a
+/// test cannot make or see through `j`: a tree as jj itself writes one
+fn jj_repo(r: &Repo) -> std::sync::Arc<jj_lib::repo::ReadonlyRepo> {
+    use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+    use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
+    let mut config = StackedConfig::with_defaults();
+    let user = "[user]\nname = \"Test User\"\nemail = \"test@example.com\"\n";
+    config.add_layer(ConfigLayer::parse(ConfigSource::User, user).unwrap());
+    let settings = jj_lib::settings::UserSettings::from_config(config).unwrap();
+    let ws = jj_lib::workspace::Workspace::load(
+        &settings,
+        &r.dir,
+        &default_backend_factories(),
+        &default_working_copy_factories(),
+    )
+    .unwrap();
+    pollster::block_on(ws.repo_loader().load_at_head()).unwrap()
+}
+
+/// The stored commit that `id`, an expression of the repo `r` giving one
+/// commit's `Id`, names
+fn jj_commit(r: &Repo, repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>, id: &str) -> jj_lib::commit::Commit {
+    use jj_lib::repo::Repo as _;
+    let hash = r.j(&[&format!("\\r -> (meta ({})).hash", id)]).ok().stdout;
+    let id = jj_lib::backend::CommitId::try_from_hex(hash.trim()).unwrap();
+    repo.store().get_commit(&id).unwrap()
+}
+
+/// Rebase the commit `id` names onto the one `onto` names, as jj does: it
+/// merges their trees as trees, so where the commit is conflicted, a path
+/// can keep each term of its merge, a pair of sides that cancel included
+fn jj_rebase(r: &Repo, id: &str, onto: &str) {
+    let repo = jj_repo(r);
+    let commit = jj_commit(r, &repo, id);
+    let onto = jj_commit(r, &repo, onto);
+    let mut tx = repo.start_transaction();
+    pollster::block_on(jj_lib::rewrite::rebase_commit(tx.repo_mut(), commit, vec![onto.id().clone()])).unwrap();
+    pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+    pollster::block_on(tx.commit("rebase")).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_cancel() {
-    // a tree of five sides, with a file conflict at `a` and a symlink/file
-    // conflict at `b`, whose description names L's symlink as removed once
-    // and added twice. Resolving `a` lets the scan write a tree of three
+    // a tree of five sides, as jj's rebase of a conflicted commit makes one,
+    // with a file conflict at `a` and a symlink/file conflict at `b`, whose
+    // description names L's symlink as removed once and added twice.
+    // Resolving `a` lets the scan write a tree of three
     // sides, where `b`'s conflict has the pair cancelled and describes
     // itself in three lines, while the file, which nobody touched, still
     // holds the five a checkout wrote. The scan took that file for one
@@ -2300,10 +2342,15 @@ fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_c
     r.j(&["new"]).ok();
     r.write("a", "other\n");
     r.j(&["describe \"M\""]).ok();
+    // R onto M as jj rebases it, which keeps the pair at `b`
+    jj_rebase(&r, "head (matching (\\c -> c.message == \"R\") all r)", "r.root.id");
     r.j(&[&goto("R")]).ok();
-    r.j(&["rebase (matching (\\c -> c.message == \"M\") all)"]).ok();
     r.j(&["new"]).ok();
     assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"] [\"b\"]]");
+    let repo = jj_repo(&r);
+    let tree = |id: &str| jj_commit(&r, &repo, id).tree_ids().clone();
+    assert_eq!(tree("r.root.id").iter().count(), 5);
+    assert_eq!(tree("r.root.id"), tree("(up r).root.id"));
     let description = r.read("b");
     assert_eq!(description.lines().count(), 6, "{}", description);
     let modified = || std::fs::symlink_metadata(r.dir.join("b")).unwrap().modified().unwrap();
