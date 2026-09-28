@@ -580,7 +580,9 @@ fn a_commit_the_expression_made_lists_its_files_unmarked() {
     let (mut i, cfg) = make_interp(be);
     let out = eval_and_display(&mut i, &cfg, "focus . new", repo.clone());
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].starts_with("○ ") && !lines[0].contains("wqzt"), "{}", out);
+    // the minted id is random, so tell the new commit from the focus by the
+    // focus's message, which no id can hold (ids are letters k..z)
+    assert!(lines[0].starts_with("○ ") && !lines[0].contains("wip"), "{}", out);
     assert_eq!(lines[1..], ["", "    src/lexer.rs", "    src/parser.rs"], "{}", out);
     let rec = eval_and_display(&mut i, &cfg, "\\r -> { c = (new r).root }", repo.clone());
     assert!(field_line(&rec, "c").starts_with("○ "), "{}", rec);
