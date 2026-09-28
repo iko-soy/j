@@ -967,7 +967,10 @@ directory.
   nested repository (a directory below the root holding `.git` or `.jj`);
   these rules are fixed, since `j` reads no jj configuration. If the snapshot
   changed the commit, that change is part of the operation persisted
-  afterwards, or discarded with the rest if nothing is persisted. A crashed
+  afterwards, or discarded with the rest if nothing is persisted; a change
+  that leaves the commit with its parent's files, as where the directory
+  reverts what the commit changed, gives it the parent's tree, as step 4
+  of §7.5 writes such a commit, so that jj takes it for empty. A crashed
   or printing program leaves the working copy and the repository exactly as
   before (but see §7.5 step 7); `j id` is the way to record the working
   directory and nothing else (§1.2).
@@ -1145,14 +1148,17 @@ loaded from a stored tree, its own or another's (`new` gives the child its
 parent's), with that tree as jj stored it, pairs of sides that cancel and
 conflict labels included (§7.3), as jj's own `new` and `describe` keep a
 tree: one built from the files could be another tree for the same files.
-For the same reason a commit step 4 writes whose files are its parent's,
-as `squash`, `rebase` or `abandon` can leave a commit whose files they
-build anew, is written with the parent's tree, labels included, as jj's
-own `squash` or `rebase` leaves a commit it empties: jj takes a commit for
-empty only where its tree is its parent's. A persisting run then reads the
-files of the focus, of the commits it writes with other files, and of
-those whose files it compares with a tree they were not loaded from, but
-not those of the rest of the history.
+For the same reason a commit step 4 writes whose files are its parent's is
+written with the parent's tree, labels included, whatever tree its files
+were loaded from, as jj's own `squash` or `rebase` leaves a commit it
+empties: jj takes a commit for empty only where its tree is its parent's.
+`squash`, `rebase` or `abandon` can leave such a commit by building its
+files anew, or by moving it, its files unchanged, onto another tree for
+the same files: an empty child of a commit squashed into its parent, or
+an empty commit rebased onto one holding its parent's files. A persisting
+run then reads the files of the focus, of the commits it writes with
+other files, and of those whose files it compares with a tree they were
+not loaded from, but not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 

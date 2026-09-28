@@ -1671,6 +1671,19 @@ impl JjBackend {
                 .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
             return Ok((head, None));
         }
+        // a directory come to hold the parent's files, as where it reverts
+        // the commit's change, is recorded with the parent's tree (§7.4), as
+        // persistence writes a commit with its parent's files (§7.5 step 4):
+        // the snapshot builds on the commit's tree, and so could make
+        // another tree for the parent's files, one jj takes for a change.
+        // Not before the check above, or a commit already holding such a
+        // tree would be rewritten by a directory that has not changed. A
+        // merge is immutable, so never folded into (§7.2), and its parents'
+        // trees are not merged for it
+        let tree = match wc_commit.parent_ids() {
+            [_] => parents_tree_if_same(head.as_ref(), wc_commit.parent_ids(), tree).await,
+            _ => tree,
+        };
         let mut tx = head.start_transaction();
         tx.set_is_snapshot(true);
         let new_wc = tx
@@ -1868,11 +1881,15 @@ impl JjBackend {
                         };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {
-                        // files the stored tree lists are written as it is
+                        // files the stored tree lists are written as it is,
+                        // but where they are the parent's, as the files of a
+                        // commit moved onto another tree for them come to be,
+                        // with the parent's tree (§7.5 step 4)
+                        let parents = std::slice::from_ref(&parent_jj);
                         let tree = if files_changed {
-                            loaded_trees.tree_to_write(tx.repo(), &files_v, std::slice::from_ref(&parent_jj))?
+                            loaded_trees.tree_to_write(tx.repo(), &files_v, parents)?
                         } else {
-                            stored_tree
+                            block_on(parents_tree_if_same(tx.repo(), parents, stored_tree))
                         };
                         let c = block_on(
                             tx.repo_mut()
@@ -3902,11 +3919,13 @@ impl<'a> LoadedTrees<'a> {
 /// `rebase` or `abandon`, which build the files anew, got another tree for
 /// them: jj took it for a change at each conflicted path, the tree's empty
 /// mark (`is_empty`) did not show, and the checkout wrote the conflicts
-/// again with generic labels. Files with no conflict make one tree, so a
-/// resolved parents' tree is not compared, nor one of the same ids, and the
-/// comparison stops at the first path where the two differ. It only
-/// chooses between two trees for the same files, so where the parents'
-/// cannot be read, it is `tree`.
+/// again with generic labels. So did a commit moved onto another tree for
+/// its files, which kept its own, and a snapshot that reverted the commit's
+/// change, which builds on the commit's tree (§7.4). Files with no conflict
+/// make one tree, so a resolved parents' tree is not compared, nor one of
+/// the same ids, and the comparison stops at the first path where the two
+/// differ. It only chooses between two trees for the same files, so where
+/// the parents' cannot be read, it is `tree`.
 async fn parents_tree_if_same(repo: &dyn Repo, parents: &[CommitId], tree: MergedTree) -> MergedTree {
     let mut commits = Vec::with_capacity(parents.len());
     for id in parents {
