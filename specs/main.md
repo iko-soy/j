@@ -1003,18 +1003,28 @@ Within it:
    they are safe on a commit directly above `main`; navigation onto `main`
    is written `new . goto trunk`.)
 7. Perform the checkout of §7.4, then commit the operation. A checkout
-   that fails (a path the filesystem cannot hold, a full disk) crashes
-   without committing it, so nothing is recorded. Unless the working
-   directory changed while the program ran, what the checkout wrote is
-   then put back: each path at which the focus differs from the working
-   directory gets back what the directory held there, and each directory
-   the checkout created is removed while empty. No other path is touched: a
-   file created or edited elsewhere meanwhile keeps its content, and an
-   ignored file stays, even where a `.gitignore` the checkout wrote no
-   longer ignores it or where the focus adds a file of that name (the
-   checkout does not write over it). When something is in the way of a
-   path, the crash says the directory could not be put back, and the next
-   run records what it holds.
+   that fails (a path the filesystem cannot hold, a full disk), or an
+   operation that then cannot be committed, crashes without committing
+   it, so nothing is recorded. Unless the working directory changed while
+   the program ran, what the checkout wrote is then put back: each path
+   at which the focus differs from the working directory gets back what
+   the directory held there if it now holds nothing or what the checkout
+   writes there (the focus's content, all of it or, except where an
+   ignored file was, the start of it that a write cut short leaves), and
+   each directory the checkout created is removed while empty. The paths
+   the focus adds are cleared before the paths it replaced are written
+   back, so that a name the focus changes only in case is put back where
+   the filesystem folds case, and no file is read into the repository.
+   Anything else is left alone: a file created or edited meanwhile keeps
+   its content, at such a path too and however it was saved (even by
+   renaming a new file over the old); an ignored file stays, even where a
+   `.gitignore` the checkout wrote no longer ignores it, and where the
+   focus adds a file of that name (the checkout does not write over it)
+   even if it holds the focus's content; and so does, where the
+   filesystem folds case, the file of a path's other spelling. When
+   something left alone is in the way of a path, the crash says the
+   directory could not be put back, and the next run records what it
+   holds.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part

@@ -11,8 +11,10 @@ use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::{MergedTree, TreeDiffEntry};
@@ -292,8 +294,7 @@ struct PendingSnapshot {
 /// How every scan of the working directory reads it (§7.4): each file
 /// not ignored by the directory's own `.gitignore`s is tracked, whatever
 /// its size. `persist`'s checkout rescans with the same options and
-/// relies on getting the snapshot's tree back; only `put_back` chooses
-/// which untracked files its scan tracks.
+/// relies on getting the snapshot's tree back.
 fn snapshot_options() -> SnapshotOptions<'static> {
     SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
@@ -389,8 +390,13 @@ struct Footprint {
     new_dirs: BTreeSet<RepoPathBuf>,
     /// each path the focus adds that already holds something other than a
     /// directory (an ignored file), by device and inode: the checkout
-    /// leaves that alone
+    /// leaves that alone. Where the filesystem folds case, a path whose
+    /// other spelling the focus removes is not one: what is found there is
+    /// that tracked file, which the checkout removes.
     occupied: HashMap<RepoPathBuf, (u64, u64)>,
+    /// whether the filesystem folds case (`Backend::folds_case`), so that a
+    /// path names whatever file has its name in another case
+    folds_case: bool,
 }
 
 /// The device and inode of what `path` holds, unless it is a directory
@@ -408,6 +414,7 @@ impl Footprint {
         root: &std::path::Path,
         on_disk: &MergedTree,
         focus: &MergedTree,
+        folds_case: bool,
     ) -> Result<Footprint, String> {
         let is_dir_now = |path: &RepoPath| {
             path.to_fs_path(root)
@@ -415,11 +422,16 @@ impl Footprint {
         };
         let mut new_dirs = BTreeSet::new();
         let mut occupied = HashMap::new();
+        // the paths the focus removes, in lower case, where case folds
+        let mut removed = HashSet::new();
         // whether each directory looked at so far is one on disk
         let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
         let mut diff = on_disk.diff_stream(focus, &EverythingMatcher);
         while let Some(TreeDiffEntry { path, values }) = diff.next().await {
             let Diff { before, after } = values.map_err(|e| e.to_string())?;
+            if folds_case && after.is_absent() {
+                removed.insert(path.as_internal_file_string().to_lowercase());
+            }
             if !(before.is_absent() && after.is_present()) {
                 continue;
             }
@@ -446,64 +458,227 @@ impl Footprint {
                 }
             }
         }
-        Ok(Footprint { new_dirs, occupied })
+        occupied.retain(|path, _| !removed.contains(&path.as_internal_file_string().to_lowercase()));
+        Ok(Footprint { new_dirs, occupied, folds_case })
     }
 }
 
 /// Put back what a checkout from `on_disk` to `focus` that failed part way
 /// wrote (§7.5 step 7): remove the directories it created while they are
-/// empty, scan the directory, and check out what the scan found with the
-/// paths of the checkout's footprint as `on_disk` holds them. The scan
-/// starts tracking only those paths, ignored or not, so a file created
-/// elsewhere meanwhile, or one a `.gitignore` the checkout wrote no longer
-/// ignores, is not touched, and a file edited elsewhere meanwhile keeps
-/// its edit. A path the focus adds that still holds what it held before
-/// (`Footprint::occupied`) is left out, since the checkout did not write
-/// it. A path something is in the way of fails the put-back.
+/// empty, and give each path of its footprint that holds what the checkout
+/// writes there, or nothing, what `on_disk` holds there. Anything else a
+/// path holds is left alone and not read into the store: a file saved
+/// meanwhile, however it was saved, an ignored file that was there before
+/// (`Footprint::occupied`, still the same file), or, where case folds, the
+/// file of the path's other spelling. The paths the focus adds that the
+/// checkout wrote are removed first, so that such another spelling is out
+/// of the way when the paths it replaced are written back. A path
+/// something is in the way of fails the put-back.
 async fn put_back(
     wc: &mut dyn LockedWorkingCopy,
     root: &std::path::Path,
     on_disk: &Commit,
     focus: &Commit,
     footprint: &Footprint,
+    settings: &UserSettings,
 ) -> Result<(), String> {
     remove_new_dirs(root, &footprint.new_dirs);
+    // how the working copy writes a conflict
+    let marker_style = TreeStateSettings::try_from_user_settings(settings)
+        .map_err(|e| e.to_string())?
+        .conflict_marker_style;
     // the paths, recomputed rather than kept through a checkout that
-    // succeeds, each with what the directory held there
+    // succeeds, each with what the directory held there and the focus holds
     let mut paths = Vec::new();
     let mut diff = on_disk.tree().diff_stream(&focus.tree(), &EverythingMatcher);
     while let Some(TreeDiffEntry { path, values }) = diff.next().await {
-        let before = values.map_err(|e| e.to_string())?.before;
-        let kept = footprint.occupied.get(&path);
-        if kept.is_none() || kept.copied() != file_identity(root, &path) {
-            paths.push((path, before));
+        let Diff { before, after } = values.map_err(|e| e.to_string())?;
+        paths.push((path, before, after));
+    }
+    // where case folds, the paths that fold together, whose files are told
+    // apart by how their directories list them (`spelled`)
+    let mut twins = HashSet::new();
+    if footprint.folds_case {
+        let mut folded: HashMap<String, Vec<&RepoPath>> = HashMap::new();
+        for (path, _, _) in &paths {
+            folded.entry(path.as_internal_file_string().to_lowercase()).or_default().push(path);
+        }
+        twins.extend(folded.into_values().filter(|p| p.len() > 1).flatten().map(|p| p.to_owned()));
+    }
+    let mut listed: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
+    // the tree the working-copy state is to record: `on_disk`, with each
+    // path to put back present where it holds what the checkout wrote
+    // (`stand_in`), and absent where it holds nothing; and that tree once
+    // the paths the focus adds are removed from it
+    let mut state = MergedTreeBuilder::new(on_disk.tree());
+    let mut removed = MergedTreeBuilder::new(on_disk.tree());
+    let labels = focus.tree().labels().clone();
+    for (path, before, after) in paths {
+        if let Some(&id) = footprint.occupied.get(&path) {
+            if file_identity(root, &path) == Some(id) {
+                continue;
+            }
+        }
+        let disk = path.to_fs_path(root).map_err(|e| e.to_string())?;
+        let mut meta = disk.symlink_metadata().ok().filter(|m| !m.is_dir());
+        if meta.is_some() && twins.contains(&path) && !spelled(root, &disk, &mut listed) {
+            meta = None;
+        }
+        match meta {
+            None if before.is_present() => {
+                state.set_or_remove(path.clone(), Merge::absent());
+                removed.set_or_remove(path, Merge::absent());
+            }
+            None => {}
+            Some(meta) => {
+                // a write cut short leaves the start of the focus's file,
+                // but none is taken for one where an ignored file was
+                let partly = !footprint.occupied.contains_key(&path);
+                let store = focus.store();
+                let value = after.clone();
+                if holds_written(store, &path, value, &labels, marker_style, &disk, &meta, partly).await? {
+                    let written = stand_in(&before, &after);
+                    state.set_or_remove(path.clone(), written.clone());
+                    removed.set_or_remove(path, if before.is_absent() { Merge::absent() } else { written });
+                }
+            }
         }
     }
-    // tracked even where a `.gitignore` the checkout wrote ignores them
-    let matcher = FilesMatcher::new(paths.iter().map(|(path, _)| path));
-    let options = SnapshotOptions {
-        start_tracking_matcher: &matcher,
-        force_tracking_matcher: &matcher,
-        ..snapshot_options()
-    };
-    // the state records `on_disk`, which the checkout's own scan found
-    let scanned = scan(wc, root, &on_disk.tree(), &options).await?;
-    let mut builder = MergedTreeBuilder::new(scanned);
-    for (path, before) in paths {
-        builder.set_or_remove(path, before);
-    }
-    let target = with_tree(on_disk, builder.write_tree().await.map_err(|e| e.to_string())?);
-    let stats = wc.check_out(&target).await.map_err(|e| e.to_string())?;
-    match stats.skipped_files {
+    let state = with_tree(on_disk, state.write_tree().await.map_err(|e| e.to_string())?);
+    let removed = with_tree(on_disk, removed.write_tree().await.map_err(|e| e.to_string())?);
+    // a reset writes nothing, and reads no file. The paths the focus adds
+    // are removed before the paths it replaced are written back, so that,
+    // where case folds, a name the focus changes only in case is free.
+    wc.reset(&state).await.map_err(|e| e.to_string())?;
+    let first = wc.check_out(&removed).await.map_err(|e| e.to_string())?;
+    let second = wc.check_out(on_disk).await.map_err(|e| e.to_string())?;
+    match first.skipped_files + second.skipped_files {
         0 => Ok(()),
         1 => Err("something is in the way of 1 path".to_string()),
         n => Err(format!("something is in the way of {} paths", n)),
     }
 }
 
+/// Whether each name along `disk` below `root` is listed by its directory
+/// under that spelling, where a name in another case would find the same
+/// file. Each directory is listed once, into `listed`.
+fn spelled(
+    root: &std::path::Path,
+    disk: &std::path::Path,
+    listed: &mut HashMap<PathBuf, HashSet<std::ffi::OsString>>,
+) -> bool {
+    let Ok(below) = disk.strip_prefix(root) else {
+        return false;
+    };
+    let mut dir = root.to_owned();
+    for name in below {
+        let names = listed.entry(dir.clone()).or_insert_with(|| {
+            std::fs::read_dir(&dir)
+                .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+                .unwrap_or_default()
+        });
+        if !names.contains(name) {
+            return false;
+        }
+        dir.push(name);
+    }
+    true
+}
+
+/// The value the working-copy state records, while it is put back, for a
+/// path holding what the checkout wrote where `on_disk` holds `before` and
+/// the focus `after`: present, so that a checkout removes the file; other
+/// than `before`, so that one to `on_disk` writes `before` back; and
+/// resolved, so that no conflict elsewhere in the tree changes its number
+/// of sides, which would make the checkout write that path too. The state
+/// is not saved, and no checkout reads the value.
+fn stand_in(
+    before: &jj_lib::backend::MergedTreeValue,
+    after: &jj_lib::backend::MergedTreeValue,
+) -> jj_lib::backend::MergedTreeValue {
+    // it differs from `before`, as the diff found
+    if after.is_resolved() {
+        return after.clone();
+    }
+    if let Some(TreeValue::File { id, executable, copy_id }) = before.as_normal() {
+        let executable = !executable;
+        return Merge::normal(TreeValue::File { id: id.clone(), executable, copy_id: copy_id.clone() });
+    }
+    let side = after.iter().flatten().map(|v| Merge::normal(v.clone())).find(|v| v != before);
+    side.unwrap_or_else(|| after.clone())
+}
+
+/// Whether `disk`, the file at `path` whose `lstat` gave `meta`, holds what
+/// a checkout writes there for `value`: all of it, or, with `partly`, a
+/// start of it. It is compared byte for byte with what jj's checkout writes
+/// (j's settings convert no line endings), and nothing is written to the
+/// store. The executable bit is not compared.
+#[allow(clippy::too_many_arguments)]
+async fn holds_written(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: jj_lib::backend::MergedTreeValue,
+    labels: &jj_lib::conflict_labels::ConflictLabels,
+    marker_style: ConflictMarkerStyle,
+    disk: &std::path::Path,
+    meta: &std::fs::Metadata,
+    partly: bool,
+) -> Result<bool, String> {
+    use futures::AsyncReadExt;
+    use jj_lib::conflicts::{self, MaterializedTreeValue};
+    use std::io::Read;
+    let written = conflicts::materialize_tree_value(store, path, value, labels)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bytes: Vec<u8> = match written {
+        MaterializedTreeValue::File(mut file) => {
+            let mut bytes = Vec::new();
+            file.reader.read_to_end(&mut bytes).await.map_err(|e| e.to_string())?;
+            bytes
+        }
+        MaterializedTreeValue::FileConflict(file) => {
+            let options = conflicts::ConflictMaterializeOptions {
+                marker_style,
+                marker_len: Some(conflicts::choose_materialized_conflict_marker_len(&file.contents)),
+                merge: store.merge_options().clone(),
+            };
+            conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into()
+        }
+        MaterializedTreeValue::OtherConflict { id, labels } => id.describe(&labels).into_bytes(),
+        MaterializedTreeValue::Symlink { target, .. } if meta.is_symlink() => {
+            return Ok(disk.read_link().is_ok_and(|t| t.as_os_str() == target.as_str()));
+        }
+        // a file holding the target, where the filesystem has no symlinks
+        MaterializedTreeValue::Symlink { target, .. } => target.into_bytes(),
+        // no file is written there
+        _ => return Ok(false),
+    };
+    let len = meta.len();
+    if !meta.is_file() || len > bytes.len() as u64 || (!partly && len < bytes.len() as u64) {
+        return Ok(false);
+    }
+    // a piece at a time, to the end, as the file may have grown since
+    let Ok(mut file) = std::fs::File::open(disk) else {
+        return Ok(false);
+    };
+    let mut buf = vec![0; bytes.len().min(1 << 16) + 1];
+    let mut at = 0;
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => return Ok(partly || at == bytes.len()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(false),
+        };
+        if bytes.get(at..at + n) != Some(&buf[..n]) {
+            return Ok(false);
+        }
+        at += n;
+    }
+}
+
 /// `commit` with `tree` in place of its own, for the working copy to read:
-/// a checkout, a reset and `put_back` read only a commit's tree. It is
-/// never written.
+/// a checkout and a reset read only a commit's tree. It is never written.
 fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
     let (tree_ids, labels) = tree.into_tree_ids_and_labels();
     Commit::new(
@@ -1123,7 +1298,8 @@ impl JjBackend {
             let old_tree = locked_ws.locked_wc().old_tree().clone();
             match scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()).await {
                 Ok(scanned) if scanned.tree_ids() == on_disk.tree().tree_ids() => {
-                    footprint = Footprint::of(&root, &on_disk.tree(), &commit.tree()).await;
+                    let folds_case = self.folds_case();
+                    footprint = Footprint::of(&root, &on_disk.tree(), &commit.tree(), folds_case).await;
                 }
                 // the directory changed while the program ran, or can no
                 // longer be scanned (an entry appeared, vanished or cannot
@@ -1161,7 +1337,10 @@ impl JjBackend {
                 // the head, as it did before the run.
                 if let Some(on_disk) = on_disk {
                     let restored = match &footprint {
-                        Ok(f) => put_back(locked_ws.locked_wc(), &root, on_disk, commit, f).await,
+                        Ok(f) => {
+                            let repo = self.current_repo();
+                            put_back(locked_ws.locked_wc(), &root, on_disk, commit, f, repo.settings()).await
+                        }
                         Err(e) => Err(e.clone()),
                     };
                     if let Err(e) = restored {
