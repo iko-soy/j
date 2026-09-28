@@ -2672,8 +2672,8 @@ fn left_note(left: &[&std::path::Path]) -> String {
 /// current directory, as `jj git clone` stores it, for git resolves a
 /// relative one against the directory each later `fetch` or `push` runs
 /// in; one under a home directory (`~/…`, `~user/…`) and any other URL, a
-/// `file://` one included, as given. One that does not parse is a usage
-/// error.
+/// `file://` one included, as given. One that does not parse, or a path
+/// that does not resolve to UTF-8, is a usage error.
 fn origin_url(url: &str) -> Result<String, OpenError> {
     let mut parsed = gix::url::parse(url).map_err(|e| (2, format!("invalid URL `{}`: {}", url, e)))?;
     // a bare path is a file location in the alternative form
@@ -2691,9 +2691,11 @@ fn origin_url(url: &str) -> Result<String, OpenError> {
     parsed
         .canonicalize(&cwd)
         .map_err(|e| (2, format!("cannot resolve `{}`: {}", url, e)))?;
-    // `add_remote` takes UTF-8, which only a current directory's name can
-    // break: such a path is stored as given
-    Ok(String::from_utf8(parsed.to_bstring().into()).unwrap_or_else(|_| url.to_string()))
+    // `add_remote` takes UTF-8, which only the current directory's name or
+    // a symlink's target can break; stored as given, the path would reach
+    // the remote only from where it was typed
+    String::from_utf8(parsed.to_bstring().into())
+        .map_err(|_| (2, format!("cannot resolve `{}`: the path it names is not UTF-8", url)))
 }
 
 /// `clone`'s work once `dir_path` exists and is empty (§7.8)

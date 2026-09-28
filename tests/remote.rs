@@ -1734,6 +1734,39 @@ fn a_local_remote_under_home_is_stored_as_given() {
     env.j_env(&d.join("sub"), &["fetch"], &vars).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_local_remote_whose_path_is_not_utf8_is_refused() {
+    // §7.8: a relative local path resolved into a directory whose name is
+    // not UTF-8 was stored as typed, as jj-lib's add_remote takes UTF-8,
+    // and then every fetch and push from anywhere else failed with "Could
+    // not find repository"; it is a usage error that changes nothing
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let env = setup();
+    let nu = env.dir.join(OsStr::from_bytes(b"nu\xff"));
+    std::fs::create_dir(&nu).unwrap();
+    let status = Command::new("git")
+        .args(["clone", "-q", "--bare"])
+        .arg(&env.remote)
+        .arg(nu.join("r.git"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = env.j(&nu, &["clone", "r.git", "c"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("not UTF-8"), "{}", out.stderr);
+    assert!(!nu.join("c").exists());
+    // `remote` from a clone in that directory
+    env.j(&nu, &["clone", env.remote.to_str().unwrap(), "d"]).ok();
+    let d = nu.join("d");
+    let before = git(&d, &["config", "--get", "remote.origin.url"]);
+    let out = env.j(&d, &["remote", "../r.git"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(git(&d, &["config", "--get", "remote.origin.url"]), before);
+    env.j(&d, &["fetch"]).ok();
+}
+
 #[test]
 fn undo_push_restores_labels() {
     let env = setup();

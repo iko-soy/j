@@ -1298,7 +1298,8 @@ they run. A local path that begins with `~` (`~/x.git`, `~user/x.git`) is
 stored as given, since git expands it to that home directory on every
 `fetch` and `push`; `./~/x.git` names a directory called `~`. Any other
 `URL` is stored unresolved. A `URL` that cannot be parsed, or a path that
-cannot be resolved, is a usage error (exit 2) that changes nothing.
+cannot be resolved or whose absolute path is not UTF-8, is a usage error
+(exit 2) that changes nothing.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
 at most one operation, described `init` and `clone URL` (`URL` as stored),
