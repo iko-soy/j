@@ -446,13 +446,14 @@ const SIZE_BAR_TOP: usize = 1000;
 /// Otherwise a line that does not occur on the other side at all cannot be
 /// part of any common subsequence, so, as git's xdiff does, it counts as
 /// changed up front, and the rest is searched unless `reorder_bound` already
-/// puts it past the cap. That search (`line_distance`) takes at most about
-/// twice `cap / 64 + 2` steps per line, whatever the lines are: Myers' search
-/// soon stops on most content, but on a long file of a few lines repeating
-/// it can make a pass over the lines for each of the `2 × cap + 1` diagonals
-/// it reaches, so once it has taken half those steps a bit-parallel search
-/// counts instead. A million lines of two alternating, with 480 pairs of
-/// neighbours swapped, took Myers' search alone some 5 × 10⁸ comparisons.
+/// puts it past the cap. That search (`line_distance`) costs at most about
+/// twice what a bit-parallel search of `cap / 64 + 2` machine words per line
+/// does, whatever the lines are: Myers' search soon stops on most content,
+/// but on a long file of a few lines repeating it can make a pass over the
+/// lines for each of the `2 × cap + 1` diagonals it reaches, so once it has
+/// cost half that the bit-parallel search counts instead. A million lines of
+/// two alternating, with 480 pairs of neighbours swapped, took Myers' search
+/// alone some 5 × 10⁸ comparisons.
 fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
     use std::collections::HashMap;
     // the rounds of the first, short search
@@ -522,9 +523,9 @@ fn trim_common<'s, T: PartialEq>(a: &'s [T], b: &'s [T]) -> (&'s [T], &'s [T]) {
 /// reaches the end on round `d` exactly when the shortest diff has `d` steps,
 /// run for `max` rounds at most. A round extends each of its diagonals along
 /// equal lines from where the round before left off, so the work is at most
-/// `max` squared steps plus one pass over the lines per diagonal. Each
-/// diagonal reached and each pair of lines compared along it adds a step to
-/// `steps`; `None` once they pass `limit`.
+/// `max` squared diagonals plus one pass over the lines per diagonal. Each
+/// pair of lines compared along a diagonal adds a step to `steps`, and each
+/// diagonal reached `DIAGONAL` steps; `None` once they pass `limit`.
 fn edit_distance<T: PartialEq>(
     a: &[T],
     b: &[T],
@@ -552,7 +553,7 @@ fn edit_distance<T: PartialEq>(
                 x += 1;
                 y += 1;
             }
-            *steps += 1 + (x - from) as usize;
+            *steps += DIAGONAL + (x - from) as usize;
             if *steps > limit {
                 return None;
             }
@@ -565,14 +566,27 @@ fn edit_distance<T: PartialEq>(
     Some(max)
 }
 
+/// What reaching a diagonal costs `edit_distance`, in comparisons of two
+/// lines along one, the unit both searches count their steps in: measured at
+/// about twelve in a debug build and seven in release.
+const DIAGONAL: usize = 8;
+
+/// What a word costs `banded_distance`, in the same comparisons: measured at
+/// about six in a debug build and three to four in release. Weighted so,
+/// `line_distance` gives up Myers' search once it has cost about what the
+/// other search will; counted alike, it gave it up on a long file of a few
+/// lines repeating where finishing would have taken half the time or less.
+const WORD: usize = 4;
+
 /// `edit_distance` of lines numbered below `ids`, in at most twice the steps
-/// `banded_distance` takes and one run along a diagonal, whatever the lines
+/// `banded_distance` takes and one diagonal with its run, whatever the lines
 /// are. Myers' search soon stops on most content, but on a long file of a
 /// few lines repeating it runs along equal lines on many diagonals, a pass
 /// over the file for each, so it may take only as many steps as
 /// `banded_distance` takes at most, and that counts instead if it has not
-/// finished by then. Both find the same count; `steps` adds up the steps of
-/// both.
+/// finished by then. Steps are weighted by what they cost (`DIAGONAL`,
+/// `WORD`), so that is when it has cost about as much as the other search
+/// will. Both find the same count; `steps` adds up the steps of both.
 fn line_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut usize) -> usize {
     let limit = *steps + banded_steps(a.len(), b.len(), max);
     match edit_distance(a, b, max, limit, steps) {
@@ -591,12 +605,12 @@ fn band(n: usize, m: usize, max: usize) -> Option<(usize, usize)> {
 }
 
 /// The most steps `banded_distance` takes on `n` lines and `m` under `max`:
-/// one per line of the first, to find where its lines are, and one per word
+/// `WORD` per line of the first, to find where its lines are, and per word
 /// of it the band crosses, at most `(del + ins) / 64 + 2`, per line of the
 /// second.
 fn banded_steps(n: usize, m: usize, max: usize) -> usize {
     match band(n, m, max) {
-        Some((del, ins)) if n > 0 && m > 0 => n + m * ((del + ins) / 64 + 2),
+        Some((del, ins)) if n > 0 && m > 0 => WORD * (n + m * ((del + ins) / 64 + 2)),
         _ => 0,
     }
 }
@@ -605,7 +619,7 @@ fn banded_steps(n: usize, m: usize, max: usize) -> usize {
 /// at a time for each line of `b` (Hyyrö's bit-parallel longest common
 /// subsequence), over only the band of diagonals a diff counting less than
 /// `max` stays on, as Ukkonen bounds the search. Its steps, which it adds to
-/// `steps`, are one per line of `a` and one per word of `a` the band crosses
+/// `steps`, are `WORD` per line of `a` and per word of `a` the band crosses
 /// per line of `b`, whatever the lines are.
 ///
 /// After each line of `b`, the zero bits of `a`'s words up to a place in
@@ -624,7 +638,7 @@ fn banded_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut
     if n == 0 || m == 0 {
         return n + m;
     }
-    *steps += n;
+    *steps += WORD * n;
     // per line, from `start[l]` to `start[l + 1]`: the words of `a` it occurs
     // in, in order, with a bit where it occurs in each
     let mut start = vec![0usize; ids + 1];
@@ -660,7 +674,7 @@ fn banded_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut
         // line `j` of `b` can only be kept with lines `j - ins` to `j + del`
         // of `a`
         let (lo, hi) = (j.saturating_sub(ins) / 64, (j + del).min(n - 1) / 64);
-        *steps += hi + 1 - lo;
+        *steps += WORD * (hi + 1 - lo);
         let end = start[*l + 1];
         let mut e = next[*l];
         while e < end && word[e] < lo {
@@ -3261,9 +3275,9 @@ mod tests {
         // one swap to the next, a pass over the file for each of about 500
         // diagonals, and on such a file of a million lines drawing the size
         // bar took seconds. `line_distance` gives it up once it has taken as
-        // many steps as the bit-parallel search takes at most, 18 per line
-        // under the size bar's cap, so it takes at most twice that and one
-        // run along a diagonal, whatever the lines are
+        // many steps as the bit-parallel search takes at most, 18 words per
+        // line under the size bar's cap, so it takes at most twice that and
+        // one diagonal with its run, whatever the lines are
         let a: Vec<usize> = (0..100_000).map(|i| i % 2).collect();
         let mut b = a.clone();
         for k in 0..480 {
@@ -3273,9 +3287,39 @@ mod tests {
         assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(960));
         assert_eq!(line_distance(&a, &b, 2, SIZE_BAR_TOP, &mut steps), 960);
         let most = banded_steps(a.len(), b.len(), SIZE_BAR_TOP);
-        assert!(most <= 18 * a.len(), "{} steps at most", most);
-        assert!(steps <= 2 * most + a.len(), "{} steps", steps);
+        assert!(most <= 18 * WORD * a.len(), "{} steps at most", most);
+        assert!(steps <= 2 * most + DIAGONAL + a.len(), "{} steps", steps);
         assert!(plain > 400 * a.len(), "{} steps", plain);
+    }
+
+    #[test]
+    fn line_distance_gives_up_where_the_bit_parallel_search_costs_less() {
+        // the hand-over is where it saves time, not where the two searches
+        // have taken as many steps. Two lines alternating, 32 pairs of
+        // neighbours swapped far apart: Myers' search compares about twice
+        // as many pairs of lines as `banded_distance` takes word steps, but
+        // a word step costs several comparisons, so it is the cheaper search
+        // and finishes. Giving it up there made the search over a million
+        // such lines take three times as long in a debug build
+        let a: Vec<usize> = (0..100_000).map(|i| i % 2).collect();
+        let mut b = a.clone();
+        for k in 0..32 {
+            b.swap(1001 + 3000 * k, 1002 + 3000 * k);
+        }
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(64));
+        assert_eq!(line_distance(&a, &b, 2, SIZE_BAR_TOP, &mut steps), 64);
+        assert_eq!(steps, plain);
+        // distinct lines, a block of 400 moved past 10000 others: Myers'
+        // search reaches some 320000 diagonals, on most of which no line is
+        // equal, and reaching one costs about twice a word step, so it gives
+        // up and the two searches together take fewer steps than it alone
+        let a: Vec<usize> = (0..10_400).collect();
+        let b: Vec<usize> = (400..10_400).chain(0..400).collect();
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(800));
+        assert_eq!(line_distance(&a, &b, a.len(), SIZE_BAR_TOP, &mut steps), 800);
+        assert!(steps < plain, "{} steps, {} alone", steps, plain);
     }
 
     #[test]
