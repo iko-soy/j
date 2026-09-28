@@ -1067,7 +1067,7 @@ async fn clear_the_way(
         }
         let _ = std::fs::remove_dir(dir);
     }
-    let mut aside = Aside { root: root.to_owned(), dir: None, stuck: None };
+    let mut aside = Aside { root: root.to_owned(), dir: None, stuck: None, returned: false };
     let mut dirs = HashMap::new();
     for path in paths {
         if first_not_a_dir(root, path, &mut dirs).is_some() {
@@ -1102,16 +1102,22 @@ const ASIDE: &str = "aside";
 /// The files `clear_the_way` moved out of a checkout's way, each holding
 /// what the checkout writes where it stood, in a directory in `.jj` that
 /// holds each at its path in the working directory `root`, which no scan
-/// reads; and the first file it could not move, with why. Dropped, once
-/// the checkout has written what it could, it puts each back where nothing
-/// stands now (`put_back`), as where a checkout that failed or skipped
-/// paths did not get to write, and removes the directory with what is
-/// left, each holding what the checkout wrote in its place (§7.5 step 7).
-/// One a run killed meanwhile left, the next puts back (`put_back_left`).
+/// reads; the first file it could not move, with why; and whether the
+/// checkout returned rather than failing, and so wrote in full each file
+/// it wrote. Dropped, once the checkout has written what it could, it puts
+/// each back (`put_back`) where nothing stands now, as where a checkout
+/// that failed or skipped paths did not get to write, and, unless the
+/// checkout returned, where a start of it does, as where it was cut short
+/// writing it, and removes the directory with the rest: each holds just
+/// what the focus has at its path, which the repository keeps, and what
+/// stands there, what the checkout wrote or something put there since,
+/// stays (§7.5 step 7). One a run killed meanwhile left, the next puts
+/// back (`put_back_left`).
 struct Aside {
     root: std::path::PathBuf,
     dir: Option<tempfile::TempDir>,
     stuck: Option<(RepoPathBuf, std::io::Error)>,
+    returned: bool,
 }
 
 impl Aside {
@@ -1133,17 +1139,20 @@ impl Aside {
 impl Drop for Aside {
     fn drop(&mut self) {
         if let Some(dir) = self.dir.take() {
-            put_back(&self.root, dir.path());
+            put_back(&self.root, dir.path(), !self.returned);
         }
     }
 }
 
 /// Put each file in `aside`, where `Aside` moved it, back at its path in
 /// the working directory `root` where nothing stands, making the
-/// directories above it that are missing; one that cannot be put back, as
-/// something stands there or in place of a directory above it, stays in
-/// `aside`. No symlink is followed.
-fn put_back(root: &std::path::Path, aside: &std::path::Path) {
+/// directories above it that are missing, and, where the checkout may have
+/// been `cut` short, where a start of it stands, less than all of it, as a
+/// checkout cut short while writing it leaves (`cut_short`), which it
+/// replaces; one that cannot be put back, as something else stands there
+/// or in place of a directory above it, stays in `aside`. No symlink is
+/// followed.
+fn put_back(root: &std::path::Path, aside: &std::path::Path, cut: bool) {
     let missing = |p: &std::path::Path| {
         matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
     };
@@ -1171,17 +1180,64 @@ fn put_back(root: &std::path::Path, aside: &std::path::Path) {
             let path = dir.join(entry.file_name());
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 dirs.push(path);
-            } else if missing(&root.join(&path)) && dirs_above(&path) {
-                let _ = std::fs::rename(entry.path(), root.join(&path));
+                continue;
+            }
+            let disk = root.join(&path);
+            // the directories above are looked at first, so that nothing
+            // is looked at through a symlink
+            if dirs_above(&path) && (missing(&disk) || (cut && cut_short(&disk, &entry.path()))) {
+                let _ = std::fs::rename(entry.path(), disk);
             }
         }
     }
 }
 
+/// Whether `disk` is a file holding a start of `whole`, a file moved
+/// aside, and less than all of it, or, where `whole` is a symlink, an
+/// empty file: what jj's checkout leaves where it was cut short (a full
+/// disk, a run killed) while it wrote `whole` there, as it makes a file
+/// empty before it writes it, and tries a symlink's path with an empty
+/// file first. Reads no more of either than `disk` holds. No symlink is
+/// followed.
+fn cut_short(disk: &std::path::Path, whole: &std::path::Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (Ok(stands), Ok(copy)) = (disk.symlink_metadata(), whole.symlink_metadata()) else {
+        return false;
+    };
+    if !stands.is_file() {
+        return false;
+    }
+    if copy.is_symlink() {
+        return stands.len() == 0;
+    }
+    if !copy.is_file() || stands.len() >= copy.len() {
+        return false;
+    }
+    let stands_file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(disk);
+    let (Ok(mut stands_file), Ok(mut copy_file)) = (stands_file, std::fs::File::open(whole)) else {
+        return false;
+    };
+    let (mut a, mut b) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+    let mut rest = stands.len();
+    while rest > 0 {
+        let n = rest.min(a.len() as u64) as usize;
+        let same = stands_file.read_exact(&mut a[..n]).is_ok()
+            && copy_file.read_exact(&mut b[..n]).is_ok()
+            && a[..n] == b[..n];
+        if !same {
+            return false;
+        }
+        rest -= n as u64;
+    }
+    true
+}
+
 /// Put back what a run killed while its checkout ran left moved aside in
-/// `.jj` (`Aside`), and remove the directory it left there. A run does
-/// this once it holds the repository's lock, before it looks at the
-/// working directory, so no other run is using such a directory.
+/// `.jj` (`Aside`), over a write the kill may have cut short too, and
+/// remove the directory it left there. A run does this once it holds the
+/// repository's lock, before it looks at the working directory, so no
+/// other run is using such a directory.
 fn put_back_left(root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(root.join(".jj")) else {
         return;
@@ -1189,7 +1245,7 @@ fn put_back_left(root: &std::path::Path) {
     for entry in entries.flatten() {
         let named = entry.file_name().to_str().is_some_and(|n| n.starts_with(ASIDE));
         if named && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            put_back(root, &entry.path());
+            put_back(root, &entry.path(), true);
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -2054,15 +2110,18 @@ impl JjBackend {
                 }
             };
         }
-        // what is moved aside is put back where the checkout does not write
-        // once it returns, however it returns
-        let aside = clear_the_way(&root, markers, &commit.tree(), &clear).await;
+        // what is moved aside is put back where the checkout does not write,
+        // or cuts the write short, once it returns, however it returns
+        let mut aside = clear_the_way(&root, markers, &commit.tree(), &clear).await;
         let from = locked_ws.locked_wc().old_tree().clone();
         let what = "the working directory was only partly updated";
         let stats = match locked_ws.locked_wc().check_out(commit).await {
             Ok(stats) => stats,
             Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what)))),
         };
+        // it cut no write short, so a start of a file moved aside, standing
+        // at its path, was put there meanwhile
+        aside.returned = true;
         // Something the directory does not track, put where the focus adds a
         // file since it was looked at, or a file holding what the checkout
         // writes there that could not be moved aside, made jj skip the

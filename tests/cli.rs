@@ -1800,6 +1800,143 @@ fn a_file_a_checkout_cut_short_moved_aside_is_put_back_by_the_next_run() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_file_moved_aside_that_a_full_disk_cut_short_is_put_back_whole() {
+    // §7.4, §7.5 step 7: an untracked file holding just what the checkout
+    // writes at a path the focus adds was moved aside for the checkout,
+    // and removed once it returned wherever something stood at its path.
+    // A write there that a full disk cut short left the ignored file,
+    // which no run reads, empty: `j undo` left it so, and the checkout,
+    // done again, was refused, the file being in its way. The file moved
+    // aside is put back over the start of it the checkout wrote now.
+    let r = setup();
+    r.write(".gitignore", "zz\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("zz", "z\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `zz`, written after `m`, is left empty
+    let out = stopped_mid_checkout_as(&r, &slow_edit("c.files", n), n, fill_disk);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("Failed to write the content to the file"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("zz"), "z\n");
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("zz"), "z\n");
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    // done again, the checkout completes
+    r.j(&["redo"]).ok();
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("zz"), "z\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_file_moved_aside_that_a_killed_run_left_a_start_of_is_put_back_whole() {
+    // §7.4, §7.5 step 7: a run killed while its checkout wrote a file it
+    // had moved aside leaves a start of it at its path (jj's checkout
+    // makes the file, empty, before it writes it, and a symlink's path is
+    // tried with an empty file first), and the next run, finding something
+    // there, removed the whole file it had moved aside, leaving the ignored
+    // start of it, which no run reads. It puts the file back over a start
+    // of itself now, and anything else standing there stays as it is.
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    // B tracks `t.env`, a symlink, which `.gitignore` ignores
+    r.j(&["new"]).ok();
+    std::os::unix::fs::symlink("target", r.dir.join("t.env")).unwrap();
+    r.j(&["describe \"S\""]).ok();
+    r.j(&["new"]).ok();
+    r.write(".gitignore", "*.env\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&[&new_above("base")]).ok();
+    r.write(".gitignore", "*.env\n");
+    r.j(&["describe \"A\""]).ok();
+    let names = ["o.env", "p.env", "q.env", "r.env"];
+    for name in names {
+        r.write(name, "committed\n");
+    }
+    std::os::unix::fs::symlink("target", r.dir.join("t.env")).unwrap();
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // each `.env` is written after `m`
+    let files = "c.files ++ map (\\p -> { path = [p], content = blob \"committed\\n\" }) [\"o.env\" \"p.env\" \"q.env\" \"r.env\"]";
+    let edit = format!("{} . {}", slow_edit(files, n), new_above("B"));
+    let out = stopped_mid_checkout_as(&r, &edit, n, |pid| {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    });
+    assert_eq!(out.code, -libc::SIGKILL, "{}", out.stderr);
+    assert!(in_m(&r) < n);
+    assert_eq!(aside_in_jj(&r).len(), 1);
+    for name in names.iter().chain(&["t.env"]) {
+        assert!(r.dir.join(name).symlink_metadata().is_err(), "{}", name);
+    }
+    // what a kill while each was written leaves, and what the user saved
+    // there since, which differs, or goes on after it
+    r.write("o.env", "comm");
+    r.write("p.env", "");
+    r.write("t.env", "");
+    r.write("q.env", "mine\n");
+    r.write("r.env", "committed\nand more\n");
+    let kept = |r: &Repo| {
+        assert_eq!(r.read("o.env"), "committed\n");
+        assert_eq!(r.read("p.env"), "committed\n");
+        assert_eq!(std::fs::read_link(r.dir.join("t.env")).unwrap(), PathBuf::from("target"));
+        assert_eq!(r.read("q.env"), "mine\n");
+        assert_eq!(r.read("r.env"), "committed\nand more\n");
+        assert_eq!(aside_in_jj(r), Vec::<String>::new());
+    };
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    kept(&r);
+    r.j(&["undo"]).ok();
+    kept(&r);
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_start_of_a_file_moved_aside_saved_meanwhile_stays_where_the_checkout_returns() {
+    // §7.4, §7.5 step 7: a checkout that returns, having skipped a path,
+    // wrote no file only in part, so a start of the file moved aside for
+    // it, saved at its path while the checkout ran, is the user's, and
+    // stays, holding what it held, as does anything else saved there
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("o.env", "committed\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let n = 2000;
+    // `o.env` is written after `m`
+    let files = "c.files ++ [{ path = [\"o.env\"], content = blob \"committed\\n\" }]";
+    let out = stopped_mid_checkout(&r, &slow_edit(files, n), n, || {
+        assert!(!r.dir.join("o.env").exists());
+        r.write("o.env", "comm");
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("`o.env` was not written"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(in_m(&r), n);
+    assert_eq!(r.read("o.env"), "comm");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("o.env"), "comm");
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn an_ignored_file_saved_meanwhile_where_a_checkout_adds_one_fails_it() {
     // §7.4, §7.5 step 7: a file saved while the checkout runs, at a path
     // it adds after that, is in its way, and jj skipped the path, recording
