@@ -6,25 +6,30 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, Crash, LazyBlob, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, ThunkVal, Value};
+use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::local_working_copy::{FileState, FileStates, FileType, LocalWorkingCopy, TreeState, TreeStateSettings};
+use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::backend::{CommitId, FileId};
+use jj_lib::backend::{CommitId, FileId, MergedTreeValueExt, TreeId};
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
+use jj_lib::revset::{ResolvedRevsetExpression, RevsetStreamExt};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
-use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::transaction::UnpublishedOperation;
+use jj_lib::working_copy::{LockedWorkingCopy, SnapshotError, SnapshotOptions};
 use jj_lib::workspace::Workspace;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -32,7 +37,7 @@ use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn block_on<F: Future>(f: F) -> F::Output {
     pollster::block_on(f)
@@ -252,26 +257,1160 @@ pub struct JjInner {
     repo: Mutex<Arc<ReadonlyRepo>>,
     workspace_name: WorkspaceNameBuf,
     /// visible map backing the `Backend` lookups during evaluation; filled by
-    /// build_interp with the post-snapshot map
+    /// build_interp with the post-snapshot map, or the loaded one when the
+    /// snapshot goes into a new child of an immutable focus (§7.2)
     visible: Mutex<Option<Arc<VisibleRepo>>>,
     lock_guard: Mutex<Option<FileLock>>,
-    /// the snapshot transaction and working-copy lock, held between
-    /// build_interp and persist so the snapshot and the expression's edits
-    /// form one jj operation (§1.2); dropped uncommitted by printing runs
+    /// the snapshot's unpublished rewrite, kept between build_interp and
+    /// persist so the snapshot and the expression's edits form one jj
+    /// operation (§1.2); dropped uncommitted by printing runs. The
+    /// working-copy lock is not held: its saved state is still the tree
+    /// recorded before the snapshot until `persist`'s checkout scans the
+    /// directory again
     pending: Mutex<Option<PendingSnapshot>>,
+    /// whether the workspace's filesystem folds case, probed on first use
+    /// (`Backend::folds_case`)
+    folds_case: OnceLock<bool>,
+    /// whether the workspace's filesystem holds each name longer than
+    /// `NAME_MAX` asked about so far (`Backend::name_fits`)
+    long_names: Mutex<HashMap<String, bool>>,
 }
 
 /// holding the file keeps the flock
 pub struct FileLock(#[allow(dead_code)] std::fs::File);
 
-#[allow(dead_code)]
 struct PendingSnapshot {
     /// repo as loaded at head, before the snapshot
     pre_repo: Arc<ReadonlyRepo>,
-    /// the snapshot's rewritten wc commit and tree, to be folded into the
+    /// the snapshot's tree for the wc commit, to be folded into the
     /// persisting operation (§1.2 step 8, §7.7)
-    new_wc_id: CommitId,
     tree: MergedTree,
+    /// false when the wc commit is immutable: the snapshot then belongs to
+    /// the focus's new child (§7.2), and the wc commit is kept as stored
+    fold_into_wc: bool,
+    /// the tree the scan found in the working directory, which `persist`'s
+    /// checkout starts from: `tree` itself, unless the working copy was
+    /// stale and `tree` merges the directory's changes onto the commit
+    /// (`snapshot_tree`)
+    scanned: MergedTree,
+}
+
+/// How every scan of the working directory reads it (§7.4): each file
+/// not ignored by the directory's own `.gitignore`s is tracked, whatever
+/// its size. `persist`'s checkout rescans with the same options and
+/// relies on getting the snapshot's tree back.
+fn snapshot_options() -> SnapshotOptions<'static> {
+    SnapshotOptions {
+        base_ignores: GitIgnoreFile::empty(),
+        progress: None,
+        start_tracking_matcher: &EverythingMatcher,
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size: u64::MAX,
+    }
+}
+
+/// Scan the working directory with `options`, as `wc.snapshot` does, where
+/// `base` is the tree the working copy's state records, as `saved` holds
+/// it; return the tree scanned. jj's scan loses a regular file found where
+/// `base` has a conflict it cannot write a file into, one with a side that
+/// is no file, and keeps the conflict, so the file reaches no tree (§7.4):
+///
+/// - at a conflicted path, where a checkout wrote jj's description of the
+///   sides and a file written since holds something else
+///   (`FilesOnConflicts::at`). The state is first reset to a resolved file
+///   there, so that the scan reads the file whole, as it reads any tracked
+///   file; the path stays tracked where a `.gitignore` has come to match it.
+/// - above one, where `base` has a directory holding a conflict, whose
+///   differing sides the scan keeps at the path while it removes the
+///   entries below (and a debug build fails an assertion). Such a file is
+///   first left untracked, which scans it as if it had been moved away and
+///   records the directory's removal; a second scan then records the file
+///   where nothing is, as a later run would once it was put back.
+async fn scan(
+    wc: &mut dyn LockedWorkingCopy,
+    root: &std::path::Path,
+    base: &MergedTree,
+    saved: &SavedState,
+    options: &SnapshotOptions<'_>,
+) -> Result<MergedTree, String> {
+    let files = files_on_conflicts(root, base, Some(saved))?;
+    let mut state = base.clone();
+    if !files.at.is_empty() {
+        // the empty file: a reset records the file at each path it changes
+        // as an empty one, not executable, modified at the epoch, so the
+        // scan reads any other file there, and keeps this one for such a file
+        let store = base.store();
+        let id = store.write_file(RepoPath::root(), &mut &[][..]).await.map_err(|e| e.to_string())?;
+        let copy_id = CopyId::placeholder();
+        let empty = Merge::normal(TreeValue::File { id, executable: false, copy_id });
+        state = reset_paths(wc, &state, files.at.into_iter().map(|path| (path, empty.clone()))).await?;
+    }
+    if !files.over.is_empty() {
+        let untracked = FilesMatcher::new(&files.over);
+        let start = DifferenceMatcher::new(options.start_tracking_matcher, &untracked);
+        let first = SnapshotOptions { start_tracking_matcher: &start, ..options.clone() };
+        state = scan_pass(wc, root, &state, &first).await?;
+        // a state that agrees with its tree tracks every entry below the
+        // directory, so none is left; were a conflict left below, the
+        // second scan would lose the file after all
+        if let Some(path) = files_on_conflicts(root, &state, None)?.over.first() {
+            return Err(format!(
+                "cannot record the file `{}` in place of a directory holding a conflict",
+                path.as_internal_file_string()
+            ));
+        }
+    }
+    scan_pass(wc, root, &state, options).await
+}
+
+/// `wc.snapshot(options)`, where `state` is the tree the working copy's
+/// state records; return the tree scanned. jj's scan reads a directory a
+/// `.gitignore` ignores only at the paths the state tracks there, and where
+/// it cannot look at one of them because a directory above it has been
+/// replaced by a file, it fails instead of taking the path for deleted, as
+/// it takes one it does not find. The paths below a file are then dropped
+/// from the state, which records them as deleted, and the directory is
+/// scanned again (§7.4). A scan fails so while it walks the directory,
+/// before it changes anything in the state.
+async fn scan_pass(
+    wc: &mut dyn LockedWorkingCopy,
+    root: &std::path::Path,
+    state: &MergedTree,
+    options: &SnapshotOptions<'_>,
+) -> Result<MergedTree, String> {
+    let err = match wc.snapshot(options).await {
+        Ok((scanned, _stats)) => return Ok(scanned),
+        Err(err) => err,
+    };
+    let not_a_dir = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotADirectory;
+    let SnapshotError::Other { err: source, .. } = &err else {
+        return Err(err.to_string());
+    };
+    if !source.downcast_ref::<std::io::Error>().is_some_and(not_a_dir) {
+        return Err(err.to_string());
+    }
+    // one `lstat` per path the state tracks, only once a scan has failed
+    let mut gone = Vec::new();
+    for (path, value) in state.entries() {
+        value.map_err(|e| e.to_string())?;
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        if disk.symlink_metadata().is_err_and(|e| not_a_dir(&e)) {
+            gone.push((path, Merge::absent()));
+        }
+    }
+    if gone.is_empty() {
+        return Err(err.to_string());
+    }
+    reset_paths(wc, state, gone).await?;
+    let (scanned, _stats) = wc.snapshot(options).await.map_err(|e| e.to_string())?;
+    Ok(scanned)
+}
+
+/// Give the working copy's state, which records `state`, the tree `state`
+/// with `values` at their paths, and return it; nothing in the working
+/// directory is read or written. A reset takes each path it changes for one
+/// the next scan is to read again.
+async fn reset_paths(
+    wc: &mut dyn LockedWorkingCopy,
+    state: &MergedTree,
+    values: impl IntoIterator<Item = (RepoPathBuf, jj_lib::backend::MergedTreeValue)>,
+) -> Result<MergedTree, String> {
+    let mut builder = MergedTreeBuilder::new(state.clone());
+    for (path, value) in values {
+        builder.set_or_remove(path, value);
+    }
+    let tree = builder.write_tree().await.map_err(|e| e.to_string())?;
+    // a reset reads only the commit's tree
+    let commit = with_tree(&state.store().root_commit(), tree.clone());
+    wc.reset(&commit).await.map_err(|e| e.to_string())?;
+    Ok(tree)
+}
+
+/// Where the working directory holds a regular file that jj's scan reads
+/// into no tree, as `tree` has a conflict there it cannot write a file into
+struct FilesOnConflicts {
+    /// the conflicted paths with a side that is no file (a directory, a
+    /// symlink, a submodule), which a checkout writes as jj's description of
+    /// the sides, whose file was written since and describes no such
+    /// conflict
+    at: Vec<RepoPathBuf>,
+    /// the directories holding a conflict, that is those above a conflicted
+    /// path: a directory's sides differ exactly when a conflict is below
+    /// it, as jj writes no tree whose sides differ where every path resolves
+    over: Vec<RepoPathBuf>,
+}
+
+/// Where the working copy saves its state, to read back what the state a
+/// scan's lock loaded records of a file (`files_on_conflicts`). Nothing is
+/// read until a scan asks.
+struct SavedState {
+    store: Arc<Store>,
+    root: PathBuf,
+    path: PathBuf,
+    settings: UserSettings,
+}
+
+impl SavedState {
+    /// Where `ws` saves its working copy's state; taken before the lock,
+    /// which borrows `ws`
+    fn of(ws: &Workspace) -> SavedState {
+        let root = ws.workspace_root().to_owned();
+        let path = match ws.working_copy().downcast_ref::<LocalWorkingCopy>() {
+            Some(wc) => wc.state_path().to_owned(),
+            None => root.join(".jj").join("working_copy"),
+        };
+        SavedState { store: ws.repo_loader().store().clone(), root, path, settings: ws.settings().clone() }
+    }
+
+    /// The state as saved, where it records `tree`, with the time it was
+    /// saved; None where it cannot be read or records another tree. A state
+    /// file that is not there is not read, as jj would write one to read.
+    fn load(&self, tree: &MergedTree) -> Option<(TreeState, i64)> {
+        let meta = self.path.join("tree_state").symlink_metadata().ok()?;
+        let saved_at = millis(meta.modified().ok()?)?;
+        let settings = TreeStateSettings::try_from_user_settings(&self.settings).ok()?;
+        let state = TreeState::load(self.store.clone(), self.root.clone(), self.path.clone(), &settings).ok()?;
+        (state.current_tree().tree_ids() == tree.tree_ids()).then_some((state, saved_at))
+    }
+}
+
+/// A modification time in milliseconds since the epoch, as jj's working
+/// copy records one
+fn millis(time: std::time::SystemTime) -> Option<i64> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).ok(),
+        Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|m| -m),
+    }
+}
+
+/// Whether the working copy's state, saved at `saved_at`, records `state`
+/// for the regular file `meta` describes as it is now: jj's own test of a
+/// file left as it was (`FileState::is_clean`, the executable bit aside),
+/// under which it reads nothing. A file modified in the millisecond the
+/// state was saved, or later, may have been written after it was.
+fn left_as_recorded(state: &FileState, meta: &std::fs::Metadata, saved_at: i64) -> bool {
+    matches!(state.file_type, FileType::Normal { .. })
+        && state.size == meta.len()
+        && meta.modified().ok().and_then(millis) == Some(state.mtime.0)
+        && state.mtime.0 < saved_at
+}
+
+/// The terms of a conflict that `text`, jj's description of one, names:
+/// those removed and those added, each without the label a checkout may
+/// write after it, with each removed that is also added cancelled against
+/// it, as simplifying the conflict does, sorted; None for text that is no
+/// description. Two descriptions naming the same terms describe one
+/// conflict, whatever its labels or the sides it has lost since.
+fn described_terms(text: &[u8]) -> Option<(Vec<&str>, Vec<&str>)> {
+    let lines = std::str::from_utf8(text).ok()?.strip_prefix("Conflict:\n")?;
+    if !lines.is_empty() && !lines.ends_with('\n') {
+        return None;
+    }
+    let (mut removes, mut adds) = (Vec::new(), Vec::new());
+    for line in lines.split_terminator('\n') {
+        let (terms, term) = match (line.strip_prefix("  Removing "), line.strip_prefix("  Adding ")) {
+            (Some(term), _) => (&mut removes, term),
+            (_, Some(term)) => (&mut adds, term),
+            _ => return None,
+        };
+        // a term ends with its object's id, which holds no space
+        let id = term.find(" with id ")? + " with id ".len();
+        let end = term[id..].find(' ').map_or(term.len(), |n| id + n);
+        let (term, label) = term.split_at(end);
+        if !label.is_empty() && !(label.starts_with(" (") && label.ends_with(')')) {
+            return None;
+        }
+        terms.push(term);
+    }
+    removes.retain(|term| match adds.iter().position(|t| t == term) {
+        Some(n) => {
+            adds.swap_remove(n);
+            false
+        }
+        None => true,
+    });
+    removes.sort_unstable();
+    adds.sort_unstable();
+    Some((removes, adds))
+}
+
+/// Look on disk at `tree`'s conflicts for `FilesOnConflicts`; with no
+/// `saved`, for `over` only. Nothing is looked at when `tree` is resolved;
+/// each directory above a conflict at most once, with one `lstat`; and a
+/// conflict with a side that is no file below directories, with one more,
+/// and a read where its file is as long as its description. Only a file
+/// that holds something else is looked up in the saved state, which is read
+/// once, and read itself where the state records it otherwise.
+fn files_on_conflicts(
+    root: &std::path::Path,
+    tree: &MergedTree,
+    saved: Option<&SavedState>,
+) -> Result<FilesOnConflicts, String> {
+    let mut files = FilesOnConflicts { at: Vec::new(), over: Vec::new() };
+    // whether each directory looked at so far is one on disk
+    let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
+    // the state as saved, read once a file differs from its description,
+    // and what it records of the files, taken once
+    let loaded: std::cell::OnceCell<Option<(TreeState, i64)>> = std::cell::OnceCell::new();
+    let recorded: std::cell::OnceCell<Option<(FileStates<'_>, i64)>> = std::cell::OnceCell::new();
+    for (path, value) in tree.conflicts() {
+        let value = value.map_err(|e| e.to_string())?;
+        let parent = path.parent().expect("a conflicted path has a parent");
+        let above: Vec<&RepoPath> = parent.ancestors().take_while(|d| !d.is_root()).collect();
+        // from the top down, stopping at the first that is not a directory
+        let below_dirs = above.into_iter().rev().all(|dir| match dirs.get(dir) {
+            Some(&is_dir) => is_dir,
+            None => {
+                let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+                if meta.as_ref().is_some_and(|m| m.is_file()) {
+                    files.over.push(dir.to_owned());
+                }
+                let is_dir = meta.is_some_and(|m| m.is_dir());
+                dirs.insert(dir.to_owned(), is_dir);
+                is_dir
+            }
+        });
+        let Some(saved) = saved.filter(|_| below_dirs && value.to_file_merge().is_none()) else {
+            continue;
+        };
+        let Some((disk, meta)) = path.to_fs_path(root).ok().and_then(|disk| {
+            let meta = disk.symlink_metadata().ok()?;
+            meta.is_file().then_some((disk, meta))
+        }) else {
+            continue;
+        };
+        // what jj's checkout writes for it (§7.4)
+        let written = value.describe(tree.labels());
+        let mut bytes = None;
+        if meta.len() == written.len() as u64 {
+            match std::fs::read(&disk) {
+                Ok(read) if read == written.as_bytes() => continue,
+                Ok(read) => bytes = Some(read),
+                Err(_) => continue,
+            }
+        }
+        // the file a checkout wrote, left as it was: it describes the
+        // conflict as the checkout had it, which the state may since
+        // record otherwise with no file written, as a scan that drops a
+        // pair of sides that cancel, or a reset that only relabels, does
+        let states = recorded.get_or_init(|| {
+            let (state, saved_at) = loaded.get_or_init(|| saved.load(tree)).as_ref()?;
+            Some((state.file_states(), *saved_at))
+        });
+        if states.as_ref().is_some_and(|(file_states, saved_at)| {
+            file_states.get(&path).is_some_and(|state| left_as_recorded(&state, &meta, *saved_at))
+        }) {
+            continue;
+        }
+        // written since, or not known to be left: the conflict is kept
+        // while the file describes it, as when an editor saves it unchanged
+        let Some(bytes) = bytes.or_else(|| std::fs::read(&disk).ok()) else {
+            continue;
+        };
+        let unlabelled = value.describe(&jj_lib::conflict_labels::ConflictLabels::unlabeled());
+        let terms = described_terms(unlabelled.as_bytes());
+        if terms.is_none() || described_terms(&bytes) != terms {
+            files.at.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// The tree a snapshot records in the working-copy commit, whose tree is
+/// `wc`, where the working copy's state records `state` and a scan of the
+/// working directory found `scanned` (§7.4): `scanned` itself where the
+/// state is the commit's, and also where it is `current`, saved at the
+/// operation the repository is at, which jj takes for the files last
+/// checked out whatever it records: one lost, which jj makes again
+/// recording no file, or one put in its place. Such a state may record none
+/// of the commit's conflicts, so a file holding what a checkout wrote for
+/// one is read back as it there (`conflicts_written`). Otherwise the state
+/// is stale (a checkout that failed or was cut short after its operation
+/// was recorded, a `fetch` that rebased the commit, jj run with
+/// `--ignore-working-copy` or from another workspace), and what the
+/// directory holds is a change to `state` rather than to the commit: that
+/// change is replayed onto the commit, a three-way merge with `state` as
+/// the base, in which a path both changed differently is a conflict, but
+/// for one setting a directory against anything else, which takes what the
+/// working directory holds there, as where the state is current. What a
+/// checkout cut short wrote is the commit's own content, which the merge
+/// takes as it is: where the directory holds what the commit does, the base
+/// is taken to hold it too, so that a conflict the state records there,
+/// whose sides would not cancel against the commit's, does not make one of
+/// a change both made. That includes a conflict the checkout wrote, which
+/// the scan read as its text (`conflicts_written`).
+async fn snapshot_tree(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    wc: &MergedTree,
+    state: &MergedTree,
+    current: bool,
+    scanned: &MergedTree,
+) -> Result<MergedTree, String> {
+    if state.tree_ids() == wc.tree_ids() {
+        return Ok(scanned.clone());
+    }
+    if current {
+        return conflicts_written(root, markers, wc, state, scanned).await;
+    }
+    if scanned.tree_ids() == state.tree_ids() {
+        return Ok(wc.clone());
+    }
+    let scanned = &conflicts_written(root, markers, wc, state, scanned).await?;
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    // the paths where the directory holds something other than the commit
+    let mut apart = std::collections::HashSet::new();
+    let mut diff = wc.diff_stream(scanned, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        entry.values.map_err(err)?;
+        apart.insert(entry.path);
+    }
+    // the base: the state, but for what the directory changed as the
+    // commit did
+    let mut base = MergedTreeBuilder::new(state.clone());
+    let mut same = false;
+    let mut diff = state.diff_stream(scanned, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { after, .. } = entry.values.map_err(err)?;
+        if !apart.contains(&entry.path) {
+            base.set_or_remove(entry.path, after);
+            same = true;
+        }
+    }
+    let base = if same { base.write_tree().await.map_err(err)? } else { state.clone() };
+    let merged = MergedTree::merge(Merge::from_removes_adds(
+        vec![(base.clone(), "last checkout".to_string())],
+        vec![
+            (wc.clone(), "working-copy commit".to_string()),
+            (scanned.clone(), "working directory".to_string()),
+        ],
+    ))
+    .await
+    .map_err(err)?;
+    // A conflict setting a directory against a file, a symlink or nothing,
+    // which jj keeps at the path itself, cannot be a blob that lists the
+    // directory's entries (§7.3), and a checkout would write jj's
+    // description of it in place of what the directory holds there,
+    // removing a directory's files: where the directory changed the path,
+    // take what it holds, as a snapshot over a current state does. The
+    // commit's change there is left in the operation before. Where the
+    // directory holds what the base does, the merge took the commit's value
+    // as it is, so such a conflict is one the commit already has, and it
+    // stays. A tree with no conflict is not walked.
+    let mut kept = MergedTreeBuilder::new(merged.clone());
+    let mut mixed = false;
+    for (path, value) in merged.conflicts() {
+        if value.map_err(err)?.iter().any(|term| matches!(term, Some(TreeValue::Tree(_)))) {
+            let held = scanned.path_value(&path).await.map_err(err)?;
+            if held == base.path_value(&path).await.map_err(err)? {
+                continue;
+            }
+            kept.set_or_remove(path, held);
+            mixed = true;
+        }
+    }
+    if !mixed {
+        return Ok(merged);
+    }
+    kept.write_tree().await.map_err(err)
+}
+
+/// `scanned` with the commit's conflict at each path the working-copy state
+/// records something else at, where the file holds what jj's checkout
+/// writes for that conflict (`holds_written`): its markers, or its
+/// description where a side is no file (§7.4). A checkout records the
+/// conflict in the state as it writes the file, so a scan reads such a file
+/// back as the conflict; one cut short, or one over a stale state, records
+/// nothing, nor does a state made again where it was lost, and the scan
+/// reads the file as the text it holds. Each of the commit's conflicts is
+/// looked at, and a file read, only where neither the state nor the scan
+/// has the conflict.
+async fn conflicts_written(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    wc: &MergedTree,
+    state: &MergedTree,
+    scanned: &MergedTree,
+) -> Result<MergedTree, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut tree = MergedTreeBuilder::new(scanned.clone());
+    let mut found = false;
+    for (path, value) in wc.conflicts() {
+        let value = value.map_err(err)?;
+        if state.path_value(&path).await.map_err(err)? == value
+            || scanned.path_value(&path).await.map_err(err)? == value
+        {
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        if holds_written(wc.store(), &path, value.clone(), wc.labels(), markers, &disk).await? {
+            tree.set_or_remove(path, value);
+            found = true;
+        }
+    }
+    if !found {
+        return Ok(scanned.clone());
+    }
+    tree.write_tree().await.map_err(err)
+}
+
+/// Whether `disk`, the entry at `path`, holds what a checkout writes there
+/// for `value`: a file's content or a symlink's target, whatever its
+/// executable bit, or, for a conflict, exactly its markers, compared byte
+/// for byte (j's settings convert no line endings), or, where a side is no
+/// file, a description of the same sides, whatever their labels and less
+/// any it both removes and adds, as a scan reads one back
+/// (`files_on_conflicts`); nothing is written to the store
+async fn holds_written(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: jj_lib::backend::MergedTreeValue,
+    labels: &jj_lib::conflict_labels::ConflictLabels,
+    markers: ConflictMarkerStyle,
+    disk: &std::path::Path,
+) -> Result<bool, String> {
+    use jj_lib::conflicts::{self, MaterializedTreeValue};
+    let symlink = matches!(value.as_normal(), Some(TreeValue::Symlink(_)));
+    let Some(meta) = disk.symlink_metadata().ok().filter(|m| if symlink { m.is_symlink() } else { m.is_file() })
+    else {
+        return Ok(false);
+    };
+    let written = conflicts::materialize_tree_value(store, path, value, labels)
+        .await
+        .map_err(|e| e.to_string())?;
+    match written {
+        MaterializedTreeValue::Symlink { target, .. } => {
+            Ok(std::fs::read_link(disk).is_ok_and(|t| t.as_os_str() == target.as_str()))
+        }
+        MaterializedTreeValue::File(mut file) => {
+            let bytes = file.read_all(path).await.map_err(|e| e.to_string())?;
+            Ok(meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
+        }
+        MaterializedTreeValue::FileConflict(file) => {
+            let options = conflicts::ConflictMaterializeOptions {
+                marker_style: markers,
+                marker_len: Some(conflicts::choose_materialized_conflict_marker_len(&file.contents)),
+                merge: store.merge_options().clone(),
+            };
+            let bytes: Vec<u8> =
+                conflicts::materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into();
+            Ok(meta.len() == bytes.len() as u64 && std::fs::read(disk).is_ok_and(|b| b == bytes))
+        }
+        MaterializedTreeValue::OtherConflict { id, .. } => {
+            let unlabelled = id.describe(&jj_lib::conflict_labels::ConflictLabels::unlabeled());
+            let terms = described_terms(unlabelled.as_bytes());
+            Ok(terms.is_some() && std::fs::read(disk).is_ok_and(|b| described_terms(&b) == terms))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// How the working copy writes a conflict, as `settings` say
+fn marker_style(settings: &UserSettings) -> Result<ConflictMarkerStyle, String> {
+    Ok(TreeStateSettings::try_from_user_settings(settings).map_err(|e| e.to_string())?.conflict_marker_style)
+}
+
+/// The first of the directories between the root and `path`, from the top
+/// down, that is no directory on disk, with the type of what stands there
+/// (none where nothing does, or it cannot be looked at), or none if each
+/// is: a symlink is not one, and is not followed, as no directory below
+/// one is looked at. Each directory not looked at before costs one
+/// `lstat`, and what it found is kept in `dirs`.
+fn first_not_a_dir(
+    root: &std::path::Path,
+    path: &RepoPath,
+    dirs: &mut HashMap<RepoPathBuf, Option<std::fs::FileType>>,
+) -> Option<(RepoPathBuf, Option<std::fs::FileType>)> {
+    let parent = path.parent()?;
+    let above: Vec<&RepoPath> = parent.ancestors().take_while(|d| !d.is_root()).collect();
+    for dir in above.into_iter().rev() {
+        let stands = match dirs.get(dir) {
+            Some(&stands) => stands,
+            None => {
+                let meta = dir.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+                let stands = meta.map(|m| m.file_type());
+                dirs.insert(dir.to_owned(), stands);
+                stands
+            }
+        };
+        if !stands.is_some_and(|t| t.is_dir()) {
+            return Some((dir.to_owned(), stands));
+        }
+    }
+    None
+}
+
+/// The first path where the working directory, scanned again as
+/// `rescanned`, no longer holds what it held as `on_disk`, the run's
+/// snapshot of it, and a checkout from `on_disk` to `to` writes or removes
+/// a file: a change made while the program ran, which no snapshot holds and
+/// jj's checkout would write over without looking (§7.5 step 7). Paths are
+/// compared file by file, as a directory is by what it holds; one lookup
+/// in `to` per path the directory changed at.
+async fn written_over(
+    on_disk: &MergedTree,
+    rescanned: &MergedTree,
+    to: &MergedTree,
+) -> Result<Option<RepoPathBuf>, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut diff = on_disk.diff_stream(rescanned, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, .. } = entry.values.map_err(err)?;
+        // a diff has no tree on either side
+        let focus = to.path_value(&entry.path).await.map_err(err)?;
+        let focus = if focus.is_tree() { Merge::absent() } else { focus };
+        if focus != before {
+            return Ok(Some(entry.path));
+        }
+    }
+    Ok(None)
+}
+
+/// What stands in the way of a path a checkout adds: `holder`, in the
+/// working directory, which does not track it, at `path`, above it, or in
+/// a directory at it
+struct InTheWay {
+    path: RepoPathBuf,
+    holder: RepoPathBuf,
+}
+
+impl InTheWay {
+    /// Whether it is a directory at `path`, holding `holder`
+    fn is_dir(&self) -> bool {
+        self.holder != self.path && self.holder.starts_with(&self.path)
+    }
+
+    /// What a refused checkout says of it among others: a directory by its
+    /// own path, with what it holds, anything else by its path
+    fn named(&self) -> String {
+        if self.is_dir() {
+            format!(
+                "`{}` (a directory holding untracked files, such as `{}`)",
+                self.path.as_internal_file_string(),
+                self.holder.as_internal_file_string()
+            )
+        } else {
+            format!("`{}`", self.holder.as_internal_file_string())
+        }
+    }
+}
+
+/// Why a checkout is refused over `in_the_way`, which is not empty, as
+/// git names each untracked file in the way: one with the path the focus
+/// has there, more by listing the first ten and counting the rest
+fn in_the_way_of(in_the_way: &[InTheWay]) -> String {
+    const LISTED: usize = 10;
+    match in_the_way {
+        [one] if one.is_dir() => format!(
+            "it has `{0}`, and `{0}` in the working directory is a directory holding untracked files, such as `{1}`; move it aside",
+            one.path.as_internal_file_string(),
+            one.holder.as_internal_file_string()
+        ),
+        [one] => format!(
+            "it has `{}`, and an untracked `{}` in the working directory is in its way; move it aside",
+            one.path.as_internal_file_string(),
+            one.holder.as_internal_file_string()
+        ),
+        _ => {
+            let mut named: Vec<String> = in_the_way.iter().take(LISTED).map(InTheWay::named).collect();
+            let last = match in_the_way.len() - named.len() {
+                0 => named.pop().unwrap_or_default(),
+                more => format!("{} more", more),
+            };
+            format!(
+                "untracked files in the working directory are in the way of files it has: {} and {}; move them aside",
+                named.join(", "),
+                last
+            )
+        }
+    }
+}
+
+/// What stands in the working directory where a checkout from `from`, the
+/// tree the directory holds as scanned, to `to` adds a file (or a symlink,
+/// or a conflict): at each path where `to` has one and `from` has none.
+/// jj's checkout writes nothing over anything already there, and skips
+/// the path without failing, recording it as written, so the next scan
+/// would read what stands there into the focus, an ignored file's content
+/// in place of the focus's, or take the focus's file for deleted (§7.4).
+/// What `from` tracks there the checkout removes first; trees of empty
+/// directories, which no scan sees, and a file holding just what the
+/// checkout writes there (`holds_written`), as a checkout cut short leaves
+/// at an ignored path, are cleared for it (`clear_the_way`). The result is
+/// the paths where nothing else stands, or, walking the whole diff all the
+/// same, each thing standing where anything else does (`InTheWay`), in
+/// path order, what stands above several paths once. No symlink is
+/// followed. Each path costs one `lstat`, and each directory above one not
+/// looked at before one more; a file standing at a path is read, and a
+/// directory read until something untracked is found in it, each entry in
+/// it that is no directory looked up in `from`.
+async fn look_where_added(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<Result<Vec<RepoPathBuf>, Vec<InTheWay>>, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut dirs = HashMap::new();
+    // each thing that is no directory looked up in `from`, above a path
+    let mut looked_up = std::collections::HashSet::new();
+    let mut clear = Vec::new();
+    let mut in_the_way = Vec::new();
+    let mut diff = from.diff_stream(to, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, after } = entry.values.map_err(err)?;
+        // a submodule's directory is the submodule's own, which jj keeps
+        if before.is_present() || after.is_absent() || matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            continue;
+        }
+        let path = entry.path;
+        if let Some((dir, stands)) = first_not_a_dir(root, &path, &mut dirs) {
+            // where nothing stands above the path, or what `from` tracks
+            // and the checkout removes, nothing stands at it
+            if stands.is_some() && looked_up.insert(dir.clone()) {
+                let is_tracked = from.path_value(&dir).await.map_err(err)?.is_present();
+                if !is_tracked {
+                    in_the_way.push(InTheWay { path, holder: dir });
+                }
+            }
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        let holder = if meta.is_dir() {
+            untracked_below(&disk, &path, from)
+        } else if holds_written(to.store(), &path, after, to.labels(), markers, &disk).await? {
+            None
+        } else {
+            Some(path.clone())
+        };
+        match holder {
+            Some(holder) => in_the_way.push(InTheWay { path, holder }),
+            None => clear.push(path),
+        }
+    }
+    if in_the_way.is_empty() {
+        Ok(Ok(clear))
+    } else {
+        Ok(Err(in_the_way))
+    }
+}
+
+/// Something that is no directory in the directory `disk`, standing at
+/// `path`, or in a directory in it, that `from` does not track, or a
+/// directory that cannot be read; none where it holds nothing else. Entries
+/// are told apart without following a symlink, and `from` is read below
+/// `path` only once there is something to look up.
+fn untracked_below(disk: &std::path::Path, path: &RepoPath, from: &MergedTree) -> Option<RepoPathBuf> {
+    let mut tracked: Option<std::collections::HashSet<RepoPathBuf>> = None;
+    let mut dirs = vec![(disk.to_owned(), path.to_owned())];
+    while let Some((dir, at)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Some(at);
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Some(at);
+            };
+            let name = entry.file_name();
+            // a name no path of a tree holds
+            let Some(below) = name.to_str().and_then(|n| RepoPathComponent::new(n).ok()).map(|c| at.join(c)) else {
+                return Some(at);
+            };
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push((entry.path(), below));
+                continue;
+            }
+            let tracked = tracked.get_or_insert_with(|| {
+                let under = jj_lib::matchers::PrefixMatcher::new([path]);
+                from.entries_matching(&under).filter(|(_, value)| value.is_ok()).map(|(p, _)| p).collect()
+            });
+            if !tracked.contains(&below) {
+                return Some(below);
+            }
+        }
+    }
+    None
+}
+
+/// Clear each of `paths`, where a checkout from the tree the working
+/// directory holds to `to` adds a file (`look_where_added`): a file there
+/// is moved aside while it holds what the checkout writes
+/// (`holds_written`), and in a directory there every directory holding no
+/// file is removed, deepest first, and it too once empty. A path below
+/// anything that is no directory on disk, a symlink included, is left
+/// alone, and no symlink in one is followed; a directory is removed only
+/// while empty, so a file put there meanwhile stays, as does one changed
+/// meanwhile, and the checkout skips the path (§7.5 step 7). So does one
+/// that cannot be moved, which the result names.
+async fn clear_the_way(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    to: &MergedTree,
+    paths: &[RepoPathBuf],
+) -> Aside {
+    fn clear(dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    clear(&entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+    let mut aside = Aside { root: root.to_owned(), dir: None, stuck: None, returned: false };
+    let mut dirs = HashMap::new();
+    for path in paths {
+        if first_not_a_dir(root, path, &mut dirs).is_some() {
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            clear(&disk);
+            continue;
+        }
+        let Ok(value) = to.path_value(path).await else {
+            continue;
+        };
+        if holds_written(to.store(), path, value, to.labels(), markers, &disk).await.unwrap_or(false) {
+            if let Err(e) = aside.take(path, &disk) {
+                aside.stuck.get_or_insert((path.clone(), e));
+            }
+        }
+    }
+    aside
+}
+
+/// The start of the name of each directory in `.jj` that `Aside` moves
+/// files into
+const ASIDE: &str = "aside";
+
+/// The files `clear_the_way` moved out of a checkout's way, each holding
+/// what the checkout writes where it stood, in a directory in `.jj` that
+/// holds each at its path in the working directory `root`, which no scan
+/// reads; the first file it could not move, with why; and whether the
+/// checkout returned rather than failing, and so wrote in full each file
+/// it wrote. Dropped, once the checkout has written what it could, it puts
+/// each back (`put_back`) where nothing stands now, as where a checkout
+/// that failed or skipped paths did not get to write, and, unless the
+/// checkout returned, where a start of it does, as where it was cut short
+/// writing it, and removes the directory with the rest: each holds just
+/// what the focus has at its path, which the repository keeps, and what
+/// stands there, what the checkout wrote or something put there since,
+/// stays (§7.5 step 7). One a run killed meanwhile left, the next puts
+/// back (`put_back_left`).
+struct Aside {
+    root: std::path::PathBuf,
+    dir: Option<tempfile::TempDir>,
+    stuck: Option<(RepoPathBuf, std::io::Error)>,
+    returned: bool,
+}
+
+impl Aside {
+    /// Move `disk`, the file at `path`, into the directory, made on first
+    /// use; renamed, it is neither copied nor followed if a symlink
+    fn take(&mut self, path: &RepoPath, disk: &std::path::Path) -> std::io::Result<()> {
+        let dir = match &mut self.dir {
+            Some(dir) => dir,
+            none => none.insert(tempfile::Builder::new().prefix(ASIDE).tempdir_in(self.root.join(".jj"))?),
+        };
+        let to = path.to_fs_path(dir.path()).map_err(std::io::Error::other)?;
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(disk, to)
+    }
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            put_back(&self.root, dir.path(), !self.returned);
+        }
+    }
+}
+
+/// Put each file in `aside`, where `Aside` moved it, back at its path in
+/// the working directory `root` where nothing stands, making the
+/// directories above it that are missing, and, where the checkout may have
+/// been `cut` short, where a start of it stands, less than all of it, as a
+/// checkout cut short while writing it leaves (`cut_short`), which it
+/// replaces; one that cannot be put back, as something else stands there
+/// or in place of a directory above it, stays in `aside`. No symlink is
+/// followed.
+fn put_back(root: &std::path::Path, aside: &std::path::Path, cut: bool) {
+    let missing = |p: &std::path::Path| {
+        matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    };
+    // whether each directory above `path` in `root` is one, or is made
+    let dirs_above = |path: &std::path::Path| {
+        let mut at = root.to_owned();
+        for name in path.parent().into_iter().flat_map(|p| p.components()) {
+            at.push(name);
+            let made = match at.symlink_metadata() {
+                Ok(meta) => meta.is_dir(),
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound && std::fs::create_dir(&at).is_ok(),
+            };
+            if !made {
+                return false;
+            }
+        }
+        true
+    };
+    let mut dirs = vec![std::path::PathBuf::new()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(aside.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = dir.join(entry.file_name());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+                continue;
+            }
+            let disk = root.join(&path);
+            // the directories above are looked at first, so that nothing
+            // is looked at through a symlink
+            if dirs_above(&path) && (missing(&disk) || (cut && cut_short(&disk, &entry.path()))) {
+                let _ = std::fs::rename(entry.path(), disk);
+            }
+        }
+    }
+}
+
+/// Whether `disk` is a file holding a start of `whole`, a file moved
+/// aside, and less than all of it, or, where `whole` is a symlink, an
+/// empty file: what jj's checkout leaves where it was cut short (a full
+/// disk, a run killed) while it wrote `whole` there, as it makes a file
+/// empty before it writes it, and tries a symlink's path with an empty
+/// file first. Reads no more of either than `disk` holds. No symlink is
+/// followed.
+fn cut_short(disk: &std::path::Path, whole: &std::path::Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (Ok(stands), Ok(copy)) = (disk.symlink_metadata(), whole.symlink_metadata()) else {
+        return false;
+    };
+    if !stands.is_file() {
+        return false;
+    }
+    if copy.is_symlink() {
+        return stands.len() == 0;
+    }
+    if !copy.is_file() || stands.len() >= copy.len() {
+        return false;
+    }
+    let stands_file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(disk);
+    let (Ok(mut stands_file), Ok(mut copy_file)) = (stands_file, std::fs::File::open(whole)) else {
+        return false;
+    };
+    let (mut a, mut b) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+    let mut rest = stands.len();
+    while rest > 0 {
+        let n = rest.min(a.len() as u64) as usize;
+        let same = stands_file.read_exact(&mut a[..n]).is_ok()
+            && copy_file.read_exact(&mut b[..n]).is_ok()
+            && a[..n] == b[..n];
+        if !same {
+            return false;
+        }
+        rest -= n as u64;
+    }
+    true
+}
+
+/// Put back what a run killed while its checkout ran left moved aside in
+/// `.jj` (`Aside`), over a write the kill may have cut short too, and
+/// remove the directory it left there. A run does this once it holds the
+/// repository's lock, before it looks at the working directory, so no
+/// other run is using such a directory.
+fn put_back_left(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(".jj")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let named = entry.file_name().to_str().is_some_and(|n| n.starts_with(ASIDE));
+        if named && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            put_back(root, &entry.path(), true);
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The first path a checkout from `from` to `to` that skipped some left
+/// holding something other than what it writes there: with no directory
+/// above it, or a directory at it, or, where it adds the path, anything but
+/// what it writes (`holds_written`); none if no such path is found. Only
+/// once a checkout has skipped a path is the directory looked at again,
+/// reading the files it added until one differs.
+async fn first_skipped(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<Option<RepoPathBuf>, String> {
+    let mut dirs = HashMap::new();
+    let mut diff = from.diff_stream(to, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, after } = entry.values.map_err(|e| e.to_string())?;
+        if after.is_absent() || matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            continue;
+        }
+        let path = entry.path;
+        if let Some((_, stands)) = first_not_a_dir(root, &path, &mut dirs) {
+            if stands.is_some() {
+                return Ok(Some(path));
+            }
+            continue;
+        }
+        let Ok(disk) = path.to_fs_path(root) else {
+            continue;
+        };
+        let Ok(meta) = disk.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir()
+            || (before.is_absent() && !holds_written(to.store(), &path, after, to.labels(), markers, &disk).await?)
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Save the working copy's state as a scan that found `scanned` left it:
+/// at `head`, the operation the repository is at, where that is the
+/// working-copy commit's tree `wc`; otherwise at the operation it was
+/// saved at before, so that it stays stale for jj too, which takes a state
+/// saved at the head for a current one and would record the directory
+/// into the commit whole (§7.4)
+async fn save_scan(
+    mut locked_ws: jj_lib::workspace::LockedWorkspace<'_>,
+    scanned: &MergedTree,
+    wc: &MergedTree,
+    head: &OperationId,
+) -> Result<(), String> {
+    let op_id = if scanned.tree_ids() == wc.tree_ids() {
+        head.clone()
+    } else {
+        locked_ws.locked_wc().old_operation_id().clone()
+    };
+    locked_ws.finish(op_id).await.map_err(|e| e.to_string())
+}
+
+/// The signal that asked the run to stop while its checkout was not to be
+/// cut short (`Deferral`), or 0
+static DEFERRED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn defer(sig: libc::c_int) {
+    DEFERRED.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// While it lives, SIGINT, SIGTERM, SIGHUP and SIGQUIT, whichever thread
+/// gets them, only note that they came: it lives from the operation's
+/// publishing until the working copy's state is saved, so that a checkout
+/// the user interrupts completes, leaving the working copy current, and
+/// through a clone, which one that comes before the working-copy commit is
+/// made fails (`unless_interrupted`), so that it removes what it made
+/// (§1.3). A signal the process ignores stays ignored, as it does for the
+/// git a clone runs (`nohup j clone`, a background job). Dropping it gives
+/// each signal back what it did before, and `raise_deferred` then acts on
+/// one that came.
+struct Deferral {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Deferral {
+    fn start() -> Deferral {
+        let mut previous = Vec::new();
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            // SAFETY: the handler only stores to an atomic, which is
+            // async-signal-safe; both actions are initialised before use
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                    || old.sa_sigaction == libc::SIG_IGN
+                {
+                    continue;
+                }
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = defer as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(sig, &action, std::ptr::null_mut()) == 0 {
+                    previous.push((sig, old));
+                }
+            }
+        }
+        Deferral { previous }
+    }
+}
+
+impl Drop for Deferral {
+    fn drop(&mut self) {
+        for (sig, old) in &self.previous {
+            // SAFETY: `old` is the action `sigaction` gave back for `sig`
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// Act on a signal a checkout or a clone deferred (§1.3) as it would have
+/// acted then: with its default action, stopping the process (`Deferral`
+/// defers no signal the process ignores). Called once the run has reported
+/// what it did.
+pub fn raise_deferred() {
+    let sig = DEFERRED.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if sig != 0 {
+        // a process a signal stops does not flush what it printed
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        // SAFETY: raising a signal whose action `Deferral` gave back
+        unsafe { libc::raise(sig) };
+    }
+}
+
+/// `done`, the outcome of a step of a clone, unless a signal to stop came
+/// while `cmd_clone`'s `Deferral` held it off: the clone then fails, before
+/// it records anything, so that it removes what it made (§1.3, §7.8). A
+/// Ctrl-C at the terminal stops the git the step runs too, which fails the
+/// step itself: `j` may take the signal only after that, and then reports
+/// the step's failure.
+fn unless_interrupted<T>(done: Result<T, OpenError>) -> Result<T, OpenError> {
+    if DEFERRED.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        Err((1, "clone interrupted".to_string()))
+    } else {
+        done
+    }
+}
+
+/// `commit` with `tree` in place of its own, for the working copy to read:
+/// a checkout and a reset read only a commit's tree. It is never written.
+fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
+    let (tree_ids, labels) = tree.into_tree_ids_and_labels();
+    Commit::new(
+        commit.store().clone(),
+        commit.id().clone(),
+        Arc::new(jj_lib::backend::Commit {
+            root_tree: tree_ids,
+            conflict_labels: labels.into_merge(),
+            ..commit.store_commit().as_ref().clone()
+        }),
+    )
 }
 
 #[derive(Clone)]
@@ -317,6 +1456,8 @@ impl JjBackend {
                 visible: Mutex::new(None),
                 lock_guard: Mutex::new(None),
                 pending: Mutex::new(None),
+                folds_case: OnceLock::new(),
+                long_names: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -336,16 +1477,17 @@ impl JjBackend {
         {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("j: cannot create {}: {}", lock_path.display(), e);
+                crate::report!("j: cannot create {}: {}", lock_path.display(), e);
                 std::process::exit(2);
             }
         };
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            eprintln!("j: another j is running in this repository");
+            crate::report!("j: another j is running in this repository");
             std::process::exit(2);
         }
         *self.inner.lock_guard.lock().unwrap() = Some(FileLock(file));
+        put_back_left(&self.inner.workspace_root);
     }
 
     pub fn build_interp(
@@ -359,7 +1501,7 @@ impl JjBackend {
         let head_repo = block_on(self.inner.workspace.lock().unwrap().repo_loader().load_at_head())
             .map_err(|e| (2, format!("cannot reload the repository at head: {}", e)))?;
         *self.inner.repo.lock().unwrap() = head_repo;
-        let loaded_visible = block_on(read_visible(&self.current_repo()))?;
+        let loaded_visible = Arc::new(block_on(read_visible(&self.current_repo()))?);
         let loaded = build_repo_value(&loaded_visible, &loaded_visible.wc_change_id)?;
 
         let current = if snapshot {
@@ -371,7 +1513,7 @@ impl JjBackend {
                 // no working-copy change: the repo is the one already loaded,
                 // so reuse its value instead of rebuilding it
                 None => {
-                    *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+                    *self.inner.visible.lock().unwrap() = Some(loaded_visible.clone());
                     loaded.clone()
                 }
                 Some(pending) => {
@@ -383,7 +1525,7 @@ impl JjBackend {
                 }
             }
         } else {
-            *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+            *self.inner.visible.lock().unwrap() = Some(loaded_visible.clone());
             loaded.clone()
         };
 
@@ -408,24 +1550,36 @@ impl JjBackend {
         // §7.2: if the focused commit is in the immutable set, the snapshot
         // cannot go into it; the focus is a new empty child of it holding the
         // snapshot, and persisting records that child
-        match self.focus_if_immutable(&mut interp, cfg, &current)? {
-            Some(adjusted) => {
-                // the persisted child is part of the loaded value too, so a
-                // run that changes nothing is a no-op
-                Ok((interp, adjusted.clone(), adjusted))
+        match self.focus_if_immutable(&mut interp, cfg, &loaded, &current)? {
+            Some((loaded, current)) => {
+                // the snapshot's rewrite of the wc commit (and its rebase of
+                // the descendants) is not the repository's: lookups answer
+                // from the stored commits, and persisting leaves the wc
+                // commit as stored rather than folding the snapshot into it
+                *self.inner.visible.lock().unwrap() = Some(loaded_visible);
+                if let Some(p) = self.inner.pending.lock().unwrap().as_mut() {
+                    p.fold_into_wc = false;
+                }
+                Ok((interp, loaded, current))
             }
             None => Ok((interp, loaded, current)),
         }
     }
 
-    /// If the focus of `current` is immutable, return a repo refocused on a
-    /// new empty child holding the focus's files (§7.2).
+    /// If the focus of `current` is immutable, return the loaded and current
+    /// repos refocused on a new empty child of it (§7.2). Both are `loaded`
+    /// with that one child added: the snapshot goes into neither the focus
+    /// nor, through a rebase, its descendants. The child holds the focus's
+    /// stored files in the loaded repo and the snapshot in the current one,
+    /// so a dirty `j id` differs from the loaded value and records the child
+    /// (§1.2 step 8).
     fn focus_if_immutable(
         &self,
         interp: &mut Interp,
         cfg: &Config,
+        loaded: &Value,
         current: &Value,
-    ) -> Result<Option<Value>, OpenError> {
+    ) -> Result<Option<(Value, Value)>, OpenError> {
         // Evaluate the config to compute the immutable set. This uses the
         // interpreter the run will go on to use, rather than a throwaway one,
         // so that the `immutable` (and the `trunk` inside it) computed here is
@@ -441,89 +1595,101 @@ impl JjBackend {
         if !immutable.contains(&focus_id) {
             return Ok(None);
         }
-        // build: new empty child of the focus with the focus's files, minted id
-        let root = current.field("root").map_err(|c| (1, c.msg))?;
-        let files = root.field("files").map_err(|c| (1, c.msg))?;
-        let child = crate::value::Value::record(&[
-            ("files", files),
-            ("message", crate::value::Value::text("")),
-            ("labels", crate::value::Value::list(vec![])),
-            (
-                "id",
-                crate::value::Value::Id(Rc::new(interp.mint_id())),
-            ),
+        // the focus's location in `loaded`, pre-snapshot; the child is its
+        // last child, so every existing child sits to the left of it
+        let field = |v: &Value, name: &str| v.field(name).map_err(|c| (1, c.msg));
+        let root = field(loaded, "root")?;
+        let frame = Value::record(&[
+            ("left", field(loaded, "children")?),
+            ("parent", root.clone()),
+            ("right", Value::list(vec![])),
         ]);
-        let child_subtree = crate::value::Value::record(&[
-            ("root", child.clone()),
-            ("children", crate::value::Value::list(vec![])),
-        ]);
-        let mut new_children: Vec<Value> = current
-            .field("children")
-            .map_err(|c| (1, c.msg))?
-            .as_list()
-            .map_err(|c| (1, c.msg))?
-            .to_vec();
-        new_children.push(child_subtree);
-        let parent = crate::value::Value::record(&[
-            ("children", crate::value::Value::list(new_children)),
-            ("context", current.field("context").map_err(|c| (1, c.msg))?),
-            ("root", root),
-        ]);
-        // refocus onto the child (it is the last child)
-        let child_id = match child.field("id").map_err(|c| (1, c.msg))? {
-            Value::Id(i) => i.to_string(),
-            _ => unreachable!(),
+        let mut frames = vec![frame];
+        frames.extend_from_slice(field(loaded, "context")?.as_list().map_err(|c| (1, c.msg))?);
+        let context = Value::list(frames);
+        let id = Value::Id(Rc::new(interp.mint_id()));
+        let at_child = |files: Value| {
+            Value::record(&[
+                ("children", Value::list(vec![])),
+                ("context", context.clone()),
+                (
+                    "root",
+                    Value::record(&[
+                        ("files", files),
+                        ("id", id.clone()),
+                        ("labels", Value::list(vec![])),
+                        ("message", Value::text("")),
+                    ]),
+                ),
+            ])
         };
-        crate::repo::by_id(&parent, &child_id)
-            .map_err(|c| (1, c.msg))?
-            .ok_or_else(|| (1, "internal: cannot refocus".to_string()))
-            .map(Some)
+        let current_at_child = at_child(field(&field(current, "root")?, "files")?);
+        // with nothing snapshotted `current` is `loaded` itself: share one
+        // value, so a run that changes nothing is a no-op without comparing
+        // the whole repository
+        let loaded_at_child = match (loaded, current) {
+            (Value::Record(a), Value::Record(b)) if Rc::ptr_eq(a, b) => current_at_child.clone(),
+            _ => at_child(field(&root, "files")?),
+        };
+        Ok(Some((loaded_at_child, current_at_child)))
     }
 
-    /// Snapshot the working copy into the wc commit; returns the repo at the
-    /// snapshot operation (unpublished but written), or the pre-snapshot repo
-    /// if nothing changed.
+    /// Snapshot the working directory into the working-copy commit (§7.4);
+    /// return the repo at the snapshot's operation, written but not
+    /// published, or the repo as loaded when there is nothing to record.
     async fn snapshot_repo(
         &self,
     ) -> Result<(Arc<ReadonlyRepo>, Option<PendingSnapshot>), OpenError> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
-        let loader = ws_guard.repo_loader().clone();
+        let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
-            progress: None,
-            start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &NothingMatcher,
-            max_new_file_size: u64::MAX,
-        };
-        let (new_tree, _stats) = locked_ws
-            .locked_wc()
-            .snapshot(&options)
+        let old_tree = locked_ws.locked_wc().old_tree().clone();
+        let scanned = scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options())
             .await
             .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
-        let changed = new_tree.tree_ids() != locked_ws.locked_wc().old_tree().tree_ids();
-        if !changed {
-            locked_ws
-                .finish(self.current_repo().operation().id().clone())
+        // the repo build_interp loaded at head from the workspace's own
+        // loader, whose store the scanned tree lives in
+        let head = self.current_repo();
+        let wc_commit = self.wc_commit(&head).await?;
+        let current = locked_ws.locked_wc().old_operation_id() == head.operation().id();
+        let tree = match marker_style(head.settings()) {
+            Ok(markers) => snapshot_tree(&root, markers, &wc_commit.tree(), &old_tree, current, &scanned).await,
+            Err(e) => Err(e),
+        }
+        .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
+        if tree.tree_ids() == wc_commit.tree().tree_ids() {
+            // nothing to record: the directory holds the commit's files, or,
+            // where the state is stale, the state's, or changes to them the
+            // commit already has, such as what a checkout cut short wrote.
+            // What was scanned is saved, at the operation the state is
+            // stale since where it still is.
+            save_scan(locked_ws, &scanned, &wc_commit.tree(), head.operation().id())
                 .await
                 .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
-            return Ok((self.current_repo(), None));
+            return Ok((head, None));
         }
-        // the snapshotted tree lives in the workspace's store; drive the
-        // transaction from the workspace's repo loader so stores match
-        let ws_repo = loader
-            .load_at_head()
-            .await
-            .map_err(|e| (2, format!("cannot reload the repository: {}", e)))?;
-        let mut tx = ws_repo.start_transaction();
+        // a directory come to hold the parent's files, as where it reverts
+        // the commit's change, is recorded with the parent's tree (§7.4), as
+        // persistence writes a commit with its parent's files (§7.5 step 4):
+        // the snapshot builds on the commit's tree, and so could make
+        // another tree for the parent's files, one jj takes for a change.
+        // Not before the check above, or a commit already holding such a
+        // tree would be rewritten by a directory that has not changed. A
+        // merge is immutable, so never folded into (§7.2), and its parents'
+        // trees are not merged for it
+        let tree = match wc_commit.parent_ids() {
+            [_] => parents_tree_if_same(head.as_ref(), wc_commit.parent_ids(), tree).await,
+            _ => tree,
+        };
+        let mut tx = head.start_transaction();
         tx.set_is_snapshot(true);
-        let wc_commit = self.wc_commit(&ws_repo).await?;
         let new_wc = tx
             .repo_mut()
             .rewrite_commit(&wc_commit)
-            .set_tree(new_tree)
+            .set_tree(tree)
             .write()
             .await
             .map_err(|e| (2, format!("cannot write the snapshot commit: {}", e)))?;
@@ -540,7 +1706,6 @@ impl JjBackend {
             .write("snapshot working copy")
             .await
             .map_err(|e| (2, format!("cannot write the snapshot operation: {}", e)))?;
-        let op_id = unpublished.operation().id().clone();
         let new_repo = unpublished.leave_unpublished();
         // Release the lock *without* finishing: `finish` saves the scanned
         // tree state to disk, which would record the working directory as
@@ -548,19 +1713,18 @@ impl JjBackend {
         // tree. The next run's incremental snapshot would then find nothing
         // to do and build the Repo from the stale tree — and a persisting run
         // would check that stale tree back out, destroying the edits. The
-        // state is advanced only by `persist`'s checkout, which finishes
-        // against the operation that actually recorded the tree (§7.4/§7.7).
+        // state is advanced only by `persist`'s checkout, which first scans
+        // the directory again and finishes against the operation that
+        // actually recorded the tree (§7.4/§7.7).
         drop(locked_ws);
-        let _ = op_id;
         let pending = PendingSnapshot {
-            pre_repo: self.current_repo(),
-            new_wc_id: new_wc.id().clone(),
+            pre_repo: head,
             tree: new_wc.tree().clone(),
+            fold_into_wc: true,
+            scanned,
         };
         Ok((new_repo, Some(pending)))
     }
-
-
 
     async fn wc_commit(&self, repo: &Arc<ReadonlyRepo>) -> Result<Commit, OpenError> {
         let id = repo
@@ -579,11 +1743,12 @@ impl JjBackend {
         interp: &mut Interp,
         cfg: &Config,
         loaded: &Value,
-        _current: &Value,
+        current: &Value,
         new: &Value,
         text: &str,
     ) -> Result<(), Crash> {
-        if crate::value::value_eq(loaded, new)? {
+        // §1.2 step 8: unchanged, up to the order of snapshot entries (§7.3)
+        if crate::repo::same_repo(loaded, new)? {
             return Ok(());
         }
         *interp.old_repo.borrow_mut() = Some(loaded.clone());
@@ -604,7 +1769,7 @@ impl JjBackend {
         // walk below compares against its output, so the snapshot change and
         // the expression's edits become one rewrite
         let mut snapshot_wc: Option<Commit> = None;
-        if let Some(p) = &pending {
+        if let Some(p) = pending.as_ref().filter(|p| p.fold_into_wc) {
             let wc_commit = block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?;
             let c = block_on(
                 tx.repo_mut()
@@ -628,6 +1793,9 @@ impl JjBackend {
             old_stored = Arc::new(vis);
         }
         let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
+        // the stored trees the program's commits were loaded with
+        let visible = self.inner.visible.lock().unwrap().clone();
+        let loaded_trees = LoadedTrees::new(visible.as_deref(), &[current, new])?;
         // shared across the whole persist walk so unchanged blobs are inflated once
         let cache = BlobCache::default();
         let entries = EntryCache::default();
@@ -651,10 +1819,7 @@ impl JjBackend {
             }
             let stored_files = block_on(tree_to_files(&store, &root_jj.tree(), &cache, &entries))
                 .map_err(|e| Crash::new(e.msg))?;
-            if !crate::value::value_eq(
-                &Value::list(stored_files),
-                &Value::list(root_v.field("files")?.as_list()?.to_vec()),
-            )? {
+            if !crate::repo::snapshot_eq(&Value::list(stored_files), &root_v.field("files")?)? {
                 return Err(Crash::new("persistence: the root commit cannot be changed"));
             }
         }
@@ -675,11 +1840,14 @@ impl JjBackend {
                 .get(&parent_change)
                 .cloned()
                 .ok_or_else(|| Crash::new("persistence: internal: parent not yet written"))?;
-            let files_v = commit_v.field("files")?;
+            // not read unless compared or written: most commits keep the
+            // stored tree they were loaded with
+            let files_v = crate::repo::files_of(&commit_v)?;
             let message = commit_v.field("message")?.as_text()?.to_string();
             let new_id = match old_stored.commits.get(&id) {
                 None => {
-                    let tree = block_on(build_tree(&store, &files_v))?;
+                    let tree =
+                        loaded_trees.tree_to_write(tx.repo(), &files_v, std::slice::from_ref(&parent_jj))?;
                     let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
                         Crash::new(format!("persistence: `{}` is not a valid change id", id))
                     })?;
@@ -698,17 +1866,31 @@ impl JjBackend {
                 Some(stored) => {
                     let stored_commit = &stored.commit;
                     let parent_changed = hex_of(stored_commit.parent_ids().first()) != parent_jj.hex();
-                    let files_changed = {
-                        let stored_files =
-                            block_on(tree_to_files(&store, &stored_commit.tree(), &cache, &entries))?;
-                        !crate::value::value_eq(
-                            &Value::list(stored_files),
-                            &Value::list(files_v.as_list()?.to_vec()),
-                        )?
-                    };
+                    let stored_tree = stored_commit.tree();
+                    // loaded from the stored tree, the files are unchanged:
+                    // reading every commit's to compare them made each
+                    // persist read the files of the whole history
+                    let files_changed = crate::repo::stored_tree(&files_v)
+                        != Some(tree_name(&stored_tree).as_str())
+                        && {
+                            let stored_files =
+                                block_on(tree_to_files(&store, &stored_tree, &cache, &entries))?;
+                            // a tree has no order: entries listed differently
+                            // are not a change to rewrite (§7.3)
+                            !crate::repo::snapshot_eq(&Value::list(stored_files), &files_v)?
+                        };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {
-                        let tree = block_on(build_tree(&store, &files_v))?;
+                        // files the stored tree lists are written as it is,
+                        // but where they are the parent's, as the files of a
+                        // commit moved onto another tree for them come to be,
+                        // with the parent's tree (§7.5 step 4)
+                        let parents = std::slice::from_ref(&parent_jj);
+                        let tree = if files_changed {
+                            loaded_trees.tree_to_write(tx.repo(), &files_v, parents)?
+                        } else {
+                            block_on(parents_tree_if_same(tx.repo(), parents, stored_tree))
+                        };
                         let c = block_on(
                             tx.repo_mut()
                                 .rewrite_commit(stored_commit)
@@ -771,32 +1953,223 @@ impl JjBackend {
         let desc = truncate_chars(text, 200);
         let unpublished = block_on(tx.write(desc))
             .map_err(|e| Crash::new(format!("cannot write the operation: {}", e)))?;
-        let op_id = unpublished.operation().id().clone();
-        let _new_repo = block_on(unpublished.publish())
-            .map_err(|e| Crash::new(format!("cannot publish the operation: {}", e)))?;
 
-        // §7.4/§7.5 step 7: check out the focus to the working directory
+        // §7.4/§7.5 step 7: publish the operation, then check the focus out
         let focus_commit = block_on(store.get_commit_async(&focus_jj))
             .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
-        block_on(self.checkout(&focus_commit, op_id))?;
-
-        Ok(())
+        // the checkout starts from what the working directory holds: the
+        // tree the run's snapshot scanned, or, where it had nothing to
+        // record, the tree the working-copy state records, as
+        // `snapshot_repo` left it. That is the focus as loaded unless the
+        // state is stale (§7.4), when the checkout writes the focus over it;
+        // taking the directory to hold the focus instead, it would find it
+        // did not, describe the focus without writing it (a reset), and the
+        // next run would record the stale files into the focus.
+        let on_disk = match pending {
+            Some(p) => p.scanned,
+            None => {
+                let state = self.inner.workspace.lock().unwrap().working_copy().tree().cloned();
+                // a state that cannot be read fails the checkout, which
+                // reads it again when it locks
+                state.or_else(|_| block_on(self.wc_commit(&base)).map(|c| c.tree()).map_err(|e| Crash::new(e.1)))?
+            }
+        };
+        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), Some(", and `j undo` goes back")))
     }
 
-    async fn checkout(&self, commit: &Commit, op_id: OperationId) -> Result<(), Crash> {
+    /// Check `commit` out: write its files to the working directory and
+    /// save the working copy's state as holding them (§7.4). `op`, the
+    /// operation that makes it the working-copy commit, is published first,
+    /// as jj does (§7.5 step 7); with none, `commit` is the head's own.
+    /// `on_disk` is the tree the directory holds, which the checkout starts
+    /// from: what a persisting run's snapshot scanned, or the tree the
+    /// working-copy state records where it scanned nothing to record, or
+    /// what `undo`'s look found; with none, the state as it is. A change
+    /// made to the directory since `on_disk` was scanned, where the
+    /// checkout writes, refuses the checkout before `op` is published
+    /// (`written_over`); one made once it has begun is written over, as by
+    /// jj. Where the commit adds a file, something `on_disk` does not track
+    /// standing there, but for empty directories and what the checkout
+    /// writes, refuses the checkout before `op` is published
+    /// (`look_where_added`), and one put there since fails it after, as it
+    /// makes jj skip the path. A checkout that fails, or is cut short, after
+    /// `op` is published leaves `op` recorded and the state stale, recording
+    /// `on_disk`: the next run takes what the checkout wrote for the
+    /// commit's own and carries on (`snapshot_tree`), as the crash says,
+    /// with `back` naming the way back; with no `back` it says nothing of
+    /// the operation (a clone that fails removes it).
+    async fn checkout(
+        &self,
+        commit: &Commit,
+        on_disk: Option<&MergedTree>,
+        op: Option<UnpublishedOperation>,
+        back: Option<&str>,
+    ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
-        locked_ws
-            .locked_wc()
-            .check_out(commit)
-            .await
+        // A persisting run's snapshot released its lock without saving what
+        // it scanned, so the state just loaded may still describe the tree
+        // recorded before the edits, and jj checks out by diffing that tree
+        // against the new one: a path whose recorded content equals the
+        // focus's would keep the user's edit, a file created since would
+        // stay, and a file replaced by a directory (or back) would leave
+        // state contradicting the tree. Scan the directory again first, as
+        // the snapshot did, so the checkout diffs from what is actually on
+        // disk (§7.4). A scan keeps what the state knows of each file where
+        // a reset to the snapshot's tree would forget it: a conflict whose
+        // sides hold marker-like lines is materialized with longer markers,
+        // and a forgotten length makes the next snapshot read those markers
+        // back at 7 characters, fail to parse them and record the edited
+        // conflict as resolved text, markers and all (§7.4).
+        if let Some(on_disk) = on_disk {
+            let old_tree = locked_ws.locked_wc().old_tree().clone();
+            let reset = match scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()).await {
+                Ok(scanned) if scanned.tree_ids() == on_disk.tree_ids() => false,
+                // the directory changed while the program ran: where the
+                // checkout would write the focus over such a change, which
+                // no snapshot holds and jj's checkout does not look for,
+                // the run crashes before anything is recorded or written
+                // (§7.5 step 7)
+                Ok(scanned) => match written_over(on_disk, &scanned, &commit.tree()).await {
+                    Ok(None) => true,
+                    Ok(Some(path)) => {
+                        return Err(Crash::new(format!(
+                            "cannot check out the focus: `{}` changed in the working directory while the program ran, and the checkout would write over it; nothing was recorded, so run the command again",
+                            path.as_internal_file_string()
+                        )));
+                    }
+                    Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}", e))),
+                },
+                // or it can no longer be scanned (an entry appeared,
+                // vanished or cannot be read; a failed scan leaves the state
+                // as it was)
+                Err(_) => true,
+            };
+            // Otherwise the state describes `on_disk` instead. A reset
+            // writes no file; the paths it changes are re-read by the next
+            // run.
+            if reset {
+                locked_ws
+                    .locked_wc()
+                    .reset(&with_tree(commit, on_disk.clone()))
+                    .await
+                    .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?;
+            }
+        }
+        // Where the focus adds a file and something the directory does not
+        // track stands (an ignored file, a symlink, a directory holding
+        // one), jj's checkout would skip the path, and the next run read
+        // what stands there into the focus: refuse before anything is
+        // recorded or written, as git does (§7.5 step 7). The trees of
+        // empty directories found there, and the files holding what the
+        // checkout writes, are cleared once `op` is published.
+        let markers = marker_style(self.current_repo().settings())
             .map_err(|e| Crash::new(format!("cannot check out the focus: {}", e)))?;
-        locked_ws
-            .finish(op_id)
-            .await
-            .map_err(|e| Crash::new(format!("cannot finish the checkout: {}", e)))?;
+        let clear = match on_disk {
+            None => Vec::new(),
+            Some(on_disk) => match look_where_added(&root, markers, on_disk, &commit.tree()).await {
+                Ok(Ok(clear)) => clear,
+                Ok(Err(in_the_way)) => {
+                    return Err(Crash::new(format!("cannot check out the focus: {}", in_the_way_of(&in_the_way))));
+                }
+                Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}", e))),
+            },
+        };
+        // from here until the state is saved, a signal to stop waits
+        let _deferral = Deferral::start();
+        let published = op.is_some();
+        let op_id = match op {
+            None => self.current_repo().operation().id().clone(),
+            Some(op) => {
+                let repo = op
+                    .publish()
+                    .await
+                    .map_err(|e| Crash::new(format!("cannot publish the operation: {}", e)))?;
+                let op_id = repo.operation().id().clone();
+                *self.inner.repo.lock().unwrap() = repo;
+                op_id
+            }
+        };
+        // what a crash from here on says: the state is left stale, which the
+        // next run carries on from (§7.5 step 7)
+        let carry_on = |what: &str| match back {
+            None => String::new(),
+            Some(back) if published => {
+                format!("; the operation is recorded, but {}: the next command carries on from there{}", what, back)
+            }
+            Some(_) => format!("; {}: the next command carries on from there", what),
+        };
+        // A checkout cut short leaves the directory holding `on_disk` but
+        // where it wrote, and the next run takes what it holds for changes
+        // to the state (`snapshot_tree`). So the state records `on_disk`
+        // first, at the operation it was saved at, which leaves it stale
+        // until the checkout completes: were it left recording the tree
+        // before the run's snapshot, the snapshot's changes, now in the
+        // operation, would be taken for new ones and replayed onto the
+        // focus too. It is saved only once `op` is published: a state
+        // recording the snapshot, beside a head that does not, would lose
+        // it (§7.4).
+        if on_disk.is_some_and(|t| t.tree_ids() != locked_ws.locked_wc().old_tree().tree_ids()) {
+            let old_op = locked_ws.locked_wc().old_operation_id().clone();
+            let saved = match locked_ws.finish(old_op).await {
+                Ok(()) => ws_guard.start_working_copy_mutation().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            locked_ws = match saved {
+                Ok(locked) => locked,
+                Err(e) => {
+                    let what = "the working directory was not updated";
+                    return Err(Crash::new(format!("cannot save the working copy's state: {}{}", e, carry_on(what))));
+                }
+            };
+        }
+        // what is moved aside is put back where the checkout does not write,
+        // or cuts the write short, once it returns, however it returns
+        let mut aside = clear_the_way(&root, markers, &commit.tree(), &clear).await;
+        let from = locked_ws.locked_wc().old_tree().clone();
+        let what = "the working directory was only partly updated";
+        let stats = match locked_ws.locked_wc().check_out(commit).await {
+            Ok(stats) => stats,
+            Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what)))),
+        };
+        // it cut no write short, so a start of a file moved aside, standing
+        // at its path, was put there meanwhile
+        aside.returned = true;
+        // Something the directory does not track, put where the focus adds a
+        // file since it was looked at, or a file holding what the checkout
+        // writes there that could not be moved aside, made jj skip the
+        // path, which it records as written. The state is left stale, as by
+        // a checkout that fails, so that no run reads what stands there
+        // (§7.5 step 7).
+        if stats.skipped_files > 0 {
+            let skipped = first_skipped(&root, markers, &from, &commit.tree()).await.ok().flatten();
+            let why = match (skipped, &aside.stuck) {
+                (Some(path), _) => format!(
+                    "`{}` was not written, as something untracked in the working directory was in its way (move it aside)",
+                    path.as_internal_file_string()
+                ),
+                (None, Some((path, e))) => format!(
+                    "`{}` was not written, as the untracked file there, holding what it writes, could not be moved out of its way: {}",
+                    path.as_internal_file_string(),
+                    e
+                ),
+                (None, None) => format!(
+                    "{} of its files were not written, as something untracked in the working directory was in their way",
+                    stats.skipped_files
+                ),
+            };
+            return Err(Crash::new(format!("cannot check out the focus: {}{}", why, carry_on(what))));
+        }
+        // the state names the operation it was checked out at, so it is
+        // saved only once that operation is published
+        if let Err(e) = locked_ws.finish(op_id).await {
+            let what = "the working copy's record of what the directory holds was not updated";
+            return Err(Crash::new(format!("cannot save the working copy's state: {}{}", e, carry_on(what))));
+        }
         Ok(())
     }
 
@@ -894,6 +2267,7 @@ impl JjBackend {
     }
 
     pub fn cmd_remote(&self, url: &str) -> Result<(), OpenError> {
+        let url = &origin_url(url)?;
         self.take_lock();
         let base = self.current_repo();
         let origin = RemoteName::new("origin");
@@ -911,7 +2285,17 @@ impl JjBackend {
         .map_err(|e| (1, format!("cannot set the remote: {}", e)))
     }
 
+    /// Run from the top of the workspace, as git runs from the top of its
+    /// working tree: git resolves a relative local URL (one stored by git,
+    /// or by `j` before §7.8 resolved them) against the directory it runs
+    /// in, and jj-lib's git and ours inherit this process's
+    fn enter_workspace_root(&self) -> Result<(), OpenError> {
+        std::env::set_current_dir(&self.inner.workspace_root)
+            .map_err(|e| (1, format!("cannot enter {}: {}", self.inner.workspace_root.display(), e)))
+    }
+
     pub fn cmd_fetch(&self) -> Result<(), OpenError> {
+        self.enter_workspace_root()?;
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
         let mut tx = base.start_transaction();
@@ -925,23 +2309,25 @@ impl JjBackend {
         Ok(())
     }
     pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<(), OpenError> {
+        self.enter_workspace_root()?;
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
-        let (value, vis) = self.eval_push_expr(cfg, expr_text, &base)?;
+        let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
-        check_push_records(&records, &vis, &base)?;
-        let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
+        let deletes_wait = check_push_records(&records, &base, &vis, &immutable)?;
+        let _ = self.push_to_origin(&base, origin, &records, deletes_wait, expr_text)?;
         Ok(())
     }
 
     /// evaluate `EXPR` against the recorded repository, without snapshotting
-    /// (§1.1), apply a function result to the repo value once (§7.6)
+    /// (§1.1), apply a function result to the repo value once (§7.6); also
+    /// return the immutable set of that repository (§7.5 step 3)
     fn eval_push_expr(
         &self,
         cfg: &mut Config,
         expr_text: &str,
         base: &Arc<ReadonlyRepo>,
-    ) -> Result<(Value, Arc<VisibleRepo>), OpenError> {
+    ) -> Result<(Value, Arc<VisibleRepo>, BTreeSet<String>), OpenError> {
         let outer = Rc::new(cfg.global_names.clone());
         let expr = crate::parse::parse_expr(expr_text, outer)
             .map_err(|p| (3, format!("line {}: {}", p.line, p.msg)))?;
@@ -955,6 +2341,10 @@ impl JjBackend {
             }
         })?;
         crate::config::eval_config(&mut interp, cfg).map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+        // the set a push may not move a bookmark out of (§7.6); build_interp
+        // evaluated it for this value to place the focus, so it is cached
+        let immutable = crate::repo::compute_immutable(&mut interp, &current)
+            .map_err(|c| (1, format!("crash: {}", c.msg)))?;
         let env = interp.global_env();
         let expr_rc = Rc::new(expr);
         let mut v = interp
@@ -973,19 +2363,23 @@ impl JjBackend {
             .unwrap()
             .clone()
             .ok_or_else(|| (2, "internal: repository value not loaded".to_string()))?;
-        Ok((v, vis))
+        Ok((v, vis, immutable))
     }
 
     /// push the updates to `origin` and record the new remote-bookmark
-    /// positions as one operation (§7.6)
+    /// positions as one operation (§7.6); when `deletes_wait`, the deletes
+    /// go in a second git push, sent only once the remote has accepted every
+    /// other update
     fn push_to_origin(
         &self,
         base: &Arc<ReadonlyRepo>,
         origin: &RemoteName,
         records: &[(String, Option<CommitId>)],
+        deletes_wait: bool,
         description: &str,
     ) -> Result<Arc<ReadonlyRepo>, OpenError> {
         let mut targets = jj_lib::git::GitPushRefTargets::default();
+        let mut deletes = jj_lib::git::GitPushRefTargets::default();
         for (name, after) in records {
             let before = base
                 .view()
@@ -994,43 +2388,104 @@ impl JjBackend {
                 .as_resolved()
                 .cloned()
                 .unwrap_or(None);
-            targets
+            // check_push_records sets `deletes_wait` only when some record
+            // sets a bookmark, so the first push is never empty
+            let batch = if deletes_wait && after.is_none() { &mut deletes } else { &mut targets };
+            batch
                 .bookmarks
                 .push((jj_lib::ref_name::RefNameBuf::from(name.clone()), Diff::new(before, after.clone())));
         }
         let mut tx = base.start_transaction();
+        if records.is_empty() {
+            // nothing to set or delete; push_refs would still run `git push
+            // origin` without refspecs, which pushes whatever git's
+            // push.default picks
+            if !remote_has_url(git_backend(base.store())?, origin) {
+                return Err((1, "no remote origin".to_string()));
+            }
+            let (_, repo) = block_on(self.publish_tx(tx, &truncate_chars(description, 200)))?;
+            return Ok(repo);
+        }
         let subprocess_options = self.git_subprocess_options()?;
         let mut callback = QuietGitCallback;
-        let stats = jj_lib::git::push_refs(
-            tx.repo_mut(),
-            subprocess_options,
-            origin,
-            &targets,
-            &mut callback,
-            &jj_lib::git::GitPushOptions::default(),
-        )
-        .map_err(|e| match e {
-            jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
-            other => (1, format!("push failed: {}", other)),
-        })?;
+        let mut push = |tx: &mut jj_lib::transaction::Transaction, targets| {
+            jj_lib::git::push_refs(
+                tx.repo_mut(),
+                subprocess_options.clone(),
+                origin,
+                targets,
+                &mut callback,
+                &jj_lib::git::GitPushOptions::default(),
+            )
+            .map_err(|e| match e {
+                jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
+                other => (1, format!("push failed: {}", other)),
+            })
+        };
+        let mut stats = push(&mut tx, &targets)?;
+        // git push is not atomic: the remote may accept some updates and
+        // reject others. When only a bookmark this push sets keeps a deleted
+        // bookmark's immutable commit reachable, the deletes go in a second
+        // push once the remote has accepted every update, and are not sent
+        // otherwise (§7.6)
+        let mut not_sent: Vec<String> = Vec::new();
+        let mut failed = None;
+        if !deletes.bookmarks.is_empty() {
+            if stats.all_ok() {
+                match push(&mut tx, &deletes) {
+                    Ok(more) => {
+                        stats.pushed.extend(more.pushed);
+                        stats.rejected.extend(more.rejected);
+                        stats.remote_rejected.extend(more.remote_rejected);
+                        stats.unexported_bookmarks.extend(more.unexported_bookmarks);
+                    }
+                    Err(e) => failed = Some(e),
+                }
+            } else {
+                for (name, _) in &deletes.bookmarks {
+                    not_sent.push(format!("refs/heads/{}", name.as_str()));
+                }
+            }
+        }
+        // push_refs has set the accepted updates in `tx`, and they are on the
+        // remote, so they are recorded before the rest is reported; a push
+        // the remote refused entirely records nothing
+        let mut repo = base.clone();
+        if stats.all_ok() || stats.some_exported() {
+            let unpublished = block_on(tx.write(truncate_chars(description, 200)))
+                .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+            repo = block_on(unpublished.publish())
+                .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+            *self.inner.repo.lock().unwrap() = repo.clone();
+        }
+        if let Some((code, msg)) = failed {
+            return Err((code, format!("{}; the other bookmarks were pushed and recorded", msg)));
+        }
         if !stats.all_ok() {
             let mut names: Vec<String> = Vec::new();
             for (name, _) in stats.rejected.iter().chain(stats.remote_rejected.iter()) {
                 names.push(name.as_str().to_string());
             }
-            return Err((1, format!("push rejected: {}", names.join(", "))));
+            // pushed, but not exported to the colocated git repo, so jj-lib
+            // left them out of `tx`
+            for (symbol, _) in &stats.unexported_bookmarks {
+                names.push(format!("{} (pushed but not recorded)", symbol.name.as_str()));
+            }
+            let mut msg = format!("push rejected: {}", names.join(", "));
+            if !not_sent.is_empty() {
+                msg.push_str(&format!("; deletes not sent: {}", not_sent.join(", ")));
+            }
+            if stats.some_exported() {
+                msg.push_str("; the other bookmarks were pushed and recorded");
+            }
+            return Err((1, msg));
         }
-        let unpublished = block_on(tx.write(truncate_chars(description, 200)))
-            .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
-        let repo = block_on(unpublished.publish())
-            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
-        *self.inner.repo.lock().unwrap() = repo.clone();
         Ok(repo)
     }
 
     pub fn cmd_undo(&self, redo: bool) -> Result<(), OpenError> {
         let base = self.head_repo()?;
-        self.check_wc_clean(&base)?;
+        let on_disk = self.check_wc_clean(&base)?;
         let loader = self.repo_loader();
         let mut cur = base.operation().clone();
         let target_op_id: OperationId;
@@ -1106,6 +2561,13 @@ impl JjBackend {
                 }
             }
         }
+        // before the operation init or clone recorded there was no
+        // repository (§7.7); the view jj recorded then has an empty child of
+        // the root as the working-copy commit, and checking it out would
+        // delete every file of the head
+        if !redo && op_created_repo(cur.metadata()) {
+            return Err((1, "nothing to undo".to_string()));
+        }
         let target_op = block_on(loader.load_operation(&target_op_id))
             .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
         let target_view = block_on(
@@ -1140,56 +2602,60 @@ impl JjBackend {
         tx.repo_mut().set_view(target_view.clone());
         let unpublished = block_on(tx.write(&marker))
             .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
-        let op_id = unpublished.operation().id().clone();
-        let repo = block_on(unpublished.publish())
-            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
-        *self.inner.repo.lock().unwrap() = repo.clone();
-        let wc_commit = block_on(self.wc_commit(&repo))?;
-        block_on(self.checkout(&wc_commit, op_id)).map_err(|c| (1, c.msg))?;
+        // the operation is published, then the restored focus checked out
+        // from what the directory holds (§7.7)
+        let wc_id = &target_view.wc_commit_ids[WorkspaceName::DEFAULT];
+        let wc_commit = block_on(base.store().get_commit_async(wc_id))
+            .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
+        let back = if redo { ", and `j undo` goes back" } else { ", and `j redo` goes back" };
+        block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished), Some(back)))
+            .map_err(|c| (1, c.msg))?;
         Ok(())
     }
 
-    /// refuse if the working directory differs from the focused commit's
-    /// files (§7.7): reserved commands never snapshot, so compare the locked
-    /// working copy's recorded tree with the focus commit's tree
-    fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<(), OpenError> {
+    /// Refuse, as `undo` and `redo` do before anything else (§7.7), when the
+    /// working directory holds changes the working-copy commit does not:
+    /// what a snapshot would record (§7.4), which their checkout would write
+    /// over. Otherwise return the tree the directory holds, as scanned,
+    /// which that checkout starts from: the commit's, but for the text
+    /// written for a conflict the state does not record, as one lost and
+    /// made again records none, or, where the working-copy state is stale,
+    /// the state's with any changes to it the commit already has, such as
+    /// what a checkout cut short wrote. Reserved commands never snapshot,
+    /// so nothing is recorded either way.
+    fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<MergedTree, OpenError> {
         let dirty = (1, "working copy has changes not in @; run `j id` to record them or discard them".to_string());
-        let wc_commit = block_on(self.wc_commit(base))?;
-        // snapshot the working directory (without persisting anything) and
-        // compare against the focused commit's files (§7.7)
+        let wc_tree = block_on(self.wc_commit(base))?.tree();
         let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
-        let options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
-            progress: None,
-            start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &NothingMatcher,
-            max_new_file_size: u64::MAX,
-        };
-        let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
+        let old_tree = locked_ws.locked_wc().old_tree().clone();
+        let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
-        let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
-        if same {
-            // the scanned tree is the one already recorded: saving the state
-            // only refreshes the mtime cache
-            block_on(locked_ws.finish(base.operation().id().clone()))
-                .map_err(|e| (2, format!("cannot finish: {}", e)))?;
-        } else {
-            // the working copy differs from @ and this command records
-            // nothing: drop the lock without saving, or the state would claim
-            // the directory was snapshotted and hide the changes from the next
-            // run (§7.7)
-            drop(locked_ws);
+        let current = locked_ws.locked_wc().old_operation_id() == base.operation().id();
+        let recorded = match marker_style(base.settings()) {
+            Ok(markers) => block_on(snapshot_tree(&root, markers, &wc_tree, &old_tree, current, &scanned)),
+            Err(e) => Err(e),
         }
-        drop(ws_guard);
-        if !same {
+        .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
+        if recorded.tree_ids() != wc_tree.tree_ids() {
+            // drop the lock without saving, or the state would claim the
+            // directory was snapshotted and hide the changes from the next
+            // run (§7.7)
             return Err(dirty);
         }
-        Ok(())
+        // saving the state only refreshes what it knows of each file, or
+        // takes in what the commit already has
+        block_on(save_scan(locked_ws, &scanned, &wc_tree, base.operation().id()))
+            .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        Ok(scanned)
     }
 
-    pub fn cmd_ops(&self) -> Result<(), OpenError> {
+    /// The operation log for `ops` (§7.7), one line per operation, newest
+    /// first; the caller writes it to stdout.
+    pub fn cmd_ops(&self) -> Result<String, OpenError> {
         let base = self.head_repo()?;
         let loader = self.repo_loader();
         let head = base.operation().clone();
@@ -1226,8 +2692,7 @@ impl JjBackend {
                 None => None,
             };
         }
-        print!("{}", out);
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -1272,23 +2737,43 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
             visible: Mutex::new(None),
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
+            folds_case: OnceLock::new(),
+            long_names: Mutex::new(HashMap::new()),
         }),
     };
+    // the import and the working-copy commit are one operation, the one
+    // undo never undoes (§7.7)
+    let mut tx = backend.current_repo().start_transaction();
     if had_git {
         let import_options = backend.git_import_options()?;
-        let mut tx = backend.current_repo().start_transaction();
         block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
             .map_err(|e| (2, format!("cannot import the git history: {}", e)))?;
+        // HEAD too: it is the head the working-copy commit starts on, and a
+        // detached HEAD's commits are reachable from no ref
+        block_on(jj_lib::git::import_head(
+            tx.repo_mut(),
+            &backend.inner.workspace_name,
+            &cwd,
+        ))
+        .map_err(|e| (2, format!("cannot import the git HEAD: {}", e)))?;
         block_on(tx.repo_mut().rebase_descendants())
             .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
-        let _ = block_on(backend.publish_tx(tx, "import git refs"))?;
     }
-    create_initial_wc_commit(&backend, cfg, "init")?;
+    // §7.8: the current head is git's HEAD (none on an unborn branch)
+    let head = tx
+        .repo()
+        .view()
+        .git_head(&backend.inner.workspace_name)
+        .as_resolved()
+        .cloned()
+        .flatten();
+    create_initial_wc_commit(&backend, cfg, tx, "init", head, had_git, Some(""))?;
     Ok(())
 }
 
 pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     let settings = user_settings_strict(cfg)?;
+    let url = &origin_url(url)?;
     let dir_path = PathBuf::from(dir);
     if dir_path.join(".jj").is_dir() {
         return Err((2, format!("{} already contains a jj repository", dir)));
@@ -1302,82 +2787,295 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     } else if dir_path.exists() {
         return Err((2, format!("{} already exists and is not empty", dir)));
     }
-    std::fs::create_dir_all(&dir_path)
-        .map_err(|e| (2, format!("cannot create {}: {}", dir, e)))?;
+    let existed = dir_path.is_dir();
+    // the directory an existing DIR leads to, through a symlink DIR may be:
+    // a clone that fails empties it only while DIR still leads there (§7.8)
+    let found = if existed { dir_identity(&dir_path, true) } else { None };
+    // the directories this run creates, in order, each with its device and
+    // inode: a clone that fails removes DIR and those of its parents left
+    // empty, or an existing DIR's entries, and nothing else (§7.8).
+    // Each is made by `create_dir`, whose success proves it new. The checks
+    // above read DIR as written, before its missing parents exist; once
+    // they do, `new/..` or `new/../keep` names a directory that was there,
+    // so DIR's own `create_dir` failing, AlreadyExists included, refuses it
+    // as `git clone` does
+    let mut created: Vec<(&std::path::Path, Option<(u64, u64)>)> = Vec::new();
+    // those of them a failed clone leaves, as their paths no longer lead
+    // to them
+    let mut left: Vec<&std::path::Path> = Vec::new();
+    // from here until the clone has removed what it made or completed, a
+    // signal to stop waits, and fails a clone that has not yet made its
+    // working-copy commit (`unless_interrupted`, §1.3)
+    let _held = Deferral::start();
+    if !existed {
+        // DIR and its missing parents, DIR first ("" is the current
+        // directory, which exists)
+        let missing: Vec<&std::path::Path> = dir_path
+            .ancestors()
+            .enumerate()
+            .take_while(|(i, p)| *i == 0 || !(p.as_os_str().is_empty() || p.exists()))
+            .map(|(_, p)| p)
+            .collect();
+        for p in missing.into_iter().rev() {
+            match std::fs::create_dir(p) {
+                Ok(()) => created.push((p, dir_identity(p, false))),
+                // a parent reached again through `..`
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && p != dir_path
+                        && p.is_dir() => {}
+                Err(e) => {
+                    for &(p, id) in created.iter().rev() {
+                        if !remove_created_dir(p, id, false) {
+                            left.push(p);
+                        }
+                    }
+                    let msg = format!("cannot create {}: {}", dir, e);
+                    return Err((2, msg + &left_note(&left)));
+                }
+            }
+        }
+    }
+    let cloned = clone_into(cfg, &settings, url, &dir_path);
+    let Err((code, msg)) = cloned else {
+        return Ok(());
+    };
+    // like `git clone`, a clone that fails leaves nothing behind: its
+    // working-copy commit would claim files the checkout never wrote, and a
+    // later clone would refuse the directory (§7.8)
+    if !existed {
+        // DIR, the last one created, goes whole; a parent holds nothing of
+        // the clone's but DIR, so it goes only if left empty: what else was
+        // put there meanwhile, a sibling clone say, stays
+        for (i, &(p, id)) in created.iter().enumerate().rev() {
+            if !remove_created_dir(p, id, i + 1 == created.len()) {
+                left.push(p);
+            }
+        }
+        Err((code, msg + &left_note(&left)))
+    } else if found.is_some() && dir_identity(&dir_path, true) == found {
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let _ = match entry.file_type() {
+                    Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()),
+                    _ => std::fs::remove_file(entry.path()),
+                };
+            }
+        }
+        Err((code, msg))
+    } else if dir_path.symlink_metadata().is_ok() {
+        // a symlink put in place of DIR, or of a directory above it, would
+        // have `read_dir` list what that names
+        Err((
+            code,
+            format!(
+                "{}; left what `{}` holds, as it is no longer the directory this clone found empty",
+                msg, dir
+            ),
+        ))
+    } else {
+        Err((code, msg))
+    }
+}
+
+/// The device and inode of the directory at `path`, following a symlink
+/// there only when `follow` says so; `None` when `path` holds no directory
+fn dir_identity(path: &std::path::Path, follow: bool) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    };
+    meta.ok().filter(|m| m.is_dir()).map(|m| (m.dev(), m.ino()))
+}
+
+/// Remove the directory a failed clone created at `path`, `whole` or only
+/// if empty, while `path` still leads to it: the directory whose device and
+/// inode `id` were read on creating it (§7.8). A symlink put in its place,
+/// or in place of a directory above it, would have the removal follow it
+/// and delete what that names, so a path leading anywhere else is left, and
+/// the result is false. One leading nowhere holds nothing to remove.
+fn remove_created_dir(path: &std::path::Path, id: Option<(u64, u64)>, whole: bool) -> bool {
+    if id.is_some() && dir_identity(path, false) == id {
+        let _ = if whole {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_dir(path)
+        };
+        true
+    } else {
+        path.symlink_metadata().is_err()
+    }
+}
+
+/// What a failed clone's error adds for the directories it created and
+/// `left` (§7.8): nothing when it left none
+fn left_note(left: &[&std::path::Path]) -> String {
+    let named = |ps: &[&std::path::Path]| {
+        ps.iter().map(|p| format!("`{}`", p.display())).collect::<Vec<_>>().join(", ")
+    };
+    match left {
+        [] => String::new(),
+        [one] => format!(
+            "; left {}, as it is no longer the directory this clone created",
+            named(&[one])
+        ),
+        [init @ .., last] => format!(
+            "; left {} and {}, as they are no longer the directories this clone created",
+            named(init),
+            named(&[last])
+        ),
+    }
+}
+
+/// `url` as `origin` holds it (§7.8): a local path resolved against the
+/// current directory, as `jj git clone` stores it, for git resolves a
+/// relative one against the directory each later `fetch` or `push` runs
+/// in; one under a home directory (`~/…`, `~user/…`) and any other URL, a
+/// `file://` one included, as given. One that does not parse, or a path
+/// that does not resolve to UTF-8, is a usage error.
+fn origin_url(url: &str) -> Result<String, OpenError> {
+    let mut parsed = gix::url::parse(url).map_err(|e| (2, format!("invalid URL `{}`: {}", url, e)))?;
+    // a bare path is a file location in the alternative form
+    if parsed.scheme != gix::url::Scheme::File || !parsed.serialize_alternative_form {
+        return Ok(url.to_string());
+    }
+    // git expands a leading `~` to the home directory on every fetch and
+    // push, from wherever it runs; resolved here, it would name a directory
+    // called `~` (`./~/…` still does)
+    if parsed.path.starts_with(b"~") {
+        return Ok(url.to_string());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| (2, format!("cannot read the current directory: {}", e)))?;
+    parsed
+        .canonicalize(&cwd)
+        .map_err(|e| (2, format!("cannot resolve `{}`: {}", url, e)))?;
+    // `add_remote` takes UTF-8, which only the current directory's name or
+    // a symlink's target can break; stored as given, the path would reach
+    // the remote only from where it was typed
+    String::from_utf8(parsed.to_bstring().into())
+        .map_err(|_| (2, format!("cannot resolve `{}`: the path it names is not UTF-8", url)))
+}
+
+/// `clone`'s work once `dir_path` exists and is empty (§7.8)
+fn clone_into(
+    cfg: &Config,
+    settings: &UserSettings,
+    url: &str,
+    dir_path: &std::path::Path,
+) -> Result<(), OpenError> {
     let (workspace, repo) = block_on(Workspace::init_colocated_git(
-        &settings,
-        &dir_path,
+        settings,
+        dir_path,
         gix::hash::Kind::Sha1,
     ))
     .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
     let backend = JjBackend {
         inner: Arc::new(JjInner {
-            workspace_root: dir_path.clone(),
+            workspace_root: dir_path.to_path_buf(),
             workspace: Mutex::new(workspace),
             repo: Mutex::new(repo),
             workspace_name: WorkspaceName::DEFAULT.to_owned(),
             visible: Mutex::new(None),
             lock_guard: Mutex::new(None),
             pending: Mutex::new(None),
+            folds_case: OnceLock::new(),
+            long_names: Mutex::new(HashMap::new()),
         }),
     };
     let origin = RemoteName::new("origin");
     let mut tx = backend.current_repo().start_transaction();
-    jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
-        .map_err(|e| (1, format!("cannot set the remote: {}", e)))?;
-    backend.git_fetch_refs(tx.repo_mut(), origin)?;
+    // a signal to stop fails each step before the working-copy commit's
+    // (§1.3)
+    unless_interrupted(
+        jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
+            .map_err(|e| (1, format!("cannot set the remote: {}", e))),
+    )?;
+    unless_interrupted(backend.git_fetch_refs(tx.repo_mut(), origin))?;
+    let default_branch = unless_interrupted(git_default_branch(
+        git_backend(tx.repo().store())?.git_repo_path(),
+        origin,
+    ))?;
     let import_options = backend.git_import_options()?;
-    block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
-        .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
-    block_on(tx.repo_mut().rebase_descendants())
-        .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
-    let _ = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
-    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url))?;
+    unless_interrupted(
+        block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+            .map_err(|e| (1, format!("cannot import the fetched refs: {}", e))),
+    )?;
+    unless_interrupted(
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| (1, format!("cannot rebase descendants: {}", e))),
+    )?;
+    // §7.8: the default bookmark's target (none when the remote's HEAD names
+    // no branch, or a branch it does not have)
+    let head = default_branch.and_then(|name| {
+        tx.repo()
+            .view()
+            .get_remote_bookmark(RefName::new(&name).to_remote_symbol(origin))
+            .target
+            .as_resolved()
+            .cloned()
+            .flatten()
+    });
+    // the fetch and the working-copy commit are one operation, the one undo
+    // never undoes (§7.7)
+    create_initial_wc_commit(&backend, cfg, tx, &format!("clone {}", url), head, false, None)?;
     Ok(())
 }
 
-/// §7.8: after init/clone, create a working-copy commit as a child of the
-/// current head (a bookmark target if there is one, otherwise the root
-/// commit) and check it out.
+/// §7.8: after init/clone, create a working-copy commit as a child of
+/// `head` (the root commit when there is none), record it in `tx` with
+/// what the command has imported, and check it out. The commit holds its
+/// parent's files less any a checkout cannot create (`checkout_tree`), so
+/// it is empty unless the parent has one. `adopt` says the working
+/// directory already holds a checkout of the parent (init over an existing
+/// git repository): the working copy is then reset to the commit instead of
+/// written, so no file is touched and what the directory holds beyond the
+/// parent is the next snapshot's change. `back` is what a checkout that
+/// fails says (`JjBackend::checkout`): none for a clone, which then removes
+/// what it made.
 fn create_initial_wc_commit(
     backend: &JjBackend,
     cfg: &Config,
+    mut tx: jj_lib::transaction::Transaction,
     description: &str,
+    head: Option<CommitId>,
+    adopt: bool,
+    back: Option<&str>,
 ) -> Result<(), OpenError> {
-    let base = backend.current_repo();
-    let store = base.store().clone();
-    let mut parent = store.root_commit_id().clone();
-    'outer: for (_name, target) in base.view().local_bookmarks() {
-        if let Some(id) = target.as_resolved().and_then(|t| t.clone()) {
-            parent = id;
-            break 'outer;
-        }
-    }
-    if parent == *store.root_commit_id() {
-        for (_name, remote_ref) in base.view().remote_bookmarks(RemoteName::new("origin")) {
-            if let Some(id) = remote_ref.target.as_resolved().and_then(|t| t.clone()) {
-                parent = id;
-                break;
-            }
-        }
-    }
+    let store = tx.base_repo().store().clone();
+    let parent = head.unwrap_or_else(|| store.root_commit_id().clone());
     // jj's own init already created a working-copy commit; if it is already
     // a child of the target parent, keep it and just check it out
     let mut to_abandon: Option<CommitId> = None;
-    if let Ok(existing) = block_on(backend.wc_commit(&base)) {
+    let existing = tx.repo().view().get_wc_commit_id(&backend.inner.workspace_name).cloned();
+    if let Some(existing) = existing.and_then(|id| block_on(store.get_commit_async(&id)).ok()) {
         if existing.parent_ids().first() == Some(&parent) {
-            let op_id = base.operation().id().clone();
-            block_on(backend.checkout(&existing, op_id)).map_err(|c| (1, c.msg))?;
+            // jj's commit is an empty child of the root; record only what
+            // was imported, if anything
+            let op = if tx.repo().has_changes() {
+                Some(
+                    block_on(tx.write(truncate_chars(description, 200)))
+                        .map_err(|e| (1, format!("cannot write the operation: {}", e)))?,
+                )
+            } else {
+                None
+            };
+            block_on(backend.checkout(&existing, None, op, back)).map_err(|c| (1, c.msg))?;
             return Ok(());
         }
         if existing.id() != store.root_commit_id() {
             to_abandon = Some(existing.id().clone());
         }
     }
+    let parent_tree = block_on(store.get_commit_async(&parent))
+        .map_err(|e| (1, format!("cannot read the parent commit: {}", e)))?
+        .tree();
+    let wc_tree = block_on(checkout_tree(parent_tree, backend))?;
     let user_sig = backend
         .user_signature(cfg)
         .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
-    let mut tx = base.start_transaction();
     if let Some(old_wc) = &to_abandon {
         tx.repo_mut().record_abandoned_commit_with_parents(
             old_wc.clone(),
@@ -1386,7 +3084,7 @@ fn create_initial_wc_commit(
     }
     let wc = block_on(
         tx.repo_mut()
-            .new_commit(vec![parent], store.empty_merged_tree())
+            .new_commit(vec![parent], wc_tree)
             .set_author(user_sig.clone())
             .set_committer(user_sig)
             .write(),
@@ -1399,12 +3097,43 @@ fn create_initial_wc_commit(
         .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
     let unpublished = block_on(tx.write(truncate_chars(description, 200)))
         .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
-    let op_id = unpublished.operation().id().clone();
-    let repo = block_on(unpublished.publish())
-        .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
-    *backend.inner.repo.lock().unwrap() = repo;
-    block_on(backend.checkout(&wc, op_id)).map_err(|c| (1, c.msg))?;
+    // an adopted directory is reset to the commit, not checked out over:
+    // checking out from the empty tree jj's init recorded would recreate
+    // the files the user deleted there. Anything else is written, once the
+    // operation is published (§7.5 step 7).
+    let on_disk = if adopt { Some(wc.tree()) } else { None };
+    block_on(backend.checkout(&wc, on_disk.as_ref(), Some(unpublished), back)).map_err(|c| (1, c.msg))?;
     Ok(())
+}
+
+/// `tree` without the files at a path a checkout cannot create (§7.5 step
+/// 1), which a git branch can hold: a `.jj` directory committed by mistake,
+/// a name the workspace's filesystem does not hold. jj's checkout stops at
+/// the first such path, failing the whole clone, so the working-copy commit
+/// init or clone starts on leaves them out, and their removal is its change
+/// (§7.8).
+async fn checkout_tree(tree: MergedTree, backend: &JjBackend) -> Result<MergedTree, OpenError> {
+    let folds_case = backend.folds_case();
+    let refused: Vec<RepoPathBuf> = tree
+        .entries()
+        .map(|(path, _)| path)
+        .filter(|path| {
+            path.components().any(|c| {
+                crate::repo::checkout_refuses(c.as_internal_str(), folds_case, |name| backend.name_fits(name))
+            })
+        })
+        .collect();
+    if refused.is_empty() {
+        return Ok(tree);
+    }
+    let mut builder = MergedTreeBuilder::new(tree);
+    for path in refused {
+        builder.set_or_remove(path, Merge::absent());
+    }
+    builder
+        .write_tree()
+        .await
+        .map_err(|e| (1, format!("cannot write a tree: {}", e)))
 }
 
 /// user settings for init/clone: a missing or malformed `user` is a
@@ -1488,14 +3217,45 @@ fn git_fetch_subprocess(git_dir: &std::path::Path, remote: &RemoteName) -> Resul
     if out.status.success() {
         Ok(())
     } else {
-        Err((
-            1,
-            format!(
-                "fetch failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ))
+        Err((1, format!("fetch failed: {}", git_failure(&out))))
     }
+}
+
+/// What a git that failed said, or how it ended when it said nothing (a
+/// Ctrl-C stops it silently)
+fn git_failure(out: &std::process::Output) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match (said.is_empty(), out.status.signal()) {
+        (false, _) => said,
+        (true, Some(sig)) => format!("git was stopped by signal {}", sig),
+        (true, None) => format!("git exited with status {}", out.status.code().unwrap_or(-1)),
+    }
+}
+
+/// the branch the remote's HEAD names, its default bookmark (§7.8), asked of
+/// the remote with `git ls-remote --symref` (the git `git_fetch_subprocess`
+/// runs); `None` when HEAD names no branch (a detached HEAD)
+fn git_default_branch(
+    git_dir: &std::path::Path,
+    remote: &RemoteName,
+) -> Result<Option<String>, OpenError> {
+    let exe = std::env::var("J_GIT").unwrap_or_else(|_| "git".to_string());
+    let out = std::process::Command::new(exe)
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["ls-remote", "--symref", remote.as_str(), "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| (1, format!("cannot run git ls-remote: {}", e)))?;
+    if !out.status.success() {
+        return Err((1, format!("cannot read the remote's default branch: {}", git_failure(&out))));
+    }
+    // `ref: refs/heads/<branch>\tHEAD`
+    Ok(String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+        let branch = line.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD")?;
+        Some(branch.to_string())
+    }))
 }
 
 enum OpKind {
@@ -1542,6 +3302,14 @@ fn op_marker(meta: &jj_lib::op_store::OperationMetadata) -> Option<OpMarker> {
         }
     }
     None
+}
+
+/// Whether `meta` is the operation `init` or `clone` recorded (§7.7), by its
+/// description, `init` or `clone URL`: no expression is described so, both
+/// words being reserved (§1.1).
+fn op_created_repo(meta: &jj_lib::op_store::OperationMetadata) -> bool {
+    let desc = meta.description.trim();
+    desc == "init" || desc.starts_with("clone ")
 }
 
 /// a full-length (or prefix) hex operation id
@@ -1654,68 +3422,178 @@ fn parse_push_records(
     Ok(out)
 }
 
-/// §7.6: refuse to send commits with unresolved files or empty descriptions,
-/// and refuse to move/delete a bookmark whose current target is immutable
-/// away from a descendant of that target
+/// §7.6: refuse to move a bookmark whose current target is immutable to a
+/// commit that does not descend from that target, or to delete it while no
+/// bookmark left on `origin` after the push reaches that target; and refuse
+/// to send commits with unresolved files or empty descriptions. Returns
+/// whether such a delete is allowed only because a record's new target
+/// reaches it, so the deletes must wait for the updates (push_to_origin),
+/// and refuses a push whose deletes would wait for a bookmark git cannot
+/// create while one of them is still there
 fn check_push_records(
     records: &[(String, Option<CommitId>)],
-    vis: &VisibleRepo,
     repo: &Arc<ReadonlyRepo>,
-) -> Result<(), OpenError> {
+    vis: &VisibleRepo,
+    immutable: &BTreeSet<String>,
+) -> Result<bool, OpenError> {
     let store = repo.store().clone();
+    let origin = RemoteName::new("origin");
+    // the records' new targets, which the push sends and leaves on `origin`
+    let new_targets: Vec<CommitId> = records.iter().filter_map(|(_, t)| t.clone()).collect();
+    // the targets of the other bookmarks left on `origin` after the push:
+    // those no record names, where they are as of the last fetch or push;
+    // computed for the first delete that needs them
+    let mut unnamed: Option<Vec<CommitId>> = None;
+    // the deletes that only records' new targets keep reached
+    let mut waiting: Vec<&str> = Vec::new();
     for (name, target) in records {
-        let mut seeds: Vec<String> = Vec::new();
-        if let Some(commit_id) = target {
-            let commit = block_on(store.get_commit_async(commit_id))
-                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
-            let change_id = commit.change_id().reverse_hex();
-            if vis.commits.contains_key(&change_id) {
-                seeds.push(change_id);
-            }
-        }
-        if let Some(current) = repo
+        let Some(current) = repo
             .view()
-            .get_remote_bookmark(RefName::new(name).to_remote_symbol(RemoteName::new("origin")))
+            .get_remote_bookmark(RefName::new(name).to_remote_symbol(origin))
             .target
             .as_resolved()
             .cloned()
             .unwrap_or(None)
-        {
-            let commit = block_on(store.get_commit_async(&current))
-                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
-            let change_id = commit.change_id().reverse_hex();
-            if vis.commits.contains_key(&change_id) {
-                seeds.push(change_id);
-            }
+        else {
+            continue;
+        };
+        let change_id = block_on(store.get_commit_async(&current))
+            .map_err(|e| (2, format!("cannot read a commit: {}", e)))?
+            .change_id()
+            .reverse_hex();
+        // the immutable set holds visible commits: a target rewritten here
+        // since the last fetch or push is hidden, and not in it although the
+        // visible rewrite carries its change id (and its label)
+        let visible = vis.commits.get(&change_id).is_some_and(|c| c.commit.id() == &current);
+        if !visible || !immutable.contains(&change_id) {
+            continue;
         }
-        let ancestors = ancestors_of_change_ids(vis, &seeds);
-        for change_id in &ancestors {
-            let rec = vis.commits.get(change_id).expect("ancestors are stored");
-            for (_path, value) in rec.commit.tree().entries() {
-                let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
-                if !value.is_resolved() {
+        match target {
+            None => {
+                // a delete loses no history while another bookmark still
+                // reaches the commit: a merged feature, a second name. When
+                // only a bookmark this push sets reaches it (`rename`), the
+                // remote may reject that update and accept the delete, so
+                // the delete waits for the update to be accepted
+                let unnamed = unnamed.get_or_insert_with(|| {
+                    let named: BTreeSet<&str> = records.iter().map(|(n, _)| n.as_str()).collect();
+                    repo.view()
+                        .remote_bookmarks(origin)
+                        .filter(|(n, _)| !named.contains(n.as_str()))
+                        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+                        .cloned()
+                        .collect()
+                });
+                let reached = |heads: &[CommitId]| {
+                    ResolvedRevsetExpression::commits(vec![current.clone()])
+                        .intersection(&ResolvedRevsetExpression::commits(heads.to_vec()).ancestors())
+                        .evaluate(repo.as_ref())
+                        .and_then(|r| r.is_empty())
+                        .map(|empty| !empty)
+                        .map_err(|e| (2, format!("cannot read the index: {}", e)))
+                };
+                if !reached(unnamed)? {
+                    if !reached(&new_targets)? {
+                        return Err((
+                            1,
+                            format!(
+                                "push: `{}` is on the immutable commit `@{}` and cannot be deleted while no bookmark left on origin reaches it",
+                                name, change_id
+                            ),
+                        ));
+                    }
+                    waiting.push(name);
+                }
+            }
+            Some(new) => {
+                let descends = block_on(repo.index().is_ancestor(&current, new))
+                    .map_err(|e| (2, format!("cannot read the index: {}", e)))?;
+                if !descends {
                     return Err((
                         1,
                         format!(
-                            "push: commit `@{}` has unresolved files",
-                            rec.change_id
+                            "push: `{}` is on the immutable commit `@{}` and can only move to a descendant of it",
+                            name, change_id
                         ),
                     ));
                 }
             }
-            if rec.commit.description().trim().is_empty() && rec.commit.id() != store.root_commit_id() {
-                return Err((
-                    1,
-                    format!("push: commit `@{}` has an empty description", rec.change_id),
-                ));
+        }
+    }
+    // git cannot hold a bookmark and one under its name at once (`master`
+    // and `master/legacy`), so while the deletes wait, a first push that
+    // creates a name nesting with a deleted one is rejected and the deletes
+    // are never sent. With a bookmark no record names on the waiting
+    // delete's commit, nothing waits and it is one git push (§7.6)
+    let deletes_wait = !waiting.is_empty();
+    if deletes_wait {
+        let nests = |a: &str, b: &str| b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'));
+        for (deleted, _) in records.iter().filter(|(_, t)| t.is_none()) {
+            for (set, _) in records.iter().filter(|(_, t)| t.is_some()) {
+                if nests(deleted, set) || nests(set, deleted) {
+                    let keep = if waiting.contains(&deleted.as_str()) { deleted.as_str() } else { waiting[0] };
+                    let literal = crate::show::text_literal(keep);
+                    // the temporary label: the first of `tmp`, `tmp-1`, ...
+                    // that is no bookmark, here or on origin, no record
+                    // names, and nests with none of those, so pushing and
+                    // deleting it moves none of the user's bookmarks, and
+                    // this push, which names nothing nesting with it, no
+                    // longer waits on `keep`'s commit
+                    let taken: Vec<&str> = repo
+                        .view()
+                        .bookmarks()
+                        .map(|(n, _)| n.as_str())
+                        .chain(records.iter().map(|(n, _)| n.as_str()))
+                        .collect();
+                    let tmp = std::iter::once("tmp".to_string())
+                        .chain((1..).map(|i| format!("tmp-{i}")))
+                        .find(|t| !taken.iter().any(|n| n == t || nests(n, t) || nests(t, n)))
+                        .expect("finitely many names are taken");
+                    let tmp = crate::show::text_literal(&tmp);
+                    return Err((
+                        1,
+                        format!(
+                            "push: `{deleted}` must stay on origin until `{set}` is accepted, and git cannot create `{set}` while `{deleted}` is there; first push a temporary label on `{keep}`'s commit, `push (label {tmp} (labelled {literal}))`, then this push, then `push (unlabel {tmp})`"
+                        ),
+                    ));
+                }
             }
         }
     }
-    Ok(())
+    // the commits that would be sent: ancestors of the new targets that no
+    // bookmark on the remote already reaches; a delete sends none
+    if new_targets.is_empty() {
+        return Ok(deletes_wait);
+    }
+    let on_remote: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(origin)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let sent = ResolvedRevsetExpression::commits(on_remote)
+        .range(&ResolvedRevsetExpression::commits(new_targets))
+        .evaluate(repo.as_ref())
+        .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
+    let sent: Vec<Commit> = block_on(sent.stream().commits(&store).try_collect())
+        .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
+    for commit in &sent {
+        let change_id = commit.change_id().reverse_hex();
+        for (_path, value) in commit.tree().entries() {
+            let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
+            if !value.is_resolved() {
+                return Err((1, format!("push: commit `@{}` has unresolved files", change_id)));
+            }
+        }
+        if commit.description().trim().is_empty() && commit.id() != store.root_commit_id() {
+            return Err((1, format!("push: commit `@{}` has an empty description", change_id)));
+        }
+    }
+    Ok(deletes_wait)
 }
 
 /// change-id closure of jj-parents from the seeds (all jj parents, not just
-/// the first), for the push content checks
+/// the first), for the immutable set (§7.5)
 fn ancestors_of_change_ids(vis: &VisibleRepo, seeds: &[String]) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = seeds.to_vec();
@@ -1794,14 +3672,68 @@ impl Backend for JjBackend {
         vis.and_then(|v| v.commits.get(id).map(|r| r.commit.has_conflict()))
     }
 
-    fn is_empty(&self, id: &str) -> Option<bool> {
+    fn is_empty(&self, id: &str, parent: &str) -> Option<bool> {
         let vis = self.inner.visible.lock().unwrap().clone();
-        // O(1): empty iff the tree id equals the first parent's tree id
+        // O(1): empty iff the tree id equals the parent's tree id
         vis.and_then(|v| {
             let rec = v.commits.get(id)?;
-            let parent = v.commits.get(&rec.first_parent)?;
+            let parent = v.commits.get(parent)?;
             Some(rec.commit.tree_ids() == parent.commit.tree_ids())
         })
+    }
+
+    fn folds_case(&self) -> bool {
+        // jj's checkout refuses a name whose file identity is that of
+        // `.git` or `.jj` in the same directory (local_working_copy.rs), so
+        // where `.JJ` is the workspace's own `.jj` it refuses `.GIT` too.
+        // Where each spelling of a name gets its own inode number
+        // (exfat-fuse) the identities differ and the checkout writes
+        // `.GIT/x` into `.git`, so folding is told by how names resolve:
+        // `.JJ` resolves, but the directory does not list it under that
+        // spelling. A directory that cannot be listed is taken to fold
+        // case, the answer that refuses more.
+        *self.inner.folds_case.get_or_init(|| {
+            use jj_lib::file_util::FileIdentity;
+            let root = &self.inner.workspace_root;
+            let Ok(upper) = FileIdentity::from_symlink_path(root.join(".JJ")) else {
+                return false;
+            };
+            FileIdentity::from_symlink_path(root.join(".jj")).is_ok_and(|lower| lower == upper)
+                || std::fs::read_dir(root).map_or(true, |mut entries| {
+                    !entries.any(|e| e.is_ok_and(|e| e.file_name() == ".JJ"))
+                })
+        })
+    }
+
+    fn name_fits(&self, name: &str) -> bool {
+        if name.len() <= crate::repo::NAME_MAX {
+            return true;
+        }
+        // a component, never a path: one with `/` would be created elsewhere
+        if name.contains(['/', '\0']) {
+            return false;
+        }
+        // no call tells whether the limit counts bytes (ext4) or UTF-16
+        // units or characters (exFAT, NTFS, APFS), so the name is tried:
+        // created in a directory of its own under `.jj`, which is then
+        // removed, once per name and run
+        let mut known = self.inner.long_names.lock().unwrap();
+        if let Some(fits) = known.get(name) {
+            return *fits;
+        }
+        let fits = match tempfile::Builder::new()
+            .prefix("name-")
+            .tempdir_in(self.inner.workspace_root.join(".jj"))
+        {
+            Ok(dir) => {
+                let fits = std::fs::File::create(dir.path().join(name)).is_ok();
+                drop(dir);
+                fits
+            }
+            Err(_) => false,
+        };
+        known.insert(name.to_string(), fits);
+        fits
     }
 
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
@@ -1809,18 +3741,11 @@ impl Backend for JjBackend {
         let Some(vis) = vis else {
             return BTreeSet::new();
         };
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<String> = ids.iter().cloned().collect();
-        while let Some(id) = stack.pop() {
-            if seen.insert(id.clone()) {
-                if let Some(rec) = vis.commits.get(&id) {
-                    if !rec.first_parent.is_empty() {
-                        stack.push(rec.first_parent.clone());
-                    }
-                }
-            }
-        }
-        seen
+        // every jj parent, not just the first: rewriting a commit reached
+        // only through a merge's second parent rewrites the merge too
+        // (§7.5 step 3)
+        let seeds: Vec<String> = ids.iter().cloned().collect();
+        ancestors_of_change_ids(&vis, &seeds)
     }
 
     fn replay(&self, onto: &[Value], from: &[Value], to: &[Value]) -> Result<Vec<Value>, Crash> {
@@ -1842,21 +3767,72 @@ async fn jj_replay(
     let onto_tree = build_tree(store, &Value::list(onto.to_vec())).await?;
     let from_tree = build_tree(store, &Value::list(from.to_vec())).await?;
     let to_tree = build_tree(store, &Value::list(to.to_vec())).await?;
-    let merge = Merge::from_removes_adds(
-        vec![from_tree.tree_ids().as_resolved().cloned().unwrap()],
-        vec![
-            onto_tree.tree_ids().as_resolved().cloned().unwrap(),
-            to_tree.tree_ids().as_resolved().cloned().unwrap(),
-        ],
-    );
-    // tree_merge::merge_trees resolves file contents line-level and keeps
-    // unresolvable paths as conflicts (tree_merge.rs:78)
-    let merged = jj_lib::tree_merge::merge_trees(store, merge)
-        .await
-        .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+    // any of the three may itself be conflicted (a snapshot with unresolved
+    // blobs, §7.3), so merge the trees the way jj's rebase does:
+    // MergedTree::merge flattens conflicted inputs into one merge, simplifies
+    // it, and resolves file contents line-level with tree_merge::merge_trees,
+    // keeping unresolvable paths as conflicts. Empty labels leave the result
+    // unlabeled; the labels would not survive tree_to_files anyway.
+    let merged = MergedTree::merge(Merge::from_removes_adds(
+        vec![(from_tree.clone(), String::new())],
+        vec![(onto_tree.clone(), String::new()), (to_tree.clone(), String::new())],
+    ))
+    .await
+    .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+    refuse_file_directory_clash(&merged, &onto_tree, &from_tree, &to_tree).await?;
     // conflicts stay as unresolved blobs (§7.3)
-    let merged = MergedTree::new(store.clone(), merged, jj_lib::conflict_labels::ConflictLabels::unlabeled());
     tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
+}
+
+/// Crash if the merge left a conflict with a file on one side and, on
+/// another, a directory `onto` or `to` holds at that path: one entry cannot
+/// list that directory's entries (§7.3). A conflict that `onto`, `from` or
+/// `to` already holds at the path is not made here: its sides, a directory
+/// side jj made earlier included, came in as an unresolved blob, and replay
+/// carries them beside the others, as when the child resolving that conflict
+/// is squashed into it.
+async fn refuse_file_directory_clash(
+    merged: &MergedTree,
+    onto: &MergedTree,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<(), Crash> {
+    let value_at = async |tree: &MergedTree, path: &RepoPath| {
+        tree.path_value(path).await.map_err(|e| Crash::new(format!("replay: {}", e)))
+    };
+    // walks only the unresolved part of the tree: nothing when it is resolved
+    for (path, value) in merged.conflicts() {
+        let value = value.map_err(|e| Crash::new(format!("replay: {}", e)))?;
+        // sides that cancel are no sides
+        let value = value.simplify();
+        let has = |dir: bool| {
+            value
+                .adds()
+                .any(|v| matches!(v, Some(t) if matches!(t, TreeValue::Tree(_)) == dir))
+        };
+        if !has(false) || !has(true) {
+            continue;
+        }
+        let held = [
+            value_at(onto, &path).await?,
+            value_at(from, &path).await?,
+            value_at(to, &path).await?,
+        ];
+        // an input's conflict at the path, as opposed to one inside the
+        // directory there, which leaves the path a directory in the input
+        if held.iter().any(|h| !h.is_resolved() && !h.is_tree()) {
+            continue;
+        }
+        let side = |dir: &MergedTreeValueT| {
+            dir.is_tree() && value.adds().any(|v| v.is_some() && dir.iter().any(|h| h == v))
+        };
+        if side(&held[0]) || side(&held[2]) {
+            let comps: Vec<String> =
+                path.components().map(|c| c.as_internal_str().to_string()).collect();
+            return Err(crate::domain::file_directory_clash(&comps));
+        }
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -1875,6 +3851,107 @@ impl ConflictTreeValue {
     fn new(adds: Vec<Option<TreeValue>>, removes: Vec<Option<TreeValue>>) -> MergedTreeValueT {
         Merge::from_removes_adds(removes, adds)
     }
+}
+
+/// The stored trees a program's commits may still hold the files of, to
+/// write each such commit with the tree itself (§7.5 step 4). A list holds
+/// each conflict simplified (`merged_value_to_blob`), and the tree it was
+/// loaded from need not, so a tree built from the list could differ from
+/// the stored one where the files do not: a child `new` made would not be
+/// empty, as jj's own `new` leaves one.
+struct LoadedTrees<'a> {
+    /// the stored commits the program's repo was loaded from
+    visible: Option<&'a VisibleRepo>,
+    /// the lists the lazy `files` of the program's commits have loaded, by
+    /// identity: `c.files` takes the list out, so a commit given it, as
+    /// `new` gives its child its parent's, holds the list itself
+    lists: HashMap<(*const Vec<Value>, usize), Rc<ThunkVal>>,
+}
+
+impl<'a> LoadedTrees<'a> {
+    /// The trees `repos`' commits were loaded with; nothing is read
+    fn new(visible: Option<&'a VisibleRepo>, repos: &[&Value]) -> Result<LoadedTrees<'a>, Crash> {
+        let mut lists = HashMap::new();
+        for repo in repos {
+            for commit in crate::repo::all_commits(repo)? {
+                if let Value::Thunk(t) = crate::repo::files_of(&commit)? {
+                    if let (Some(_), Some(Value::List(list))) = (t.tree(), t.peek()) {
+                        lists.insert(list.identity(), t);
+                    }
+                }
+            }
+        }
+        Ok(LoadedTrees { visible, lists })
+    }
+
+    /// The tree to write for a commit on `parents` whose files are `files`:
+    /// where they are still a list loaded from a stored tree, that tree as
+    /// jj stored it, and otherwise the one `build_tree` makes of them; but
+    /// where either lists the parents' files, the parents' tree
+    fn tree_to_write(&self, repo: &dyn Repo, files: &Value, parents: &[CommitId]) -> Result<MergedTree, Crash> {
+        let tree = self.tree_of(repo.store(), files)?;
+        Ok(block_on(parents_tree_if_same(repo, parents, tree)))
+    }
+
+    fn tree_of(&self, store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
+        let loaded = match files {
+            Value::Thunk(t) => Some(t),
+            Value::List(list) => self.lists.get(&list.identity()),
+            _ => None,
+        };
+        if let Some(t) = loaded {
+            let stored = t.origin().zip(self.visible).and_then(|(id, vis)| vis.commits.get(id));
+            if let Some(tree) = stored.map(|rec| rec.commit.tree()) {
+                if t.tree() == Some(tree_name(&tree).as_str()) {
+                    return Ok(tree);
+                }
+            }
+        }
+        block_on(build_tree(store, &files.forced()?))
+    }
+}
+
+/// The tree of `parents`, merged where there are several, as jj's emptiness
+/// takes it, where it lists the files `tree` lists, and otherwise `tree`
+/// (§7.5 step 4). A list holds each conflict less the sides that cancel
+/// (§7.3), and a tree built from it holds no labels, where a tree jj merged
+/// keeps both; so a commit left with its parent's files by `squash`,
+/// `rebase` or `abandon`, which build the files anew, got another tree for
+/// them: jj took it for a change at each conflicted path, the tree's empty
+/// mark (`is_empty`) did not show, and the checkout wrote the conflicts
+/// again with generic labels. So did a commit moved onto another tree for
+/// its files, which kept its own, and a snapshot that reverted the commit's
+/// change, which builds on the commit's tree (§7.4). Files with no conflict
+/// make one tree, so a resolved parents' tree is not compared, nor one of
+/// the same ids, and the comparison stops at the first path where the two
+/// differ. It only chooses between two trees for the same files, so where
+/// the parents' cannot be read, it is `tree`.
+async fn parents_tree_if_same(repo: &dyn Repo, parents: &[CommitId], tree: MergedTree) -> MergedTree {
+    let mut commits = Vec::with_capacity(parents.len());
+    for id in parents {
+        match repo.store().get_commit_async(id).await {
+            Ok(commit) => commits.push(commit),
+            Err(_) => return tree,
+        }
+    }
+    let Ok(parents_tree) = jj_lib::rewrite::merge_commit_trees(repo, &commits).await else {
+        return tree;
+    };
+    // the same terms: the parents' tree, with jj's labels for them
+    if parents_tree.tree_ids() == tree.tree_ids() {
+        return parents_tree;
+    }
+    if parents_tree.tree_ids().is_resolved() {
+        return tree;
+    }
+    let mut diff = parents_tree.diff_stream(&tree, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        match entry.values {
+            Ok(Diff { before, after }) if value_as_read(&before) == value_as_read(&after) => {}
+            _ => return tree,
+        }
+    }
+    parents_tree
 }
 
 async fn build_tree(store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
@@ -1936,19 +4013,41 @@ async fn blob_to_tree_value(store: &Arc<Store>, content: &Value) -> Result<Merge
                 return Err(Crash::new("persistence: malformed conflict blob"));
             }
             // jj order: [add, (remove, add)*] → Merge with interleaved adds
-            // and removes
+            // and removes; each side keeps its absence, its own file type or
+            // its directory (§7.3), so the tree written is the one the
+            // conflict was read from
             let mut values: Vec<Option<TreeValue>> = Vec::new();
             for side in sides {
-                let mut slice: &[u8] = side.as_ref();
-                let id = store
-                    .write_file(&RepoPathBuf::root(), &mut slice)
-                    .await
-                    .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
-                values.push(Some(TreeValue::File {
-                    id,
-                    executable: b.kind == BlobKind::Executable,
-                    copy_id: CopyId::placeholder(),
-                }));
+                let Some(side) = side else {
+                    values.push(None);
+                    continue;
+                };
+                let value = if let Some(hex) = &side.tree {
+                    TreeValue::Tree(
+                        TreeId::try_from_hex(hex)
+                            .ok_or_else(|| Crash::new("persistence: bad tree id"))?,
+                    )
+                } else if side.kind == BlobKind::Symlink {
+                    let target = std::str::from_utf8(&side.bytes)
+                        .map_err(|_| Crash::new("persistence: symlink target is not UTF-8"))?;
+                    let id = store
+                        .write_symlink(&RepoPathBuf::root(), target)
+                        .await
+                        .map_err(|e| Crash::new(format!("cannot write a symlink: {}", e)))?;
+                    TreeValue::Symlink(id)
+                } else {
+                    let mut slice: &[u8] = side.bytes.as_ref();
+                    let id = store
+                        .write_file(&RepoPathBuf::root(), &mut slice)
+                        .await
+                        .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
+                    TreeValue::File {
+                        id,
+                        executable: side.kind == BlobKind::Executable,
+                        copy_id: CopyId::placeholder(),
+                    }
+                };
+                values.push(Some(value));
             }
             let mut adds = Vec::new();
             let mut removes = Vec::new();
@@ -2033,20 +4132,64 @@ async fn read_file_bytes(
     Ok(buf)
 }
 
-async fn side_to_bytes(
+/// one side of a conflict as jj stores it: absent (`None`, a deletion
+/// conflict), or content with that side's own file type (§7.3)
+async fn conflict_side(
     store: &Arc<Store>,
     path: &RepoPath,
     v: &Option<TreeValue>,
     cache: &BlobCache,
-) -> Result<Rc<Vec<u8>>, Crash> {
+) -> Result<Option<ConflictSide>, Crash> {
     match v {
-        Some(TreeValue::File { id, .. }) => read_file_bytes(store, path, id, cache).await,
-        Some(TreeValue::Symlink(id)) => store
-            .read_symlink(path, id)
-            .await
-            .map(|s| Rc::new(s.into_bytes()))
-            .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e))),
-        _ => Ok(Rc::new(Vec::new())),
+        None => Ok(None),
+        Some(TreeValue::File { id, executable, .. }) => Ok(Some(ConflictSide {
+            kind: if *executable {
+                BlobKind::Executable
+            } else {
+                BlobKind::Regular
+            },
+            bytes: read_file_bytes(store, path, id, cache).await?,
+            tree: None,
+        })),
+        Some(TreeValue::Symlink(id)) => {
+            let target = store
+                .read_symlink(path, id)
+                .await
+                .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e)))?;
+            Ok(Some(ConflictSide {
+                kind: BlobKind::Symlink,
+                bytes: Rc::new(target.into_bytes()),
+                tree: None,
+            }))
+        }
+        // a directory side, in a conflict between a file and a directory,
+        // reads as empty content but keeps its tree, so writing the conflict
+        // back cannot put an empty file where the directory was
+        Some(TreeValue::Tree(id)) => Ok(Some(ConflictSide {
+            kind: BlobKind::Regular,
+            bytes: Rc::new(Vec::new()),
+            tree: Some(id.hex()),
+        })),
+        // a submodule side reads as an empty file, as a resolved one does in
+        // tree_value_to_blob (§12)
+        Some(TreeValue::GitSubmodule(_)) => Ok(Some(ConflictSide::regular(&[]))),
+    }
+}
+
+/// The value a list reads where a tree holds `value` (§7.3): a conflict less
+/// each pair of sides that cancel, one added and one removed the same, as jj
+/// simplifies a file conflict to write it out. jj keeps every term of a
+/// merge it cannot resolve, pairs that cancel included, so a replayed
+/// commit's conflict inherited from its parent was not the parent's, and
+/// each commit a rebase replayed above took two more sides for it. Where
+/// only directory sides would be left, the value is kept whole: jj keeps it
+/// as one conflict at the path, and the simplified one would be a conflict
+/// between directories, which jj merges entry by entry. Two values read
+/// the same are the same entry of a list.
+fn value_as_read(value: &MergedTreeValueT) -> std::borrow::Cow<'_, MergedTreeValueT> {
+    match (!value.is_resolved()).then(|| value.simplify()).filter(|v| !v.is_tree()) {
+        Some(simplified) => std::borrow::Cow::Owned(simplified),
+        None => std::borrow::Cow::Borrowed(value),
     }
 }
 
@@ -2056,6 +4199,9 @@ async fn merged_value_to_blob(
     value: &jj_lib::backend::MergedTreeValue,
     cache: &BlobCache,
 ) -> Result<Value, Crash> {
+    // the conflict less the sides that cancel (§7.3)
+    let read = value_as_read(value);
+    let value = read.as_ref();
     if let Some(v) = value.as_resolved() {
         return match v {
             Some(tv) => tree_value_to_blob(store, path, tv).await,
@@ -2066,11 +4212,11 @@ async fn merged_value_to_blob(
         };
     }
     // conflict sides, jj order: [add, (remove, add)*] (§7.3)
-    let mut sides: Vec<Rc<Vec<u8>>> = Vec::new();
+    let mut sides: Vec<Option<ConflictSide>> = Vec::new();
     for (i, add) in value.adds().enumerate() {
-        sides.push(side_to_bytes(store, path, add, cache).await?);
+        sides.push(conflict_side(store, path, add, cache).await?);
         if let Some(remove) = value.get_remove(i) {
-            sides.push(side_to_bytes(store, path, remove, cache).await?);
+            sides.push(conflict_side(store, path, remove, cache).await?);
         }
     }
     Ok(Value::Blob(Rc::new(BlobVal {
@@ -2122,8 +4268,9 @@ async fn tree_value_to_blob(
                 content: BlobContent::Resolved(Rc::new(target.into_bytes())),
             })))
         }
-        // a conflicted directory is emitted without its children by
-        // MergedTree::entries; §12 puts such repairs out of scope
+        // MergedTree::entries recurses into a resolved directory, and a
+        // directory side of a conflict goes through conflict_side, so this is
+        // a submodule, which §12 puts out of scope
         TreeValue::Tree(_) | TreeValue::GitSubmodule(_) => Ok(Value::Blob(Rc::new(BlobVal {
             kind: BlobKind::Regular,
             content: BlobContent::Resolved(Rc::new(Vec::new())),
@@ -2176,6 +4323,15 @@ async fn tree_to_files(
 // ----------------------------------------------------------------------
 // value helpers
 // ----------------------------------------------------------------------
+
+/// The name of a stored tree that a commit's lazy `files` carry
+/// (`ThunkVal::tree`): its tree ids, one per term of a conflicted tree. The
+/// list `tree_to_files` makes depends on nothing else, so two trees of one
+/// name list the same entries.
+fn tree_name(tree: &MergedTree) -> String {
+    let ids: Vec<String> = tree.tree_ids().iter().map(|id| id.hex()).collect();
+    ids.join(",")
+}
 
 fn commit_id_of(commit: &Value) -> Result<String, Crash> {
     match commit.field("id")? {
@@ -2233,13 +4389,17 @@ fn build_subtree(
     entries: &EntryCache,
 ) -> Result<Value, OpenError> {
     // the files list is lazy (§7.2): most commits are never inspected, so
-    // their file entries are materialized only on first `field("files")`
+    // their file entries are materialized only on first `field("files")`.
+    // Tagged with the change id, it tells the renderer when the O(1)
+    // `has_conflict`/`is_empty` answers still describe the commit's files;
+    // named by its tree, it lets persistence compare it unread (§7.5)
     let files_thunk = {
         let store = store.clone();
         let tree = rec.commit.tree();
+        let name = Some(tree_name(&tree));
         let cache = cache.clone();
         let entries = entries.clone();
-        Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+        Value::Thunk(Rc::new(crate::value::ThunkVal::stored(rec.change_id.clone(), name, move || {
             let files = block_on(tree_to_files(&store, &tree, &cache, &entries))?;
             Ok(Value::list(files))
         })))
@@ -2296,4 +4456,45 @@ fn sort_subtree(subtree: &mut Value, vis: &VisibleRepo) {
     });
     let root = subtree.field("root").expect("subtree has a root");
     *subtree = Value::record(&[("children", Value::list(kids)), ("root", root)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jj_lib::backend::SymlinkId;
+    use jj_lib::conflict_labels::ConflictLabels;
+
+    #[test]
+    fn a_description_names_its_terms_whatever_their_labels_and_the_sides_that_cancel() {
+        // what a checkout writes for a symlink/file conflict of five terms,
+        // and for the three it simplifies to, which a snapshot may write
+        // without writing the file again (§7.4)
+        let link = Some(TreeValue::Symlink(SymlinkId::new(vec![1; 20])));
+        let file = |n: u8| {
+            let id = FileId::new(vec![n; 20]);
+            Some(TreeValue::File { id, executable: false, copy_id: CopyId::placeholder() })
+        };
+        let five = Merge::from_vec(vec![link.clone(), link.clone(), file(2), file(1), link.clone()]);
+        let three = five.simplify();
+        assert_eq!(three.num_sides(), 2);
+        let unlabeled = ConflictLabels::unlabeled();
+        let written = five.describe(&unlabeled);
+        let simpler = three.describe(&unlabeled);
+        assert_ne!(written, simpler);
+        let terms = described_terms(simpler.as_bytes());
+        assert!(terms.is_some());
+        assert_eq!(described_terms(written.as_bytes()), terms);
+        let names = ["left (one)", "base", "middle", "base 2", "right"];
+        let labels = ConflictLabels::from_vec(names.iter().map(|n| n.to_string()).collect());
+        let labelled = five.describe(&labels);
+        assert!(labelled.contains(" (left (one))\n"), "{}", labelled);
+        assert_eq!(described_terms(labelled.as_bytes()), terms);
+        // other sides, and text that is no description, are no such conflict
+        let other = Merge::from_vec(vec![link.clone(), file(1), file(3)]).describe(&unlabeled);
+        assert!(described_terms(other.as_bytes()).is_some_and(|t| Some(t) != terms));
+        assert_eq!(described_terms(b"resolved\n"), None);
+        assert_eq!(described_terms(written.replace("Conflict:", "CONFLICT:").as_bytes()), None);
+        assert_eq!(described_terms(written.trim_end().as_bytes()), None);
+        assert_eq!(described_terms(format!("{}  Adding file with id 0101 and more\n", written).as_bytes()), None);
+    }
 }

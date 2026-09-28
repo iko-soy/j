@@ -2,7 +2,7 @@
 
 use crate::ast::TypeExpr;
 use crate::value::{PrimKind, ShapeKind, ShapeVal, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Default, Clone)]
 pub struct Shapes {
@@ -67,18 +67,13 @@ impl Shapes {
     }
 
     fn shape_of_type(&self, ty: &TypeExpr) -> Option<ShapeKind> {
-        match ty {
-            TypeExpr::Con(n) => {
-                if is_primitive(n) {
-                    let s = self.shape_of(n)?;
-                    Some(s.kind)
-                } else if let Some(decl) = self.decls.get(n) {
-                    // resolve the alias now that all decls are present
-                    self.shape_of_type(decl)
-                } else {
-                    Some(ShapeKind::Aliased(n.clone()))
-                }
-            }
+        // an alias takes its type's shape (§4.12); `unfold` is bounded, so a
+        // cycle of aliases (`Self = Self`) ends on a name like any other
+        match self.unfold(ty) {
+            TypeExpr::Con(n) if is_primitive(n) => self.shape_of(n).map(|s| s.kind),
+            // undeclared, a type variable, or an alias cycle: not a usable
+            // shape, and a crash when used (§4.12)
+            TypeExpr::Con(_) => None,
             TypeExpr::Record(fields) => Some(ShapeKind::Record(
                 fields.iter().map(|(n, _)| n.clone()).collect(),
             )),
@@ -106,23 +101,6 @@ impl Shapes {
         }
         cur
     }
-
-    /// Unfold an alias chain, owned, so it works with partially-populated
-    /// decl maps too.
-    pub fn unfold_owned(&self, ty: &TypeExpr) -> TypeExpr {
-        match ty {
-            TypeExpr::Con(n) => {
-                if is_primitive(n) || is_type_var(n) {
-                    return ty.clone();
-                }
-                match self.decls.get(n) {
-                    Some(decl) => self.unfold_owned(decl),
-                    None => ty.clone(),
-                }
-            }
-            _ => ty.clone(),
-        }
-    }
 }
 
 fn is_primitive(n: &str) -> bool {
@@ -145,6 +123,10 @@ pub struct Contract {
 pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
     let mut params = Vec::new();
     let mut cur = ty;
+    // an alias met again on this walk refers to itself (`Stream = Int ->
+    // Stream`, or `A = B` with `B = A`) and would unfold forever; the walk
+    // stops there, and the result is checked as that alias
+    let mut unfolded: HashSet<&str> = HashSet::new();
     loop {
         match cur {
             TypeExpr::Fun(a, b) => {
@@ -153,7 +135,7 @@ pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
             }
             TypeExpr::Con(n) => {
                 // alias of a function type is unfolded (§4.13)
-                if !is_primitive(n) && !is_type_var(n) {
+                if !is_primitive(n) && !is_type_var(n) && unfolded.insert(n.as_str()) {
                     if let Some(decl) = shapes.decls.get(n) {
                         cur = decl;
                         continue;
@@ -293,10 +275,10 @@ impl ContractExpr {
         match self {
             ContractExpr::Unknown => None,
             ContractExpr::Known { contract, at } => contract.params.get(*at).cloned(),
-            ContractExpr::Compose(f, g) => g
-                .next_param()
-                .or_else(|| f.next_param())
-                .or_else(|| f.result_after()),
+            // (f . g) x = f (g x) (§4.9): the argument is g's, even when
+            // g's contract is unknown or used up, and f's own contract
+            // checks what g returns when it is applied to it
+            ContractExpr::Compose(_, g) => g.next_param(),
             ContractExpr::ApplyFirst(e) => {
                 let advanced = ContractExpr::apply_first(e.clone());
                 advanced.next_param()
@@ -378,11 +360,30 @@ impl ContractExpr {
         }
     }
 
-    /// True if the next parameter is definitely a function type.
-    pub fn next_param_is_function(&self, shapes: &Shapes) -> bool {
-        match self.next_param() {
-            Some(t) => matches!(shapes.unfold(&t), TypeExpr::Fun(_, _)),
-            None => false,
+    /// The 0-based position of the next argument among those the signature
+    /// lists, when known. Messages number arguments by the signature (§4.13:
+    /// "describe expected Text as argument 1"), not by what the function
+    /// value already holds: `tree`, which is `treeWith` applied to its
+    /// options, takes its argument 1, and so does `squash`, a composition.
+    pub fn position(&self) -> Option<usize> {
+        match self {
+            ContractExpr::Known { at, .. } => Some(*at),
+            ContractExpr::Compose(_, g) => g.position(),
+            _ => None,
+        }
+    }
+
+    /// True when both are the same signature at the same position, so that
+    /// checking against one after the other repeats every check: the same
+    /// definition's contract, advanced as far. Only a known signature is
+    /// compared; any other is never the same.
+    pub fn same_as(&self, other: &ContractExpr) -> bool {
+        match (self, other) {
+            (
+                ContractExpr::Known { contract: a, at: i },
+                ContractExpr::Known { contract: b, at: j },
+            ) => Rc2::ptr_eq(a, b) && i == j,
+            _ => false,
         }
     }
 

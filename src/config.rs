@@ -40,7 +40,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
     "replay", "unresolved", "blob", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
-    "extract", "touchedPaths",
+    "extract", "touchedPaths", "subtreeCommits",
 ];
 
 pub fn is_reserved_builtin(name: &str) -> bool {
@@ -53,6 +53,8 @@ pub fn reserved_set() -> BTreeSet<String> {
 
 /// Parse and validate config.j (§6.2). Id literals are resolved separately.
 pub fn load_config(src: &str) -> Result<Config, ConfigError> {
+    // the builtins only: config.j's binders may reuse its own top-level
+    // names (§4.2), as the reference config's `\files ->` does
     let outer = Rc::new(reserved_set());
     let items = parse_config(src, outer).map_err(ConfigError::Parse)?;
     validate_items(items)
@@ -95,39 +97,24 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     }
 
     // pair signatures with definitions; a signature must immediately precede
-    // its definition (blank lines/comments fine — items between are not)
-    let mut prev_sig: Option<String> = None;
-    for item in &items {
-        match item {
-            Item::Signature(name, _, _) => {
-                prev_sig = Some(name.clone());
-            }
-            Item::Definition(name, _, _) => {
-                if let Some(s) = &prev_sig {
-                    if s != name {
-                        // signature not immediately followed by its definition
-                        if def_names.contains(s) {
-                            return verr(format!(
-                                "the signature for `{}` is not immediately followed by its definition",
-                                s
-                            ));
-                        }
-                    }
-                }
-                prev_sig = None;
-            }
-            Item::TypeDecl(_, _) => {
-                prev_sig = None;
+    // its definition (blank lines/comments fine — items between are not, a
+    // typedecl or another signature included). A builtin's signature has no
+    // definition, so any item, or the end of the file, may follow it.
+    let mut prev_sig: Option<&String> = None;
+    for item in items.iter().map(Some).chain([None]) {
+        if let Some(s) = prev_sig {
+            let paired = matches!(item, Some(Item::Definition(name, _, _)) if name == s);
+            if !paired && def_names.contains(s) {
+                return verr(format!(
+                    "the signature for `{}` is not immediately followed by its definition",
+                    s
+                ));
             }
         }
-    }
-    if let Some(s) = &prev_sig {
-        if def_names.contains(s) {
-            return verr(format!(
-                "the signature for `{}` is not immediately followed by its definition",
-                s
-            ));
-        }
+        prev_sig = match item {
+            Some(Item::Signature(name, _, _)) => Some(name),
+            _ => None,
+        };
     }
 
     let mut builtin_names: HashSet<String> = HashSet::new();
@@ -179,7 +166,25 @@ fn validate_items(items: Vec<Item>) -> Result<Config, ConfigError> {
     })
 }
 
-/// topological order by references outside lambdas (§4.1)
+/// Evaluation order of the definitions (§4.1).
+///
+/// References outside lambdas decide it, and only they can form a cycle;
+/// ready definitions are taken in name order. That alone can apply a
+/// function at load before a definition its body refers to (`opts = mk 1`
+/// with `mk = \d -> { lanes = lanes }` and `lanes` still waiting), an unbound
+/// name with no cycle anywhere. So the definitions are then grouped into the
+/// strongly connected components of all references, lambda bodies included,
+/// and the groups evaluated referenced first, the members of each in the
+/// first order, save that a member which cannot apply a function of its group
+/// at load goes first: one that refers to the group only inside lambdas it
+/// stores (`env = { lanes = 3, header = \_ -> out }`, with `out = render 1`
+/// and `render = \x -> env.lanes`). Such a member looks up only earlier
+/// groups and builtins, and every other definition keeps its place among the
+/// rest, so each still follows its references outside lambdas; and since
+/// evaluating one looks up only names it reaches by references, whatever the
+/// first order had bound in time still is (a lookup that came too early, its
+/// crash caught by `or`, may now find its name). Among members that can apply
+/// a function of their group, the first order may still apply one too early.
 fn dependency_order(
     defs: &HashMap<String, Rc<Expr>>,
 ) -> Result<Vec<(String, Rc<Expr>)>, ConfigError> {
@@ -194,7 +199,7 @@ fn dependency_order(
     let mut done: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = defs.keys().cloned().collect();
     names.sort();
-    loop {
+    while done.len() < names.len() {
         let mut progress = false;
         for n in &names {
             if done.contains(n) {
@@ -206,14 +211,285 @@ fn dependency_order(
                 progress = true;
             }
         }
-        if done.len() == names.len() {
-            return Ok(ordered);
-        }
         if !progress {
             return Err(ConfigError::Validation(
                 "config.j: a cycle among top-level definitions".into(),
             ));
         }
+    }
+    let position: HashMap<&str, usize> =
+        ordered.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+    let edges: Vec<Vec<usize>> = ordered
+        .iter()
+        .map(|(n, e)| {
+            let mut free = deps[n].clone();
+            e.free_vars(&mut Vec::new(), &mut free);
+            free.iter().filter_map(|n| position.get(n.as_str()).copied()).collect()
+        })
+        .collect();
+    let order = group_order(&edges, |group, p| {
+        let (n, e) = &ordered[p];
+        let mut eager = deps[n].clone();
+        applied_refs(e, true, &mut Vec::new(), &mut eager);
+        !eager
+            .iter()
+            .filter_map(|d| position.get(d.as_str()))
+            .any(|q| group.binary_search(q).is_ok())
+    });
+    Ok(order.into_iter().map(|p| ordered[p].clone()).collect())
+}
+
+/// Positions in a first order regrouped for evaluation (§4.1): the strongly
+/// connected components of `edges`, each after every one it has an edge
+/// into, and inside a component of several, first the members for which
+/// `early` holds, given the component (sorted) and the member, then the
+/// others, each part in the first order.
+fn group_order(edges: &[Vec<usize>], early: impl Fn(&[usize], usize) -> bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(edges.len());
+    for mut group in components(edges) {
+        group.sort_unstable();
+        if group.len() > 1 {
+            let (front, rest): (Vec<usize>, Vec<usize>) =
+                group.iter().partition(|&&p| early(&group, p));
+            group = front;
+            group.extend(rest);
+        }
+        out.extend(group);
+    }
+    out
+}
+
+/// The strongly connected components of a graph given as adjacency lists,
+/// each listed after every component it has an edge into (Tarjan's
+/// algorithm, on an explicit stack so a long chain of definitions cannot
+/// overflow the native one).
+fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = edges.len();
+    let (mut index, mut low, mut on_stack) = (vec![UNSEEN; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next) = (Vec::new(), Vec::new(), 0);
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        // (vertex, how many of its edges have been followed)
+        let mut work = vec![(root, 0)];
+        while let Some(&(v, i)) = work.last() {
+            if i == 0 {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = edges[v].get(i) {
+                work.last_mut().unwrap().1 = i + 1;
+                if index[w] == UNSEEN {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    group.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(group);
+            }
+        }
+    }
+    out
+}
+
+/// Evaluation order of the bindings of a `let` block (§4.1), as indices into
+/// them, or `None` when references outside lambdas form a cycle.
+///
+/// The rule is `dependency_order`'s, with ready bindings taken in source
+/// order: a binding follows every binding it refers to outside a lambda; the
+/// bindings are then grouped by all their references, and inside a group
+/// those that cannot apply a function of it go first, so that a function
+/// applied in a binding finds the bindings its body refers to. That order is
+/// the source order when every reference is to an earlier binding, or from
+/// inside a lambda to its own, as in nearly every block, which is so taken
+/// without the sorting: this runs each time a block is evaluated.
+pub(crate) fn let_order(bs: &[(String, Rc<Expr>)]) -> Option<Vec<usize>> {
+    let refs: Vec<Vec<(usize, bool)>> = bs
+        .iter()
+        .map(|(_, e)| {
+            let mut out = Vec::new();
+            binding_refs(e, bs, false, &mut out);
+            out
+        })
+        .collect();
+    let in_order =
+        |i: usize, r: &[(usize, bool)]| r.iter().all(|&(j, outside)| j < i || (j == i && !outside));
+    if refs.iter().enumerate().all(|(i, r)| in_order(i, r)) {
+        return Some((0..bs.len()).collect());
+    }
+    let mut ordered = Vec::with_capacity(bs.len());
+    let mut done = vec![false; bs.len()];
+    while ordered.len() < bs.len() {
+        let mut progress = false;
+        for i in 0..bs.len() {
+            if !done[i] && refs[i].iter().all(|&(j, outside)| !outside || done[j]) {
+                done[i] = true;
+                ordered.push(i);
+                progress = true;
+            }
+        }
+        if !progress {
+            return None;
+        }
+    }
+    let mut position = vec![0; bs.len()];
+    for (p, &i) in ordered.iter().enumerate() {
+        position[i] = p;
+    }
+    let edges: Vec<Vec<usize>> = ordered
+        .iter()
+        .map(|&i| refs[i].iter().map(|&(j, _)| position[j]).collect())
+        .collect();
+    let order = group_order(&edges, |group, p| {
+        let i = ordered[p];
+        let mut applied = BTreeSet::new();
+        applied_refs(&bs[i].1, true, &mut Vec::new(), &mut applied);
+        let in_group = |j: usize| group.binary_search(&position[j]).is_ok();
+        !refs[i].iter().any(|&(j, outside)| outside && in_group(j))
+            && !bs.iter().enumerate().any(|(j, (b, _))| applied.contains(b) && in_group(j))
+    });
+    Some(order.into_iter().map(|p| ordered[p]).collect())
+}
+
+/// Record the references in `e` to the names a `let` block binds, as indices
+/// into its bindings `bs`, each with whether it lies outside every lambda,
+/// where evaluating `e` needs that binding's value (§4.1). No binder inside
+/// the block may reuse one of its names (§4.2), so every occurrence is one.
+fn binding_refs(
+    e: &Expr,
+    bs: &[(String, Rc<Expr>)],
+    in_lambda: bool,
+    out: &mut Vec<(usize, bool)>,
+) {
+    let mut sub = |e: &Expr| binding_refs(e, bs, in_lambda, out);
+    match e {
+        Expr::Var(n) => {
+            if let Some(j) = bs.iter().position(|(b, _)| b == n) {
+                out.push((j, !in_lambda));
+            }
+        }
+        // `%main` is `labelled "main"` (§4.11), and in config.j a block may
+        // bind `labelled` (§4.2)
+        Expr::LabelLit(_) => {
+            if let Some(j) = bs.iter().position(|(b, _)| b == "labelled") {
+                out.push((j, !in_lambda));
+            }
+        }
+        Expr::Lambda(_, body, _) => binding_refs(body, bs, true, out),
+        Expr::If(a, b, c) => {
+            sub(a);
+            sub(b);
+            sub(c);
+        }
+        Expr::Let(inner, body) => {
+            for (_, e) in inner {
+                sub(e);
+            }
+            sub(body);
+        }
+        Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Or(a, b) => {
+            sub(a);
+            sub(b);
+        }
+        Expr::Select(a, _) | Expr::Paren(a) => sub(a),
+        Expr::Update(a, fs) => {
+            sub(a);
+            for (_, v) in fs {
+                sub(v);
+            }
+        }
+        Expr::Record(fs) => {
+            for (_, v) in fs {
+                sub(v);
+            }
+        }
+        Expr::List(es) => {
+            for e in es {
+                sub(e);
+            }
+        }
+        Expr::TypeName(_)
+        | Expr::Int(_)
+        | Expr::Text(_)
+        | Expr::IdLit(_)
+        | Expr::Id(_)
+        | Expr::NewId
+        | Expr::PathLit(_)
+        | Expr::Bool(_)
+        | Expr::SelectorFun(_)
+        | Expr::Crash => {}
+    }
+}
+
+/// Record the free names of the lambdas that evaluating `e` may apply
+/// (§4.1): every lambda outside the others, save where its value is only
+/// stored, which is `e` itself when `stored`, and a record field, list
+/// element, `if` branch or `let` body of such a place. `bound` holds the
+/// `let` names in scope, which in config.j may reuse a top-level name (§4.2).
+fn applied_refs(e: &Expr, stored: bool, bound: &mut Vec<String>, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Lambda(_, _, _) => {
+            if !stored {
+                e.free_vars(bound, out);
+            }
+        }
+        Expr::Paren(a) => applied_refs(a, stored, bound, out),
+        Expr::If(c, a, b) => {
+            applied_refs(c, false, bound, out);
+            applied_refs(a, stored, bound, out);
+            applied_refs(b, stored, bound, out);
+        }
+        Expr::Let(bs, body) => {
+            let start = bound.len();
+            bound.extend(bs.iter().map(|(n, _)| n.clone()));
+            for (_, b) in bs {
+                applied_refs(b, false, bound, out);
+            }
+            applied_refs(body, stored, bound, out);
+            bound.truncate(start);
+        }
+        Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Or(a, b) => {
+            applied_refs(a, false, bound, out);
+            applied_refs(b, false, bound, out);
+        }
+        Expr::Select(a, _) => applied_refs(a, false, bound, out),
+        Expr::Update(a, fs) => {
+            applied_refs(a, false, bound, out);
+            for (_, v) in fs {
+                applied_refs(v, stored, bound, out);
+            }
+        }
+        Expr::Record(fs) => {
+            for (_, v) in fs {
+                applied_refs(v, stored, bound, out);
+            }
+        }
+        Expr::List(es) => {
+            for e in es {
+                applied_refs(e, stored, bound, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -276,6 +552,10 @@ fn load_deps(e: &Expr, out: &mut BTreeSet<String>) {
                 load_deps(e, out);
             }
         }
+        // `%main` is `labelled "main"` (§4.11), evaluated where it stands
+        Expr::LabelLit(_) => {
+            out.insert("labelled".to_string());
+        }
         _ => {}
     }
 }
@@ -304,29 +584,34 @@ pub fn eval_config(interp: &mut Interp, cfg: &Config) -> Result<(), Crash> {
         }
     }
     interp.globals = Env::with_globals(globals);
+    // a definition executes while its lambda's body runs (§1.4)
+    for (name, expr) in &cfg.defs {
+        interp.name_bodies(name, expr);
+    }
     // evaluate definitions in dependency order, through one recursive frame so
     // top-level definitions are mutually recursive (§4.1)
-    let (genv, cell) = interp.globals.extend_rec();
+    let names: Rc<[String]> = cfg.defs.iter().map(|(name, _)| name.clone()).collect();
+    let (genv, cell) = interp.globals.extend_rec(names);
     for (name, expr) in &cfg.defs {
         *interp.current_def.borrow_mut() = Some(name.clone());
         let v = interp.eval(expr, &genv)?;
-        // value-level contract for non-function definitions
+        // the value itself, one level deep, against the whole signature
+        // (§4.13): under a function type, including an alias of one, it must
+        // be a function, however it was built (`conflicts : Revset` is a
+        // partial application, `myEdit : Edit` with `myEdit = 5` is refused)
         if let Some(ty) = cfg.sigs.get(name) {
-            let c = compile_contract(&interp.shapes, ty);
-            if c.params.is_empty() {
-                if let Err(msg) = crate::shape::check(&interp.shapes, &c.result, &v) {
-                    return Err(Crash::new(format!("contract: {}: {}", name, msg)));
-                }
+            if let Err(msg) = crate::shape::check(&interp.shapes, ty, &v) {
+                return Err(Crash::new(format!("contract: {}: {}", name, msg)));
             }
         }
-        cell.borrow_mut().push((name.clone(), v.clone()));
+        cell.borrow_mut().push(v.clone());
         // attach the definition's name and contract to its function value so
         // applications are checked (§4.13) and errors name the definition
         if let Some(ty) = cfg.sigs.get(name) {
             let contract = Rc::new(compile_contract(&interp.shapes, ty));
             let named = crate::value::attach_pending(&v, name, contract);
             let last = cell.borrow_mut().len() - 1;
-            cell.borrow_mut()[last] = (name.clone(), named);
+            cell.borrow_mut()[last] = named;
         }
     }
     interp.globals = genv;

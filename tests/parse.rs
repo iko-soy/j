@@ -97,6 +97,23 @@ fn sections() {
 }
 
 #[test]
+fn section_with_operators_on_both_sides_rejected() {
+    // `(op e op)` matches no production (§3.4). The trailing operator must
+    // be an error, not dropped, and must not survive to turn the next
+    // parenthesised expression into a left section
+    assert!(perr("(- 1 +)").contains("section"));
+    assert!(perr("((- 1 +)) 10").contains("section"));
+    assert!(perr("(id (- 1 +)) 10").contains("section"));
+    assert!(perr("[(- 1 +) (2 * 3)]").contains("section"));
+    match parse_config("bad = (- 1 +)\nsix = (2 * 3)\n", outer()) {
+        Ok(items) => panic!("accepted {:?}", items),
+        Err(e) => assert!(e.msg.contains("section"), "{}", e.msg),
+    }
+    // well-formed sections next to each other are unaffected
+    assert_eq!(r(&p("[(1 -) (+ 2) (3)]")).matches("->").count(), 2);
+}
+
+#[test]
 fn lists_and_records() {
     assert_eq!(r(&p("[1 2 3]")), "[1 2 3]");
     assert_eq!(r(&p("[]")), "[]");
@@ -144,6 +161,59 @@ fn shadowing_rejected() {
     assert!(perr("\\map -> map").contains("shadow"));
     // same name twice in one let
     assert!(perr("let x = 1; x = 2 in x").contains("shadow") || true);
+}
+
+#[test]
+fn local_shadowing_rejected() {
+    // §4.2: a name bound by an enclosing lambda or let may not be bound
+    // again inside it, not only a top-level or builtin name
+    for src in [
+        "\\x -> \\x -> x",
+        "\\x x -> x",
+        "\\x _ x -> x",
+        "let a = 1 in let a = 2 in a",
+        "let x = 1 in \\x -> x",
+        "\\x -> let x = 1 in x",
+        "let x = 1 in let f = \\x -> x in f 2", // docs/language.md
+        "\\y -> (\\z -> \\y -> z)",
+        // a binding is in scope in its own expression and in every other
+        // binding of its block, later ones included (§4.1)
+        "let f = \\f -> f in f",
+        "let a = \\b -> b; b = 2 in a 1",
+        "let a = (let c = \\b -> b in c); b = 2 in a",
+        "let a = 1\n    b = \\a -> a\nin b",
+    ] {
+        let m = perr(src);
+        assert!(m.contains("already bound") && m.contains("shadow"), "{:?}: {}", src, m);
+    }
+    // the error names the inner binder and its line
+    match parse_config("f = \\x ->\n  let y = 1\n      x = 2\n  in y\n", outer()) {
+        Ok(_) => panic!("`x` rebound inside `\\x` must fail"),
+        Err(e) => {
+            assert!(e.msg.contains("`x`"), "{}", e.msg);
+            assert_eq!(e.line, 3);
+        }
+    }
+    match parse_config("f =\n  let a = \\b ->\n        b\n      b = 2\n  in a\n", outer()) {
+        Ok(_) => panic!("`\\b` inside the block that binds `b` must fail"),
+        Err(e) => {
+            assert!(e.msg.contains("`b`"), "{}", e.msg);
+            assert_eq!(e.line, 2);
+        }
+    }
+}
+
+#[test]
+fn disjoint_scopes_may_reuse_a_name() {
+    // only an enclosing binder counts: siblings and scopes that have ended
+    // do not
+    p("(\\x -> x) (\\x -> x)");
+    p("\\_ _ -> 1");
+    p("let a = \\x -> x; b = \\x -> x in a");
+    p("(let t = 1 in t) + (let t = 2 in t)");
+    p("let f = (let x = 1 in \\y -> x + y); g = \\x -> f x in g 100");
+    p("map (+ 1) (map (1 +) [1])");
+    cfg("f = \\x -> x\ng = \\x -> let y = x in y\nh = let y = 1 in y\n");
 }
 
 #[test]
@@ -230,9 +300,118 @@ fn comments_ignored_in_config() {
 }
 
 #[test]
+fn block_comment_within_a_line_is_whitespace() {
+    // §3.1: a `{- -}` that stays on its line does not break it, so it may
+    // sit wherever a space may
+    assert_eq!(r(&p("r {- c -} .a")), "r.a");
+    assert!(matches!(p("r {- c -} { a = 2 }"), Expr::Update(_, _)));
+    assert_eq!(r(&p("[r {- c -} .a]")), "[r.a]");
+    assert!(matches!(p("let a {- c -} = 1 in a"), Expr::Let(_, _)));
+    assert!(matches!(p("\\x {- c -} -> x"), Expr::Lambda(ref ps, _, _) if ps.len() == 1));
+    assert_eq!(r(&p("{ a {- c -} = 1 }")), "{ a = 1 }");
+    assert!(matches!(p("( {- c -} + 1)"), Expr::Lambda(_, _, _)));
+    let items = cfg("f {- c -} = 1\ng {- c -} : Int\n(++) {- c -} : m -> m -> m\n");
+    assert_eq!(items.len(), 3);
+    // one spanning lines still ends the line it started on (§3.3)
+    let e = p("let\n  x = 1 {- a\n-}\n  y = 2\nin y");
+    assert!(matches!(e, Expr::Let(ref bs, _) if bs.len() == 2));
+    assert_eq!(cfg("x = f {- a\n-}\ny = 2\n").len(), 2);
+}
+
+#[test]
+fn a_line_break_ends_a_postfix_chain() {
+    // §3.3 rule 3: a selector or `{` that begins a continuation line starts
+    // the next argument or list element instead of extending the `postfix`
+    // before it; `show`'s wide list of records relies on this (§5.2)
+    assert_eq!(r(&p("r\n  .a")), "r (.a)");
+    assert_eq!(r(&p("r\n  { a = 2 }")), "r ({ a = 2 })");
+    assert_eq!(r(&p("f r\n  .a")), "(f (r)) (.a)");
+    assert!(matches!(p("[r\n  { a = 2 }]"), Expr::List(ref es) if es.len() == 2));
+    assert!(matches!(p("[{ a = 1 }\n  { a = 2 }]"), Expr::List(ref es) if es.len() == 2));
+    assert_eq!(r(&p("let y = r\n      .a\nin y")), "let y = r (.a) in y");
+    match &cfg("x = f\n  .a\n")[..] {
+        [Item::Definition(n, e, _)] => assert_eq!((n.as_str(), r(e).as_str()), ("x", "f (.a)")),
+        other => panic!("expected one definition, got {:?}", other),
+    }
+    // a comment that ends the line ends the chain too (§3.1)
+    assert_eq!(r(&p("r -- c\n  .a")), "r (.a)");
+    assert_eq!(r(&p("r {- c\n -} .a")), "r (.a)");
+    // on one line the chain continues, spaces or not
+    assert_eq!(r(&p("r .a { b = 1 }")), "r.a { b = 1 }");
+}
+
+#[test]
 fn multiline_signature_arrow() {
     let items = cfg("f : Int\n  -> Int\nf = \\x -> x\n");
     assert!(matches!(&items[0], Item::Signature(n, _, _) if n == "f"));
+}
+
+#[test]
+fn indented_lines_continue_signatures_and_typedecls() {
+    // §3.3 rule 1 holds for every item, not only definitions: a line that
+    // starts past column 1 continues it, wherever the line break falls
+    let items = cfg("f : Int ->\n  Int\nf = \\x -> x\n");
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0], Item::Signature(n, TypeExpr::Fun(_, _), _) if n == "f"));
+    match &cfg("Foo =\n  { a : Int }\n")[0] {
+        Item::TypeDecl(n, TypeExpr::Record(fs)) => assert!(n == "Foo" && fs.len() == 1),
+        other => panic!("expected a record typedecl, got {:?}", other),
+    }
+    for src in [
+        "f :\n  Int -> Int\n",
+        "f\n  : Int -> Int\n",
+        "(++) :\n  m -> m -> m\n",
+        "(++)\n  : m -> m -> m\n",
+        "f : [\n  Int\n  ]\n",
+        "f : (Int\n  -> Int)\n",
+        "Foo\n  = Int\n",
+        "Foo = {\n  a : Int\n  , b : Int\n  }\n",
+        "Foo = { a\n  : Int }\n",
+        "x\n  = 1\n",
+    ] {
+        match parse_config(src, outer()) {
+            Ok(items) => assert_eq!(items.len(), 1, "{:?}", src),
+            Err(e) => panic!("{:?}: line {}: {}", src, e.line, e.msg),
+        }
+    }
+}
+
+#[test]
+fn a_column_1_line_never_continues_an_item() {
+    // §3.3 rule 1: a token in column 1 begins the next item, so each of
+    // these is malformed, though it is one item with that line indented
+    for src in [
+        "f : Int\n-> Int\n",
+        "f\n: Int\n",
+        "(++)\n: m -> m -> m\n",
+        "Foo\n= Int\n",
+        "Foo\n\n= Int\n",
+        "Foo = { a : Int\n, b : Int }\n",
+        "Foo = { a : Int\n}\n",
+        "Foo = { a\n: Int }\n",
+        "x = let a = 1\nin a\n",
+        "x = let a = 1\n\nin a\n",
+    ] {
+        assert!(parse_config(src, outer()).is_err(), "{:?} parsed", src);
+    }
+}
+
+#[test]
+fn a_later_line_in_closes_a_let_only_within_its_layout() {
+    // an `in` that begins a line obeys layout like any other token (§3.3):
+    // in a binding of an outer let it closes the inner let only when it is
+    // indented past the outer block's column
+    let e = p("let a = let b = 1\n        in b\nin a");
+    assert!(matches!(&e, Expr::Let(bs, _) if matches!(*bs[0].1, Expr::Let(_, _))));
+    let msg = perr("let a = let b = 1\n    in b\nin a");
+    assert!(msg.contains("indented past column 5"), "{}", msg);
+    // in a definition it is under rule 1; in a lone expression it is not
+    assert_eq!(cfg("x = let a = 1\n  in a\n").len(), 1);
+    match parse_config("x = let a = 1\nin a\n", outer()) {
+        Ok(_) => panic!("`in` in column 1 continued a definition"),
+        Err(e) => assert!(e.msg.contains("indented past column 1"), "{}", e.msg),
+    }
+    assert!(matches!(p("let a = 1\nin a"), Expr::Let(_, _)));
 }
 
 #[test]
@@ -257,4 +436,139 @@ fn render_roundtrip_simple_exprs() {
             .unwrap_or_else(|err| panic!("re-parse of {:?} (from {:?}) failed: {}", rendered, src, err.msg));
         assert_eq!(render_expr(&e2), rendered, "for {:?}", src);
     }
+}
+
+/// Run `f` on a thread with the binary's worker stack (main.rs): the parser's
+/// depth bound is sized against that stack, not the test harness's default.
+fn on_worker_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
+    // §1.4: bad input exits 3 with one `j:` line. The parser is recursive
+    // descent, so it bounds its depth rather than overflow the stack.
+    on_worker_stack(|| {
+        let n = 100_000;
+        for src in [
+            format!("{}1{}", "(".repeat(n), ")".repeat(n)),
+            "(".repeat(n),
+            format!("{}{}", "[".repeat(n), "]".repeat(n)),
+            format!("{}1{}", "{ a = ".repeat(n), " }".repeat(n)),
+            format!("x{}", " { a = x".repeat(n)),
+            format!("{}1{}", "(+ ".repeat(n), ")".repeat(n)),
+            // distinct names, since shadowing is an error of its own (§4.2)
+            format!("{}1", (0..n).map(|k| format!("\\x{} -> ", k)).collect::<String>()),
+            format!("{}1", "if true then 1 else ".repeat(n)),
+            format!("{}1", (0..n).map(|k| format!("let a{} = 1 in ", k)).collect::<String>()),
+            format!("{}[]", "1 :: ".repeat(n)),
+            format!("{}true", "true or ".repeat(n)),
+        ] {
+            let msg = perr(&src);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &src[..20], msg);
+        }
+        let deep_type = format!("f : {}Int{}\n", "[".repeat(n), "]".repeat(n));
+        match parse_config(&deep_type, outer()) {
+            Ok(_) => panic!("a type nested {} deep parsed", n),
+            Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+        }
+        // nesting far beyond anything written by hand still parses
+        let m = 2_000;
+        p(&format!("{}1{}", "(".repeat(m), ")".repeat(m)));
+        p(&format!("{}{}", "[".repeat(m), "]".repeat(m)));
+        p(&format!("{}[]", "1 :: ".repeat(m)));
+        cfg(&format!("f : {}Int{}\n", "[".repeat(m), "]".repeat(m)));
+    });
+}
+
+#[test]
+fn long_left_chains_are_bounded_like_nesting() {
+    // §3.4: the parser builds a left-associative chain in a loop, not by
+    // recursion, but its tree is as tall as the chain is long, and every
+    // pass over the tree after the parse (and dropping it) recurses on that
+    // height. So a chain past the bound is a parse error too, and so is one
+    // that reaches past it only together with the chains it is nested in.
+    on_worker_stack(|| {
+        let n = 1_000_000;
+        let (k, m) = (100, 10_000);
+        let mut chains = "1".to_string();
+        for _ in 0..k {
+            chains = format!("({}{})", chains, " + 1".repeat(m));
+        }
+        for src in [
+            format!("1{}", " + 1".repeat(n)),
+            format!("f{}", " x".repeat(n)),
+            format!("x{}", ".a".repeat(n)),
+            format!("x{}", " { a = 1 }".repeat(n)),
+            chains,
+        ] {
+            let msg = perr(&src);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &src[..20], msg);
+        }
+        for src in [format!("f = 1{}\n", " + 1".repeat(n)), format!("f = g{}\n", " x".repeat(n))] {
+            match parse_config(&src, outer()) {
+                Ok(_) => panic!("a chain {} long parsed in config.j", n),
+                Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+            }
+        }
+        // chains far longer than anything written by hand still parse
+        p(&format!("1{}", " + 1".repeat(m)));
+        p(&format!("f{}", " x".repeat(m)));
+        p(&format!("x{}", ".a".repeat(m)));
+        p(&format!("x{}", " { a = 1 }".repeat(m)));
+    });
+}
+
+#[test]
+fn nesting_bound_counts_levels_as_the_spec_says() {
+    // §3.4: an expression is at most 40,000 levels deep. A leaf is one
+    // level, a parenthesis or the braces of a record or update two more than
+    // what is inside, and any other construct one more than its highest
+    // part. Each case is (source nested k deep, the deepest k that parses).
+    on_worker_stack(|| {
+        const MAX: usize = 40_000;
+        let lambdas = |k: usize| (0..k).map(|i| format!("\\x{} -> ", i)).collect::<String>();
+        let subtree = |k: usize| {
+            // as `show` renders a `Subtree`, too wide for one line once it
+            // holds a commit: a record in a list broken over lines is bare,
+            // not parenthesised (§3.3), so 1 + 2 levels each. `show` indents
+            // each `, root` line further, which the parser ignores.
+            (0..k).fold("[]".to_string(), |s, _| format!("[{{ children = {}\n, root = 1 }}]", s))
+        };
+        let chained = |k: usize| format!("(1{}){}", " + 1".repeat(20_000), " + 1".repeat(k));
+        let cases: Vec<(Box<dyn Fn(usize) -> String>, usize)> = vec![
+            (Box::new(|k| format!("{}{}", "[".repeat(k), "]".repeat(k))), MAX),
+            (Box::new(|k| format!("{}1{}", "(".repeat(k), ")".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("{}1{}", "(+ ".repeat(k), ")".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("{}1{}", "{ a = ".repeat(k), " }".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("x{}", " { a = 1 }".repeat(k))), (MAX - 1) / 2),
+            (Box::new(|k| format!("1{}", " + 1".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("f{}", " x".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("x{}", ".a".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("{}[]", "1 :: ".repeat(k))), MAX - 1),
+            (Box::new(|k| format!("{}1", "if true then 1 else ".repeat(k))), MAX - 1),
+            (Box::new(move |k| format!("{}1", lambdas(k))), MAX - 1),
+            (Box::new(subtree), (MAX - 1) / 3),
+            // a chain around a parenthesised chain: 20,001 + 2 + k
+            (Box::new(chained), MAX - 20_003),
+        ];
+        for (src, k) in cases {
+            p(&src(k));
+            let deeper = src(k + 1);
+            let msg = perr(&deeper);
+            assert!(msg.contains("nested too deeply"), "{}…: {}", &deeper[..20], msg);
+        }
+        // a type in config.j: one level, and one more for each bracket
+        let ty = |k: usize| format!("f : {}Int{}\n", "[".repeat(k), "]".repeat(k));
+        cfg(&ty(MAX - 1));
+        match parse_config(&ty(MAX), outer()) {
+            Ok(_) => panic!("a type {} deep parsed", MAX + 1),
+            Err(e) => assert!(e.msg.contains("nested too deeply"), "{}", e.msg),
+        }
+    });
 }

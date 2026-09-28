@@ -36,7 +36,7 @@ fn ok(i: &mut Interp, cfg: &config::Config, src: &str) -> Value {
 
 fn crash(i: &mut Interp, cfg: &config::Config, src: &str) -> String {
     match ev(i, cfg, src) {
-        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(i, &v)),
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(i, &v).unwrap()),
         Err(m) => m,
     }
 }
@@ -48,8 +48,8 @@ macro_rules! check {
             value_eq(&got, &$want).unwrap_or(false),
             "{} => {}, want {}",
             $src,
-            j::show::show(&$i, &got),
-            j::show::show(&$i, &$want)
+            j::show::show(&$i, &got).unwrap(),
+            j::show::show(&$i, &$want).unwrap()
         );
     }};
 }
@@ -208,9 +208,22 @@ fn show_renders_literals() {
     check!(i, cfg, "show (++)", Value::text("(++)"));
     check!(i, cfg, "show Commit", Value::text("Commit"));
     check!(i, cfg, "show id", Value::text("id"));
-    // lambda shows its source
-    let v = ok(&mut i, &cfg, "show (\\x -> x + 1)");
-    assert!(v.as_text().unwrap().contains("x"), "{}", v.as_text().unwrap());
+    // lambda shows its source, exactly as written (§5.2)
+    check!(i, cfg, "show (\\x -> x + 1)", Value::text("\\x -> x + 1"));
+}
+
+#[test]
+fn show_renders_selectors() {
+    // a selector is the SELECTOR atom `.name` (§3.4), not the accessor
+    // applied to the field name it carries internally (§5.2)
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "show (.id)", Value::text(".id"));
+    check!(i, cfg, "show [(.id)]", Value::text("[(.id)]"));
+    check!(i, cfg, "show (map (.id))", Value::text("map (.id)"));
+    // and the rendering evaluates back to the same selector
+    let shown = ok(&mut i, &cfg, "show (map (.id))");
+    let src = format!("({}) [{{ id = 5 }}]", shown.as_text().unwrap());
+    check!(i, cfg, &src, ints(&[5]));
 }
 
 #[test]

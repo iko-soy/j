@@ -1,7 +1,7 @@
 //! Repo-zipper operations, the reference `by` walk (§10), and the
 //! persistence validation shared by `validate` and the jj backend (§7.5).
 
-use crate::domain::ROOT_ID;
+use crate::domain::{Backend, ROOT_ID};
 use crate::eval::Interp;
 use crate::value::{value_eq, Crash, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,43 +157,6 @@ fn up_of(repo: &Value) -> Result<Value, Crash> {
     ]))
 }
 
-fn refocus_child(repo: &Value, child: &Value) -> Result<Value, Crash> {
-    let children = repo.field("children")?;
-    let children = children.as_list()?;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    let mut found = false;
-    // match by the child's root id: ids are unique per repo (§7.5 validates
-    // this at persist time), and a deep value_eq here would compare the whole
-    // subtree — files included — making by_id quadratic in history size
-    let want_id = id_of(&child.field("root")?).ok();
-    for c in children.iter() {
-        let same = match (&want_id, id_of(&c.field("root")?).ok()) {
-            (Some(w), Some(cid)) => *w == cid,
-            _ => value_eq(c, child)?,
-        };
-        if !found && same {
-            found = true;
-        } else if !found {
-            left.push(c.clone());
-        } else {
-            right.push(c.clone());
-        }
-    }
-    let frame = Value::record(&[
-        ("left", Value::list(left)),
-        ("parent", repo.field("root")?),
-        ("right", Value::list(right)),
-    ]);
-    let mut ctx = repo.field("context")?.as_list()?.to_vec();
-    ctx.insert(0, frame);
-    Ok(Value::record(&[
-        ("children", child.field("children")?),
-        ("context", Value::list(ctx)),
-        ("root", child.field("root")?),
-    ]))
-}
-
 // ----------------------------------------------------------------------
 // tree traversal helpers over Repo values
 // ----------------------------------------------------------------------
@@ -224,14 +187,161 @@ pub fn parent_map(repo: &Value) -> Result<Vec<(String, String)>, Crash> {
     Ok(out)
 }
 
-fn parent_map_rec(loc: &Value, out: &mut Vec<(String, String)>) -> Result<(), Crash> {
-    let pid = id_of(&loc.field("root")?)?;
-    let children = loc.field("children")?;
+/// `tree` is the top location or a subtree below it: only its `root` and
+/// `children` are read. Refocusing on each child instead copied the context
+/// at every level, which is quadratic in the depth of the history, in time
+/// and in what the walk holds at once.
+fn parent_map_rec(tree: &Value, out: &mut Vec<(String, String)>) -> Result<(), Crash> {
+    let pid = id_of(&tree.field("root")?)?;
+    let children = tree.field("children")?;
     for c in children.as_list()?.iter() {
         out.push((id_of(&c.field("root")?)?, pid.clone()));
-        parent_map_rec(&refocus_child(loc, c)?, out)?;
+        parent_map_rec(c, out)?;
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------
+// equality up to the order of snapshot entries (§7.3)
+// ----------------------------------------------------------------------
+
+/// Whether two snapshots hold the same entries, in whatever order. A
+/// snapshot stands for a tree, which has no order (§7.3): `select` lists the
+/// entries a fileset matches first, so a `contract m` that moves nothing
+/// still reorders the parent's files, and comparing them as lists called
+/// that a change. Entries compare with `value_eq`, so lazy blobs still
+/// compare by content id without being read, and two lists loaded from the
+/// same stored tree (`stored_tree`) are the same without either being read.
+pub fn snapshot_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
+    if let (Some(x), Some(y)) = (stored_tree(a), stored_tree(b)) {
+        if x == y {
+            return Ok(true);
+        }
+    }
+    let (a, b) = (a.forced()?, b.forced()?);
+    // not lists: no snapshots, left to validation to name (§7.5 step 1)
+    let (Value::List(xs), Value::List(ys)) = (&a, &b) else {
+        return value_eq(&a, &b);
+    };
+    if xs.len() != ys.len() {
+        return Ok(false);
+    }
+    // the usual case, both in path order: one pass, nothing allocated
+    let mut k = 0;
+    while k < xs.len() && value_eq(&xs[k], &ys[k])? {
+        k += 1;
+    }
+    if k == xs.len() {
+        return Ok(true);
+    }
+    // a tree has one listing in path order, the one it is loaded in and
+    // `replay` returns, so two such listings that differ are different trees
+    if in_path_order(xs) && in_path_order(ys) {
+        return Ok(false);
+    }
+    // the rest by path; an entry with no readable path, or a path listed
+    // twice, is not a tree, and compares unequal as it would as a list
+    let mut rest: BTreeMap<Vec<String>, &Value> = BTreeMap::new();
+    for x in &xs[k..] {
+        let Some(p) = entry_path(x) else {
+            return Ok(false);
+        };
+        if rest.insert(p, x).is_some() {
+            return Ok(false);
+        }
+    }
+    for y in &ys[k..] {
+        match entry_path(y).and_then(|p| rest.remove(&p)) {
+            Some(x) if value_eq(x, y)? => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// A commit's `files` as it holds them: a lazy list is not read.
+pub fn files_of(commit: &Value) -> Result<Value, Crash> {
+    if let Value::Record(m) = commit {
+        if let Some(files) = m.get("files") {
+            return Ok(files.clone());
+        }
+    }
+    commit.field("files")
+}
+
+/// The name of the stored tree `files` loads, read or not, while they are
+/// the list the backend built from it (`ThunkVal::tree`); `None` for a list
+/// the program built, even one with the same entries.
+pub fn stored_tree(files: &Value) -> Option<&str> {
+    match files {
+        Value::Thunk(t) => t.tree(),
+        _ => None,
+    }
+}
+
+fn entry_path(entry: &Value) -> Option<Vec<String>> {
+    let path = entry.field("path").ok()?;
+    let comps = path.as_list().ok()?;
+    comps.iter().map(|c| c.as_text().ok().map(str::to_string)).collect()
+}
+
+/// Every entry's path strictly after the one before, component by component
+/// (`a/b` < `a.txt`); false if a path is unreadable.
+fn in_path_order(entries: &[Value]) -> bool {
+    let before = |a: &Value, b: &Value| -> Option<bool> {
+        let (pa, pb) = (a.field("path").ok()?, b.field("path").ok()?);
+        let (ca, cb) = (pa.as_list().ok()?, pb.as_list().ok()?);
+        for (x, y) in ca.iter().zip(cb.iter()) {
+            match x.as_text().ok()?.cmp(y.as_text().ok()?) {
+                std::cmp::Ordering::Equal => {}
+                o => return Some(o.is_lt()),
+            }
+        }
+        Some(ca.len() < cb.len())
+    };
+    entries.windows(2).all(|w| before(&w[0], &w[1]) == Some(true))
+}
+
+/// Whether `b` is the repository `a` (§1.2 step 8): equal as values, except
+/// that each commit's `files` compare as snapshots (`snapshot_eq`), so a
+/// result that only reorders entries persists nothing. A record `b` shares
+/// with `a` is equal without being walked.
+pub fn same_repo(a: &Value, b: &Value) -> Result<bool, Crash> {
+    match (a, b) {
+        (Value::Record(x), Value::Record(y)) => {
+            if std::rc::Rc::ptr_eq(x, y) {
+                return Ok(true);
+            }
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
+                // only a Commit has a `files` field in a Repo value
+                let same = k1 == k2
+                    && if k1 == "files" {
+                        snapshot_eq(v1, v2)?
+                    } else {
+                        same_repo(v1, v2)?
+                    };
+                if !same {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Value::List(xs), Value::List(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (u, v) in xs.iter().zip(ys.iter()) {
+                if !same_repo(u, v)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => value_eq(a, b),
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -261,6 +371,8 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
     if let Some(old) = &old {
         validate_immutable(old, new, &immutable)?;
     }
+    let given = i.given_repo.borrow().clone().or_else(|| old.clone());
+    validate_path_names(old.as_ref(), given.as_ref(), new, &immutable, i.backend.as_ref())?;
     // focus mutable (§7.5 step 6)
     let focus_id = id_of(&new.field("root")?)?;
     if focus_id == ROOT_ID || immutable.contains(&focus_id) {
@@ -301,8 +413,9 @@ fn validate_ids_and_snapshots(repo: &Value, seen: &mut BTreeSet<String>) -> Resu
     validate_tree(&top, seen)
 }
 
-fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> {
-    let root = loc.field("root")?;
+/// `tree` is the top location or a subtree below it, as in `parent_map_rec`
+fn validate_tree(tree: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> {
+    let root = tree.field("root")?;
     let id = id_of(&root)?;
     if !seen.insert(id.clone()) {
         return Err(Crash::new(format!(
@@ -310,7 +423,24 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
             id
         )));
     }
-    let files = root.field("files")?;
+    // a list loaded from a stored tree is a snapshot already: jj's tree
+    // holds each name once, and lists a path as a file or as a directory.
+    // Reading every commit's to check it made each persist read the files
+    // of the whole history
+    let files = files_of(&root)?;
+    if stored_tree(&files).is_none() {
+        validate_snapshot(&files.forced()?)?;
+    }
+    let children = tree.field("children")?;
+    for c in children.as_list()?.iter() {
+        validate_tree(c, seen)?;
+    }
+    Ok(())
+}
+
+/// unique paths, none of them the root `./`, none both a file and a
+/// directory (§7.5 step 1)
+fn validate_snapshot(files: &Value) -> Result<(), Crash> {
     let files = files.as_list()?;
     let mut paths = BTreeSet::new();
     for e in files {
@@ -320,15 +450,163 @@ fn validate_tree(loc: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash> 
             .iter()
             .map(|c| c.as_text().map(|s| s.to_string()))
             .collect::<Result<_, _>>()?;
+        if key.is_empty() {
+            return Err(Crash::new("persistence: a snapshot has an entry at the root path ./"));
+        }
         if !paths.insert(key) {
             return Err(Crash::new("persistence: a snapshot has duplicate paths"));
         }
     }
-    let children = loc.field("children")?;
-    for c in children.as_list()?.iter() {
-        validate_tree(&refocus_child(loc, c)?, seen)?;
+    if let Some(p) = crate::domain::file_and_directory(&paths) {
+        return Err(Crash::new(format!(
+            "persistence: a snapshot has `{}` as both a file and a directory",
+            p.join("/")
+        )));
     }
     Ok(())
+}
+
+/// The name limit of ext4, xfs, btrfs and tmpfs (NAME_MAX), in bytes.
+/// exFAT, NTFS, HFS+ and APFS count 255 UTF-16 units or characters instead,
+/// so they hold longer names, and pathconf answers 255 on each: whether a
+/// longer name fits is asked of the backend (`Backend::name_fits`). A
+/// filesystem with a lower limit (encfs, eCryptfs) refuses a shorter name
+/// at checkout, which then records nothing (§7.5 step 7).
+pub const NAME_MAX: usize = 255;
+
+/// Whether a checkout cannot create the path component `comp` (§7.5 step
+/// 1). jj stores any name that is not empty and has no `/`, but its
+/// checkout refuses `.`, `..`, `.git` and `.jj`, and the filesystem a name
+/// it cannot hold, part way through writing the focus; a git tree cannot
+/// hold a NUL. Where the filesystem folds case, `.GIT` is the file `.git`,
+/// which the checkout refuses by its file identity or, where that does not
+/// show it, writes into. `fits` says whether a name longer than `NAME_MAX`
+/// bytes is one the filesystem holds.
+pub fn checkout_refuses(comp: &str, folds_case: bool, fits: impl FnOnce(&str) -> bool) -> bool {
+    matches!(comp, "" | "." | ".." | ".git" | ".jj")
+        || comp.contains(['/', '\0'])
+        || (folds_case && (comp.eq_ignore_ascii_case(".git") || comp.eq_ignore_ascii_case(".jj")))
+        || (comp.len() > NAME_MAX && !fits(comp))
+}
+
+/// Path components (§7.5 step 1) of every commit persisting writes anew or
+/// checks out must be ones a checkout can create (`checkout_refuses`).
+///
+/// A commit that keeps the files it has in `old` is checked only as the
+/// focus: persisting at most rewrites it with the tree jj already stored and
+/// never checks it out, and a fetched branch can hold `.jj`, so refusing its
+/// names would stop every persist for a commit the script did not touch.
+/// Immutable commits are such commits (step 3). One whose files differ,
+/// such as a descendant a snapshot of the focus rebases, is checked only at
+/// the paths it did not hold there: jj stored the others' names already.
+///
+/// A name longer than `NAME_MAX` is one the filesystem holds if the
+/// working directory holds it, as the focus of `given` (its snapshot, §7.4)
+/// shows: the checkout, which diffs from what is on disk, does not create
+/// such a file again. Any other is asked of the backend.
+fn validate_path_names(
+    old: Option<&Value>,
+    given: Option<&Value>,
+    new: &Value,
+    immutable: &BTreeSet<String>,
+    backend: &dyn Backend,
+) -> Result<(), Crash> {
+    let folds_case = backend.folds_case();
+    // the long names the working directory holds, read on first need: the
+    // snapshot's file list is the whole tree
+    let mut held: Option<BTreeSet<String>> = None;
+    let focus = id_of(&new.field("root")?)?;
+    let stored: BTreeMap<String, Value> = match old {
+        Some(old) => all_commits(old)?
+            .into_iter()
+            .map(|c| id_of(&c).map(|id| (id, c)))
+            .collect::<Result<_, _>>()?,
+        None => BTreeMap::new(),
+    };
+    for c in all_commits(new)? {
+        let id = id_of(&c)?;
+        if immutable.contains(&id) {
+            continue;
+        }
+        // the commit as stored, when its files differ: a path it held there
+        // is not checked again
+        let mut kept = None;
+        if id != focus {
+            if let Some(o) = stored.get(&id) {
+                if same_files(o, &c)? {
+                    continue;
+                }
+                kept = Some(o);
+            }
+        }
+        // the paths `kept` holds, read on first need: most commits hold no
+        // name a checkout refuses
+        let mut kept_paths: Option<BTreeSet<Vec<String>>> = None;
+        let files = c.field("files")?;
+        for e in files.as_list()? {
+            let path = e.field("path")?;
+            for comp in path.as_list()? {
+                let comp = comp.as_text()?;
+                if comp.len() > NAME_MAX && held.is_none() {
+                    held = Some(match given {
+                        Some(given) => long_names(&given.field("root")?.field("files")?)?,
+                        None => BTreeSet::new(),
+                    });
+                }
+                let on_disk = |c: &str| held.as_ref().is_some_and(|h| h.contains(c));
+                if !checkout_refuses(comp, folds_case, |c| on_disk(c) || backend.name_fits(c)) {
+                    continue;
+                }
+                if let Some(o) = kept {
+                    if kept_paths.is_none() {
+                        let entries = o.field("files")?;
+                        kept_paths = Some(entries.as_list()?.iter().filter_map(entry_path).collect());
+                    }
+                    if let (Some(k), Some(p)) = (&kept_paths, entry_path(e)) {
+                        if k.contains(&p) {
+                            break;
+                        }
+                    }
+                }
+                return Err(Crash::new(format!(
+                    "persistence: a snapshot has the path component {:?}, which a checkout cannot create",
+                    comp
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The path components of snapshot `files` longer than `NAME_MAX` bytes.
+fn long_names(files: &Value) -> Result<BTreeSet<String>, Crash> {
+    let mut out = BTreeSet::new();
+    for e in files.as_list()? {
+        for comp in e.field("path")?.as_list()? {
+            let comp = comp.as_text()?;
+            if comp.len() > NAME_MAX {
+                out.insert(comp.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether commit `new` holds the files commit `old` does. A commit record,
+/// or a lazy `files`, the two share, or lazy lists of one stored tree, are
+/// the same without the tree being read.
+fn same_files(old: &Value, new: &Value) -> Result<bool, Crash> {
+    if let (Value::Record(a), Value::Record(b)) = (old, new) {
+        if std::rc::Rc::ptr_eq(a, b) {
+            return Ok(true);
+        }
+        if let (Some(Value::Thunk(x)), Some(Value::Thunk(y))) = (a.get("files"), b.get("files")) {
+            if std::rc::Rc::ptr_eq(x, y) {
+                return Ok(true);
+            }
+        }
+    }
+    snapshot_eq(&files_of(old)?, &files_of(new)?)
 }
 
 fn label_set(repo: &Value) -> Result<BTreeSet<(String, String)>, Crash> {
@@ -405,7 +683,7 @@ fn validate_immutable(old: &Value, new: &Value, immutable: &BTreeSet<String>) ->
                 id
             )));
         }
-        if !value_eq(&c.field("files")?, &nc.field("files")?)? {
+        if !snapshot_eq(&files_of(&c)?, &files_of(nc)?)? {
             return Err(Crash::new(format!(
                 "persistence: commit {} is immutable (files changed)",
                 id

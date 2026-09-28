@@ -178,9 +178,9 @@ fn tree_conflict_and_empty_glyphs() {
                 Value::Blob(Rc::new(j::value::BlobVal {
                     kind: j::value::BlobKind::Regular,
                     content: j::value::BlobContent::Conflict(vec![
-                        Rc::new(b"a".to_vec()),
-                        Rc::new(b"b".to_vec()),
-                        Rc::new(b"c".to_vec()),
+                        Some(j::value::ConflictSide::regular(b"a")),
+                        Some(j::value::ConflictSide::regular(b"b")),
+                        Some(j::value::ConflictSide::regular(b"c")),
                     ]),
                 })),
             ),
@@ -358,6 +358,267 @@ fn detail_line_changed_paths() {
     assert!(text.contains("− del"), "{}", text);
 }
 
+#[test]
+fn empty_ignores_the_order_of_entries() {
+    // a snapshot stands for a tree, which has no order (§7.3): a commit
+    // holding its parent's entries in another order — what `split m` leaves
+    // when m moves nothing — changes nothing and is drawn empty
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", "parent", &[], vec![("a.txt", "1"), ("h/x", "2")]);
+    let b = commit("kbbbbbbb", "reordered", &[], vec![("h/x", "2"), ("a.txt", "1")]);
+    let c = commit("kccccccc", "changed", &[], vec![("h/x", "3"), ("a.txt", "1")]);
+    let repo = repo_of(
+        root,
+        vec![subtree(a, vec![subtree(b, vec![subtree(c, vec![])])])],
+        None,
+    );
+    let (mut i, cfg) = make_interp(backend_with(vec![
+        meta(ROOT_ID, "R", 1),
+        meta("kaaaaaaa", "A", now() - 30),
+        meta("kbbbbbbb", "B", now() - 20),
+        meta("kccccccc", "C", now() - 10),
+    ]));
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
+        repo,
+    );
+    let row = |msg: &str| {
+        text.lines()
+            .find(|l| l.contains(msg))
+            .unwrap_or_else(|| panic!("no row for {}:\n{}", msg, text))
+            .to_string()
+    };
+    assert!(row("reordered").contains('◌'), "{}", text);
+    assert!(!row("changed").contains('◌'), "{}", text);
+    assert!(!row("parent").contains('◌'), "{}", text);
+}
+
+// ----------------------------------------------------------------------
+// the size bar and the files column (§7.11 column 5, specs/tree.md Step 4)
+// ----------------------------------------------------------------------
+
+/// Render a chain of commits on the root, each `(message, files)` the child
+/// of the one before, with the files column on, and return each message's
+/// row. The focus is the root, so at detail 1 only its child diffs.
+fn chain_rows(detail: u8, chain: &[(&str, Vec<(String, String)>)]) -> Vec<(String, String)> {
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let mut metas = vec![meta(ROOT_ID, "R", 1)];
+    let mut sub: Option<Value> = None;
+    for (n, (msg, files)) in chain.iter().enumerate().rev() {
+        let id = format!("k{:03}zzzzzzzzzzzz", n);
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let c = commit(&id, msg, &[], files);
+        metas.push(meta(&id, "A", now() - 1000 + n as i64));
+        sub = Some(subtree(c, sub.into_iter().collect()));
+    }
+    let repo = repo_of(root, sub.into_iter().collect(), None);
+    let (mut i, cfg) = make_interp(backend_with(metas));
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        &format!(
+            "treeWith ({{ detail = {}, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = true }})",
+            detail
+        ),
+        repo,
+    );
+    chain
+        .iter()
+        .map(|(msg, _)| {
+            let row = text
+                .lines()
+                .find(|l| l.split_whitespace().any(|t| t == *msg))
+                .unwrap_or_else(|| panic!("no row for {}:\n{}", msg, text));
+            (msg.to_string(), row.to_string())
+        })
+        .collect()
+}
+
+fn numbered(lines: impl Iterator<Item = usize>) -> String {
+    lines.map(|i| format!("line {}\n", i)).collect()
+}
+
+#[test]
+fn size_bar_counts_lines_added_plus_removed() {
+    // the bar is lines added plus removed against the parent, one glyph per
+    // threshold 1, 10, 50, 200, 1000 (§7.11 column 5). It summed the whole
+    // length of both versions of each changed file, so a one-line edit to a
+    // long file drew the largest bar, and its thresholds were shifted by one
+    // glyph, so `▁` never appeared and `▇` stood for both 200 and 1000.
+    let mut chain: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    let mut len = 0;
+    for (msg, grow) in [
+        ("grow0001", 1),
+        ("grow0009", 9),
+        ("grow0010", 10),
+        ("grow0049", 49),
+        ("grow0050", 50),
+        ("grow0199", 199),
+        ("grow0200", 200),
+        ("grow0999", 999),
+        ("grow1000", 1000),
+    ] {
+        len += grow;
+        chain.push((msg, vec![("f".to_string(), numbered(0..len))]));
+    }
+    let edited = numbered(0..len).replace("line 1200\n", "changed\n");
+    chain.push(("edit1", vec![("f".to_string(), edited.clone())]));
+    let dropped = edited.replace("line 1300\n", "");
+    chain.push(("drop1", vec![("f".to_string(), dropped.clone())]));
+    // a path changed without a changed line still counts, so only an empty
+    // commit has no bar
+    let touched = vec![("e".to_string(), String::new()), ("f".to_string(), dropped)];
+    chain.push(("touch", touched.clone()));
+    chain.push(("nothing", touched));
+    let want = [
+        ("grow0001", "▁"),
+        ("grow0009", "▁"),
+        ("grow0010", "▂"),
+        ("grow0049", "▂"),
+        ("grow0050", "▃"),
+        ("grow0199", "▃"),
+        ("grow0200", "▅"),
+        ("grow0999", "▅"),
+        ("grow1000", "▇"),
+        ("edit1", "▁"),
+        ("drop1", "▁"),
+        ("touch", "▁"),
+        ("nothing", ""),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows.iter().zip(want) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+}
+
+#[test]
+fn size_bar_counts_exactly_up_to_its_last_threshold() {
+    // the line diff stopped at a 200 ms deadline and then overcounted, so the
+    // same commit drew `▅` on an idle machine and `▇` on a busy one, and every
+    // reordered long file cost the whole 200 ms. The bar tops out at 1000
+    // lines (§7.11 column 5), so the count is exact below that, whatever the
+    // diff costs, and stops there: blocks of lines moved within a long file
+    // (a block of n lines moved past at least n others counts 2n), counts on
+    // either side of 1000 in one file and spread over two, and a reversed
+    // file.
+    let base: Vec<String> = (0..60000).map(|i| format!("line {}\n", i)).collect();
+    let moved = |lens: &[usize], inserted: bool| -> String {
+        let mut f = base.clone();
+        for (j, len) in lens.iter().enumerate() {
+            let at = 1000 + 10000 * j;
+            let block: Vec<String> = f.drain(at..at + len).collect();
+            f.splice(at + 1000..at + 1000, block);
+        }
+        if inserted {
+            f.insert(55000, "inserted\n".to_string());
+        }
+        f.concat()
+    };
+    let grown = |by: usize| -> Vec<String> {
+        base.iter().cloned().chain((0..by).map(|i| format!("added {}\n", i))).collect()
+    };
+    let mut reversed = grown(1000);
+    reversed.reverse();
+    let fg = |f: String, g: String| vec![("f".to_string(), f), ("g".to_string(), g)];
+    let (base_f, small) = (base.concat(), numbered(0..10));
+    let chain = vec![
+        ("base", fg(base_f.clone(), small.clone())),
+        ("moves900", fg(moved(&[90; 5], false), small.clone())),
+        ("undo900", fg(base_f.clone(), small.clone())),
+        ("moves999", fg(moved(&[100, 100, 100, 100, 99], true), small.clone())),
+        ("undo999", fg(base_f.clone(), small.clone())),
+        ("moves1000", fg(moved(&[100; 5], false), small.clone())),
+        ("undo1000", fg(base_f.clone(), small.clone())),
+        ("grow999", fg(grown(500).concat(), numbered(0..509))),
+        ("grow1000", fg(grown(1000).concat(), numbered(0..1009))),
+        ("reversed", fg(reversed.concat(), numbered(0..1009))),
+    ];
+    let want = [
+        ("moves900", "▅"),
+        ("undo900", "▅"),
+        ("moves999", "▅"),
+        ("undo999", "▅"),
+        ("moves1000", "▇"),
+        ("undo1000", "▇"),
+        ("grow999", "▅"),
+        ("grow1000", "▇"),
+        ("reversed", "▇"),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip(want) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+    // runs of one repeated line swapped: a shortest diff keeps only the
+    // longer run, so these count 999 and 1000
+    let h = |first: String, then: String| vec![("h".to_string(), first + &then)];
+    let chain = vec![
+        ("runs", h("a\n".repeat(499), "b\n".repeat(501))),
+        ("runs999", h("b\n".repeat(501), "a\n".repeat(500))),
+        ("runs1000", h("a\n".repeat(500), "b\n".repeat(501))),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip([("runs999", "▅"), ("runs1000", "▇")]) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+    // two lines alternating, 450 disjoint pairs of them swapped: 900 lines
+    // either way. Every other diagonal of the search is a long run of equal
+    // lines, so the deadline expired on it even on an idle machine and drew
+    // `▇`, where the moved blocks above only overran on a busy one
+    let alternating: Vec<String> = (0..60000).map(|i| format!("l{}\n", i % 2)).collect();
+    let mut swapped = alternating.clone();
+    for k in 0..450 {
+        swapped.swap(100 + 132 * k, 101 + 132 * k);
+    }
+    let p = |f: &[String]| vec![("p".to_string(), f.concat())];
+    let chain = vec![
+        ("alternating", p(&alternating)),
+        ("swaps900", p(&swapped)),
+        ("unswap900", p(&alternating)),
+    ];
+    let rows = chain_rows(2, &chain);
+    for ((msg, row), (wmsg, bar)) in rows[1..].iter().zip([("swaps900", "▅"), ("unswap900", "▅")]) {
+        assert_eq!(msg, wmsg);
+        let got: String = row.chars().filter(|c| "▁▂▃▅▇".contains(*c)).collect();
+        assert_eq!(got, bar, "bar of {}: {:?}", msg, row);
+    }
+}
+
+#[test]
+fn files_column_counts_changed_files() {
+    // `files` is the number of files changed against the parent (specs/tree.md
+    // Step 4 column 9), not the size of the commit's snapshot: an empty
+    // commit changes none. At detail 1 most rows skip the diff, and the
+    // column must not depend on it.
+    let f = |fs: &[(&str, &str)]| -> Vec<(String, String)> {
+        fs.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect()
+    };
+    let chain = vec![
+        ("addthree", f(&[("a", "1\n"), ("b", "1\n"), ("c", "1\n")])),
+        ("changetwo", f(&[("a", "2\n"), ("b", "1\n")])),
+        ("addone", f(&[("a", "2\n"), ("b", "1\n"), ("d", "1\n")])),
+        ("changenone", f(&[("a", "2\n"), ("b", "1\n"), ("d", "1\n")])),
+    ];
+    let want = [3, 2, 1, 0];
+    for detail in [1, 2] {
+        for ((msg, row), n) in chain_rows(detail, &chain).iter().zip(want) {
+            let toks: Vec<&str> = row.split_whitespace().collect();
+            let at = toks
+                .iter()
+                .position(|t| *t == "files")
+                .unwrap_or_else(|| panic!("no files column for {}: {:?}", msg, row));
+            assert_eq!(toks[at - 1], n.to_string(), "detail {}, {}: {:?}", detail, msg, row);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------
 // the spec's worked example (§7.11)
 // ----------------------------------------------------------------------
@@ -371,9 +632,9 @@ fn conflict_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
                 Value::Blob(Rc::new(j::value::BlobVal {
                     kind: j::value::BlobKind::Regular,
                     content: j::value::BlobContent::Conflict(vec![
-                        Rc::new(b"a".to_vec()),
-                        Rc::new(b"b".to_vec()),
-                        Rc::new(b"c".to_vec()),
+                        Some(j::value::ConflictSide::regular(b"a")),
+                        Some(j::value::ConflictSide::regular(b"b")),
+                        Some(j::value::ConflictSide::regular(b"c")),
                     ]),
                 })),
             ),
@@ -426,54 +687,66 @@ fn contains_id(sub: &Value, id: &str) -> bool {
 }
 
 fn worked_example() -> (Value, MemBackend) {
+    worked_example_with_run(14)
+}
+
+/// The worked example with `n` uninteresting commits in its run.
+fn worked_example_with_run(n: usize) -> (Value, MemBackend) {
     let t = now();
     let h = 3600;
     let d = 24 * h;
     let w = 7 * d;
-    // root -> 14 uninteresting commits -> aaaa -> kpqx (trunk head)
+    // root -> n uninteresting commits -> aaaa -> kpqx (trunk head)
     let root = commit(ROOT_ID, "", &[], vec![]);
     let mut kids: Vec<Value> = Vec::new();
-    let ids: Vec<String> = (0..14).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
+    let ids: Vec<String> = (0..n).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
 
-    // the base snapshot (the last run commit's files): 30 lines each, so
-    // aaaa's diff is 30+30 = 60 lines (▅)
+    // the base snapshot (the last run commit's files): three files of 40
+    // lines. Each commit's diff against its parent sizes its bar (§7.11
+    // column 5: lines added plus removed, thresholds 1, 10, 50, 200, 1000).
     let base: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "b\n".repeat(30)),
-        ("src/parser.rs".to_string(), "b\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "b\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "b\n".repeat(40)),
+        ("src/parser.rs".to_string(), "b\n".repeat(40)),
+        ("tests/lexer.rs".to_string(), "b\n".repeat(40)),
     ];
     fn snap<'a>(fs: &'a [(String, String)]) -> Vec<(&'a str, &'a str)> {
         fs.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect()
     }
-    // aaaa: base rewritten to 30 new lines (▅)
+    // aaaa: base rewritten to 40 new lines a file, 3 × 80 = 240 lines (▅)
     let aaaa_files: Vec<(String, String)> = base
         .iter()
-        .map(|(p, _)| (p.clone(), "a\n".repeat(30)))
+        .map(|(p, _)| (p.clone(), "a\n".repeat(40)))
         .collect();
     let aaaa = commit("aaaaaaaaaaaaaaaa", "add parser", &[], snap(&aaaa_files));
-    // kpqx: aaaa rewritten to 30 new lines (▅). It has no tests/lexer.rs, so
+    // kpqx: aaaa's sources rewritten to 50 new lines and tests/lexer.rs
+    // deleted, 90 + 90 + 40 = 220 lines (▅). It has no tests/lexer.rs, so
     // wqzt's tests/lexer.rs is an addition (+), as in the worked example.
     let kpqx_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "k\n".repeat(30)),
-        ("src/parser.rs".to_string(), "k\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "k\n".repeat(50)),
+        ("src/parser.rs".to_string(), "k\n".repeat(50)),
     ];
     let kpqx = commit("kpqxaaaaaaaaaaaa", "release 1.2", &["main"], snap(&kpqx_files));
-    // mnrv: aaaa with one 2-line change (▂)
+    // mnrv: aaaa with 12 lines cut from the lexer (▂)
     let mnrv_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "a\n".repeat(29)),
-        ("src/parser.rs".to_string(), "a\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "a\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "a\n".repeat(28)),
+        ("src/parser.rs".to_string(), "a\n".repeat(40)),
+        ("tests/lexer.rs".to_string(), "a\n".repeat(40)),
     ];
     let mnrv = commit("mnrvaaaaaaaaaaaa", "fix lexer", &[], snap(&mnrv_files));
+    // wqzt: against kpqx, the lexer's 50 lines become the conflict's 8, the
+    // parser's 50 become 2, and 2 are added: 58 + 52 + 2 = 112 lines (▃)
     let wqzt = conflict_commit("wqztaaaaaaaaaaaa", "wip", &["feature"]);
-    // qrst: wqzt with the lexer conflict resolved to 2 lines (▁)
+    // qrst: wqzt with the lexer conflict resolved to its two added sides,
+    // which drops the 6 other lines of the conflict (▁)
     let qrst_files: Vec<(String, String)> = vec![
-        ("src/lexer.rs".to_string(), "r\n".repeat(2)),
-        ("src/parser.rs".to_string(), "k\n".repeat(30)),
-        ("tests/lexer.rs".to_string(), "k\n".repeat(30)),
+        ("src/lexer.rs".to_string(), "a\nc\n".to_string()),
+        ("src/parser.rs".to_string(), "w\nw\n".to_string()),
+        ("tests/lexer.rs".to_string(), "w\nw\n".to_string()),
     ];
     let qrst = commit("qrstaaaaaaaaaaaa", "spike", &[], snap(&qrst_files));
-    // yxsk: wqzt with the conflict resolved plus 9 added one-line files (▃)
+    // yxsk: wqzt with the conflict resolved to a new line, the other two files
+    // rewritten to 30 lines, and 9 one-line files added: 9 + 32 + 32 + 9 = 82
+    // lines (▃)
     let mut yxsk_files: Vec<(String, String)> = vec![
         ("src/lexer.rs".to_string(), "resolved2\n".to_string()),
         ("src/parser.rs".to_string(), "k\n".repeat(30)),
@@ -532,7 +805,8 @@ fn worked_example() -> (Value, MemBackend) {
                 hash: format!("h{}", id),
                 author: "Mary Ojeda".into(),
                 email: "a@x".into(),
-                time: t - 3 * w - 3600 + (i as i64) * 60,
+                // a minute apart, all older than aaaa
+                time: t - 3 * w - (60 * n as i64).max(3600) + (i as i64) * 60,
             },
         );
     }
@@ -611,6 +885,9 @@ fn worked_example() -> (Value, MemBackend) {
 
 #[test]
 fn tree_worked_example() {
+    // specs/tree.md drew the labels 35 and the margin 45 columns in and the
+    // detail line's marks at 11; the rows put them at 31, 40 and 16. This
+    // test compared only tokens, so the two drifted apart unseen.
     let (repo, be) = worked_example();
     let (mut i, cfg) = make_interp(be);
     let text = tree_text(
@@ -619,49 +896,33 @@ fn tree_worked_example() {
         "treeWith ({ detail = 2, margin = true, elide = true, icons = false, color = \"never\", lanes = 3, author = false, date = false, files = false })",
         repo,
     );
-    let expected = "\
-  ╎ 14
-  ◆─╮    @aaaa ▅  add parser                 3w  mo
-  ◆ │    @kpqx ▅  release 1.2      main      2w  mo
-  │ ○    @mnrv ▂  fix lexer                  1w  mo
-▶ ├─⊗    @wqzt ▃  wip              feature   2d  mo
+    // (the first row starts on the literal's line: a `\` line continuation
+    // would eat its gutter)
+    let expected = "  ╎ 14
+  ◆─╮    @aaaa ▅  add parser            3w  mo
+  ◆ │    @kpqx ▅  release 1.2  main     2w  mo
+  │ ○    @mnrv ▂  fix lexer             1w  mo
+▶ ├─⊗    @wqzt ▃  wip          feature  2d  mo
   │ │      ✖ src/lexer.rs   ~ src/parser.rs   + tests/lexer.rs
-  ╰─┼─◌  @ptlm    docs  ⋯ 3                  1d  ak
-    ├─○  @qrst ▁  spike                      5h  mo
-    ○    @yxsk ▃                             1h  mo
+  ╰─┼─◌  @ptlm    docs  ⋯ 3             1d  ak
+    ├─○  @qrst ▁  spike                 5h  mo
+    ○    @yxsk ▃                        1h  mo
 ";
-    // The spec pins down the rails *graph* (which structural characters appear
-    // on each row, in order) and the id/message/label/detail content. The
-    // size-bar glyph, exact column widths, and the gutter on the spec's first
-    // row are implementation/spec-formatting details, so we compare (a) the
-    // ordered sequence of structural characters per row and (b) the word
-    // tokens, ignoring all whitespace.
-    let struct_chars = |l: &str| -> String {
-        l.chars()
-            .filter(|c| "⌂◆○◉◌⊗├╰┼─╮┬│╎»".contains(*c))
-            .collect()
-    };
-    let tokens = |l: &str| -> Vec<String> {
-        l.split_whitespace()
-            .map(|t| t.trim_matches(|c| "▁▂▃▅▇".contains(c)).to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    };
-    let got: Vec<&str> = text.lines().collect();
+    // the spec draws exactly these rows
+    let spec = include_str!("../specs/tree.md");
+    assert!(
+        spec.contains(&format!("Rendered:\n\n```\n{}```", expected)),
+        "specs/tree.md's worked example is not\n{}",
+        expected
+    );
     // The legend follows the tree body after a blank line (§Legend). Split it
-    // off; the body must match the spec's rails graph, and the legend must
-    // explain exactly the symbols the body uses.
+    // off; the body must be the spec's rows, and the legend must explain
+    // exactly the symbols the body uses.
+    let got: Vec<&str> = text.lines().collect();
     let blank = got.iter().position(|l| l.trim().is_empty()).unwrap_or(got.len());
     let body = &got[..blank];
     let legend = &got[blank..];
-    let want: Vec<&str> = expected.lines().collect();
-    assert_eq!(body.len(), want.len(), "row count\n--- got ---\n{}\n--- want ---\n{}", text, expected);
-    for (g, w) in body.iter().zip(want.iter()) {
-        assert_eq!(struct_chars(g), struct_chars(w),
-            "rails graph\nrow got:  {}\nrow want: {}", g, w);
-        assert_eq!(tokens(g), tokens(w),
-            "content\nrow got:  {}\nrow want: {}", g, w);
-    }
+    assert_eq!(body.join("\n") + "\n", expected, "\n--- got ---\n{}", text);
     // legend explains the used symbols (only-used): ○ ◆ ◌ ⊗ ▶ ╎ ⋯ + ~ ✖ here
     // (no ⌂: the distant root folds into the run, §Option far root)
     let legend_text = legend.join("\n");
@@ -676,71 +937,729 @@ fn tree_worked_example() {
     }
 }
 
+// ----------------------------------------------------------------------
+// text columns (§Step 4): "Columns 4–8 start at the same offset on every
+// row", which the token comparison above cannot see
+// ----------------------------------------------------------------------
 
+/// The worked example's commit rows: id, message, age.
+const WORKED_ROWS: [(&str, &str, &str); 7] = [
+    ("@aaaa", "add parser", "3w"),
+    ("@kpqx", "release 1.2", "2w"),
+    ("@mnrv", "fix lexer", "1w"),
+    ("@wqzt", "wip", "2d"),
+    ("@ptlm", "docs", "1d"),
+    ("@qrst", "spike", "5h"),
+    ("@yxsk", "", "1h"),
+];
+
+/// The worked example's options at `detail`, with the data columns if `data`.
+fn worked_opts(detail: u8, data: bool) -> String {
+    format!(
+        "{{ detail = {}, margin = true, elide = true, icons = false, color = \"never\", lanes = 3, author = {d}, date = {d}, files = {d} }}",
+        detail,
+        d = data
+    )
+}
+
+/// The display column at which `needle` starts in `line`.
+fn col_of(line: &str, needle: &str) -> usize {
+    let at = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("no {:?} in {:?}", needle, line));
+    j::render::width(&line[..at])
+}
+
+/// The row of `text` that carries the id `id`.
+fn row_of<'a>(text: &'a str, id: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.contains(id))
+        .unwrap_or_else(|| panic!("no row {}\n{}", id, text))
+}
+
+#[test]
+fn tree_columns_line_up_on_every_row() {
+    // the message moved two columns right on rows with a size bar (and a
+    // row without one kept no blank slot), and the label and margin columns
+    // were placed from absolute edges used as widths, ~msg_off columns too
+    // far right, and per row from the row's own label width
+    for detail in 0..=2 {
+        for data in [false, true] {
+            let (repo, be) = worked_example();
+            let (mut i, cfg) = make_interp(be);
+            let src = format!("treeWith ({})", worked_opts(detail, data));
+            let text = tree_text(&mut i, &cfg, &src, repo);
+            let ctx = format!("detail {} data {}\n{}", detail, data, text);
+            // message: the same column on every row, bar or not
+            let msg_col = col_of(row_of(&text, "@kpqx"), "release 1.2");
+            for (id, msg, _) in WORKED_ROWS.iter().filter(|r| !r.1.is_empty()) {
+                assert_eq!(col_of(row_of(&text, id), msg), msg_col, "{} message\n{}", id, ctx);
+            }
+            // labels: two columns past the widest message
+            let lab_col = msg_col + j::render::width("release 1.2") + 2;
+            assert_eq!(col_of(row_of(&text, "@kpqx"), "main"), lab_col, "main\n{}", ctx);
+            assert_eq!(col_of(row_of(&text, "@wqzt"), "feature"), lab_col, "feature\n{}", ctx);
+            // the data columns, then the margin: two past the widest label,
+            // each at the same column on every row (authors differ in width)
+            let block_col = lab_col + j::render::width("feature") + 2;
+            let age_col = col_of(row_of(&text, "@aaaa"), "3w");
+            for (id, _, age) in WORKED_ROWS.iter() {
+                let row = row_of(&text, id);
+                assert_eq!(col_of(row, age), age_col, "{} age\n{}", id, ctx);
+                if data {
+                    assert_eq!(col_of(row, "20"), block_col, "{} date\n{}", id, ctx);
+                }
+            }
+            if !data {
+                assert_eq!(age_col, block_col, "margin\n{}", ctx);
+            }
+            // the detail line: two columns into the id column
+            if detail == 2 {
+                let id_col = col_of(row_of(&text, "@wqzt"), "@wqzt");
+                let marks = row_of(&text, "✖ src/lexer.rs");
+                assert_eq!(col_of(marks, "✖"), id_col + 2, "detail line\n{}", ctx);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_margin_is_right_aligned() {
+    // the age and the initials were joined unpadded, so a `13m` among `9m`s
+    // pushed its row's initials and right edge one column right, and a
+    // single initial ended its row one column short
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", "old", &[], vec![("a", "1")]);
+    let b = commit("kbbbbbbb", "thirteen", &[], vec![("b", "1")]);
+    let c = commit("kccccccc", "nine", &[], vec![("c", "1")]);
+    let chain = subtree(a, vec![subtree(b, vec![subtree(c, vec![])])]);
+    let repo = repo_of(root, vec![chain], Some(0));
+    let t = now();
+    let rows = [("@kaaa", "2y", "ss"), ("@kbbb", "13m", "tu"), ("@kccc", "9m", "c")];
+    for data in [false, true] {
+        let (mut i, cfg) = make_interp(backend_with(vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "Sam Smith", t - 2 * 365 * 86400 - 86400),
+            meta("kbbbbbbb", "Test User", t - 13 * 60 - 5),
+            meta("kccccccc", "Cher", t - 9 * 60 - 5),
+        ]));
+        let src = format!(
+            "treeWith ({{ detail = 1, margin = true, elide = false, icons = false, color = \"never\", lanes = 4, author = {d}, date = {d}, files = {d} }})",
+            d = data
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let ctx = format!("data {}\n{}", data, text);
+        // where each row's age and initials end
+        let ends: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|(id, age, init)| {
+                let row = row_of(&text, id);
+                assert!(row.ends_with(init), "{} initials\n{}", id, ctx);
+                let at = row.rfind(age).unwrap_or_else(|| panic!("{} age\n{}", id, ctx));
+                (j::render::width(&row[..at + age.len()]), j::render::width(row))
+            })
+            .collect();
+        assert!(ends.iter().all(|e| *e == ends[0]), "{:?}\n{}", ends, ctx);
+    }
+}
+
+#[test]
+fn a_row_without_a_bar_keeps_the_bar_slot() {
+    // specs/tree.md's worked example draws the empty `ptlm` as `@ptlm    docs`
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let src = format!("treeWith ({})", worked_opts(2, false));
+    let text = tree_text(&mut i, &cfg, &src, repo);
+    assert!(row_of(&text, "@ptlm").contains("@ptlm    docs"), "{}", text);
+    assert!(row_of(&text, "@wqzt").contains("@wqzt ▃  wip"), "{}", text);
+}
+
+// ----------------------------------------------------------------------
+// the rails area (§Step 4): `2 · lanes` columns on every row, so the id
+// column after it starts at one offset
+// ----------------------------------------------------------------------
+
+/// The worked example's options with `lanes` lanes and the `icons` glyph set
+/// if `icons`.
+fn lanes_opts(lanes: usize, icons: bool) -> String {
+    format!(
+        "{{ detail = 2, margin = true, elide = true, icons = {}, color = \"never\", lanes = {}, author = false, date = false, files = false }}",
+        icons, lanes
+    )
+}
+
+/// `line` up to display column `col`.
+fn upto_col(line: &str, col: usize) -> String {
+    let mut out = String::new();
+    for c in line.chars() {
+        if j::render::width(&out) + j::render::width(&c.to_string()) > col {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The display column of the id on every commit row of the worked example.
+fn id_cols(text: &str) -> Vec<usize> {
+    WORKED_ROWS
+        .iter()
+        .map(|(id, _, _)| col_of(row_of(text, id), id))
+        .collect()
+}
+
+#[test]
+fn a_run_count_runs_on_into_the_id_column() {
+    // the count was cut where the rails area ends: `╎` alone at lanes = 1,
+    // and `╎ 12` for a run of 123 at lanes = 2. At lanes = 1 the id column
+    // was also widened by one, though nothing was written into it.
+    // A history 123 commits deep needs more stack than a test thread has in
+    // a debug build (the binary runs on 512 MB).
+    let deep = std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+        for lanes in 1..=3 {
+            let (repo, be) = worked_example_with_run(123);
+            let (mut i, cfg) = make_interp(be);
+            let src = format!("treeWith ({})", lanes_opts(lanes, false));
+            let text = tree_text(&mut i, &cfg, &src, repo);
+            let ctx = format!("lanes {}\n{}", lanes, text);
+            assert_eq!(text.lines().next(), Some("  ╎ 123"), "{}", ctx);
+            // the rest of the count fits the id column as it is
+            assert_eq!(id_cols(&text), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "{}", ctx);
+            assert!(row_of(&text, "@aaaa").contains("@aaaa ▅  add parser"), "{}", ctx);
+        }
+    });
+    deep.unwrap().join().unwrap();
+}
+
+#[test]
+fn an_icons_glyph_fills_both_columns_of_its_lane() {
+    // a glyph two columns wide was still followed by its lane's second
+    // character, so every lane right of it, and the id, sat one column
+    // further right on its row than on the rows around it
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let src = format!("treeWith ({})", lanes_opts(3, true));
+    let text = tree_text(&mut i, &cfg, &src, repo);
+    // the gutter, the rails (lane 1 at column 4, lane 2 at 6) and the space
+    // after them: the id starts at column 9 on every row
+    let heads: Vec<String> = text.lines().take(9).map(|l| upto_col(l, 9)).collect();
+    let want = [
+        "  ╎ 14",
+        "  🪨╮    ",
+        "  🪨│    ",
+        "  │ 🍃   ",
+        "▶ ├─🔥   ",
+        "  │ │    ",
+        "  ╰─┼─🫙 ",
+        "    ├─🍃 ",
+        "    🍃   ",
+    ];
+    assert_eq!(heads, want, "\n{}", text);
+    assert_eq!(id_cols(&text), vec![9; WORKED_ROWS.len()], "\n{}", text);
+    // with every lane count, flattened rows (lanes = 2) included, the id is
+    // where it is without icons
+    for lanes in 2..=4 {
+        let src = |icons| format!("treeWith ({})", lanes_opts(lanes, icons));
+        let (repo, be) = worked_example();
+        let (mut i, cfg) = make_interp(be);
+        let plain = tree_text(&mut i, &cfg, &src(false), repo.clone());
+        let icons = tree_text(&mut i, &cfg, &src(true), repo);
+        assert_eq!(id_cols(&icons), id_cols(&plain), "lanes {}\n{}\n{}", lanes, plain, icons);
+        assert_eq!(id_cols(&icons), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "lanes {}\n{}", lanes, icons);
+    }
+}
+
+// ----------------------------------------------------------------------
+// row order and lanes (specs/tree.md Steps 1–3): rows go by time, minted
+// commits last, and "last child" / "after t" mean in row order, which an
+// edit that appends a child (`new`, `rebase`) makes differ from sibling order
+// ----------------------------------------------------------------------
+
+/// A commit whose only file is its own, so no row is drawn empty (`◌`).
+fn own_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
+    commit(id, msg, labels, vec![(id, msg)])
+}
+
+/// The rows of the tree of `repo` (focused on the root) as (rails area,
+/// the rest as words), the legend left out.
+fn row_shapes(repo: Value, metas: Vec<(String, MetaInfo)>) -> Vec<(String, String)> {
+    row_shapes_at(repo, metas, 4)
+}
+
+/// `row_shapes` with `lanes` lanes.
+fn row_shapes_at(repo: Value, metas: Vec<(String, MetaInfo)>, lanes: usize) -> Vec<(String, String)> {
+    let (mut i, cfg) = make_interp(backend_with(metas));
+    let src = format!(
+        "treeWith ({{ detail = 0, margin = false, elide = false, icons = false, color = \"never\", lanes = {}, author = false, date = false, files = false }})",
+        lanes
+    );
+    let text = tree_text(&mut i, &cfg, &src, repo);
+    text.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| {
+            // gutter 2, then 2 · lanes characters of rails
+            let rails: String = l.chars().skip(2).take(2 * lanes).collect();
+            let rest: String = l.chars().skip(2 + 2 * lanes).collect();
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            (rails.trim_end().to_string(), words.join(" "))
+        })
+        .collect()
+}
+
+fn shapes(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter().map(|(r, w)| (r.to_string(), w.to_string())).collect()
+}
+
+#[test]
+fn minted_commits_come_after_stored_ones() {
+    // a minted commit (a dry run's `new`) has no stored time and sorted as
+    // the oldest, so it took its parent's lane first and ended it, and its
+    // stored sibling forked with `├` from under it, drawn as its child. It
+    // has time ∞ (Step 1): after every stored row, inheriting the lane.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = own_commit("kaaaaaaa", "one", &[]);
+    let b = own_commit("kbbbbbbb", "two", &[]);
+    let c = own_commit("kccccccc", "three", &[]);
+    let m = own_commit("kmmmmmmm", "minted", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "A", t - 30),
+            meta("kbbbbbbb", "A", t - 20),
+            meta("kccccccc", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("○", "@kaaa one"),
+        ("├─○", "@kbbb two"),
+        ("│ ○", "@kccc three"),
+        ("○", "@kmmm minted"),
+    ]);
+    // whichever sibling order the edit left (`new` appends)
+    for minted_first in [false, true] {
+        let b_t = subtree(b.clone(), vec![subtree(c.clone(), vec![])]);
+        let m_t = subtree(m.clone(), vec![]);
+        let kids = if minted_first { vec![m_t, b_t] } else { vec![b_t, m_t] };
+        let repo = repo_of(root.clone(), vec![subtree(a.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "minted first: {}", minted_first);
+    }
+}
+
+#[test]
+fn lane_inheritance_follows_row_order_not_sibling_order() {
+    // `rebase` appends the moved commit to its new parent's children but it
+    // keeps its time, so the last child in the list need not be the last
+    // row. Rule 4 read the list: the older child inherited the lane and
+    // emptied it, and the newer one forked from the empty lane under it.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = own_commit("kaaaaaaa", "one", &[]);
+    let b = own_commit("kbbbbbbb", "two", &[]);
+    let c = own_commit("kccccccc", "three", &[]);
+    let d = own_commit("kddddddd", "four", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kaaaaaaa", "A", t - 40),
+            meta("kbbbbbbb", "A", t - 30),
+            meta("kccccccc", "A", t - 20),
+            meta("kddddddd", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("○", "@kaaa one"),
+        ("├─○", "@kbbb two"),
+        ("│ ○", "@kccc three"),
+        ("○", "@kddd four"),
+    ]);
+    for newest_first in [false, true] {
+        let b_t = subtree(b.clone(), vec![subtree(c.clone(), vec![])]);
+        let d_t = subtree(d.clone(), vec![]);
+        let kids = if newest_first { vec![d_t, b_t] } else { vec![b_t, d_t] };
+        let repo = repo_of(root.clone(), vec![subtree(a.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn trunk_head_forks_end_on_the_last_row() {
+    // the trunk head's last child in row order ends lane 0 with `╰`; read
+    // off the list, the older child ended it and the newer forked `├` below
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("khhhhhhh", "A", t - 30),
+            meta("kxxxxxxx", "A", t - 20),
+            meta("kyyyyyyy", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("◆", "@khhh head main"),
+        ("├─○", "@kxxx older"),
+        ("╰─○", "@kyyy newer"),
+    ]);
+    for newest_first in [false, true] {
+        let (x_t, y_t) = (subtree(x.clone(), vec![]), subtree(y.clone(), vec![]));
+        let kids = if newest_first { vec![y_t, x_t] } else { vec![x_t, y_t] };
+        let repo = repo_of(root.clone(), vec![subtree(h.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn trunk_reservations_are_taken_in_row_order() {
+    // a trunk commit reserves lanes for its side children after the trunk
+    // child "in row order" (Step 3), leftmost first; it took them in sibling
+    // order, so the newer side child got the nearer lane
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let p = own_commit("kppppppp", "base", &[]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("kppppppp", "A", t - 40),
+            meta("khhhhhhh", "A", t - 30),
+            meta("kxxxxxxx", "A", t - 20),
+            meta("kyyyyyyy", "A", t - 10),
+        ]
+    };
+    let want = shapes(&[
+        ("◆─┬─╮", "@kppp base"),
+        ("◆ │ │", "@khhh head main"),
+        ("  ○ │", "@kxxx older"),
+        ("    ○", "@kyyy newer"),
+    ]);
+    for newest_first in [false, true] {
+        let (x_t, y_t) = (subtree(x.clone(), vec![]), subtree(y.clone(), vec![]));
+        let h_t = subtree(h.clone(), vec![]);
+        let kids = if newest_first { vec![h_t, y_t, x_t] } else { vec![h_t, x_t, y_t] };
+        let repo = repo_of(root.clone(), vec![subtree(p.clone(), kids)], None);
+        assert_eq!(row_shapes(repo, metas()), want, "newest first: {}", newest_first);
+    }
+}
+
+#[test]
+fn a_flattened_last_child_of_the_trunk_head_ends_lane_0() {
+    // Step 3: the trunk head's last child empties lane 0 below its row. When
+    // that child found no lane (§Overflow), lane 0 ran on to the bottom, on
+    // the detail line too, and the rows flattened below it never showed `»`
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let h = own_commit("khhhhhhh", "head", &["main"]);
+    let x = own_commit("kxxxxxxx", "older", &[]);
+    let y = own_commit("kyyyyyyy", "newer", &[]);
+    let v = own_commit("kvvvvvvv", "on-older", &[]);
+    let w = own_commit("kwwwwwww", "on-newer", &[]);
+    let metas = || {
+        vec![
+            meta(ROOT_ID, "R", 1),
+            meta("khhhhhhh", "A", t - 50),
+            meta("kxxxxxxx", "A", t - 40),
+            meta("kyyyyyyy", "A", t - 30),
+            meta("kvvvvvvv", "A", t - 20),
+            meta("kwwwwwww", "A", t - 10),
+        ]
+    };
+    let x_t = subtree(x, vec![subtree(v, vec![])]);
+    let y_t = subtree(y, vec![subtree(w, vec![])]);
+    let repo = repo_of(root, vec![subtree(h, vec![x_t, y_t])], None);
+    // at lanes = 2 `newer` overflows, as `older` holds lane 1; at lanes = 1
+    // everything off the trunk does
+    let want = [
+        (1, shapes(&[
+            ("◆", "@khhh head main"),
+            ("│", "@kxxx older"),
+            ("│", "@kyyy newer"),
+            ("»", "@kvvv on-older"),
+            ("»", "@kwww on-newer"),
+        ])),
+        (2, shapes(&[
+            ("◆", "@khhh head main"),
+            ("├─○", "@kxxx older"),
+            ("│ │", "@kyyy newer"),
+            ("  ○", "@kvvv on-older"),
+            ("  »", "@kwww on-newer"),
+        ])),
+    ];
+    for (lanes, want) in want {
+        assert_eq!(row_shapes_at(repo.clone(), metas(), lanes), want, "lanes {}", lanes);
+    }
+    // the detail line under a flattened focus draws the rails below its row:
+    // lane 0 under `older`, nothing under `newer`
+    for (focus, rails) in [("@kxxx", "  │"), ("@kyyy", "")] {
+        let (mut i, cfg) = make_interp(backend_with(metas()));
+        let src = format!(
+            "treeWith ({{ detail = 2, margin = false, elide = false, icons = false, color = \"never\", lanes = 1, author = false, date = false, files = false }}) . by {}",
+            focus
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.contains(focus)).unwrap();
+        let detail = lines[at + 1];
+        assert!(detail.contains("+ k"), "no detail line under {}\n{}", focus, text);
+        assert_eq!(upto_col(detail, 4).trim_end(), rails, "{}\n{}", focus, text);
+    }
+}
+
+#[test]
+fn the_worked_example_ends_lane_0_at_ptlm_on_fewer_lanes() {
+    // `ptlm`, the trunk head's last child, overflows at lanes = 2 (lane 1 is
+    // `wqzt`'s) and at lanes = 1, and lane 0 went on past it to the bottom.
+    // It ends on `ptlm`'s row, "and then empty", as at lanes = 3.
+    let want: [(usize, [&str; 9]); 2] = [
+        (1, ["  ╎", "  ◆", "  ◆", "  │", "▶ │", "  │", "  │", "  »", "  »"]),
+        (2, ["  ╎ 14", "  ◆─╮", "  ◆ │", "  │ ○", "▶ ├─⊗", "  │ │", "  │ │", "    │", "    ○"]),
+    ];
+    for (lanes, want) in want {
+        let (repo, be) = worked_example();
+        let (mut i, cfg) = make_interp(be);
+        let src = format!("treeWith ({})", lanes_opts(lanes, false));
+        let text = tree_text(&mut i, &cfg, &src, repo);
+        let heads: Vec<String> = text
+            .lines()
+            .take(9)
+            .map(|l| upto_col(l, 2 + 2 * lanes).trim_end().to_string())
+            .collect();
+        assert_eq!(heads, want, "lanes {}\n{}", lanes, text);
+    }
+}
+
+#[test]
+fn a_run_count_never_covers_a_rail() {
+    // the count was written from the character after the run's `╎`, over
+    // whatever lay there: a trunk run below a commit whose side children
+    // are newer than the run lost their reserved rails on its row. A dry
+    // run's `new` on an older trunk commit draws one, as minted commits
+    // come last.
+    let t = now();
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let ids = ["kaaaaaaa", "kbbbbbbb", "kccccccc", "kddddddd", "keeeeeee", "kfffffff", "kggggggg"];
+    let trunk: Vec<Value> = ids
+        .iter()
+        .map(|id| own_commit(id, "", if *id == "kggggggg" { &["main"] } else { &[] }))
+        .collect();
+    let s = own_commit("ksssssss", "side", &[]);
+    let u = own_commit("kuuuuuuu", "later", &[]);
+    let w = own_commit("kwwwwwww", "wip", &[]);
+    let mut metas: Vec<(String, MetaInfo)> = vec![meta(ROOT_ID, "R", 1)];
+    for (k, id) in ids.iter().enumerate() {
+        metas.push(meta(id, "A", t - 100 + 10 * k as i64));
+    }
+    metas.push(meta("kwwwwwww", "A", t - 20));
+    metas.push(meta("ksssssss", "A", t - 10));
+    metas.push(meta("kuuuuuuu", "A", t - 5));
+    // a → b → c → d → e → f → g (main) → wip, and c's side children `side`
+    // and `later`: two runs, a–b and d–f, and c reserves lanes for both
+    let mut chain = subtree(trunk[6].clone(), vec![subtree(w, vec![])]);
+    for k in (3..6).rev() {
+        chain = subtree(trunk[k].clone(), vec![chain]);
+    }
+    chain = subtree(trunk[2].clone(), vec![chain, subtree(s, vec![]), subtree(u, vec![])]);
+    for k in (0..2).rev() {
+        chain = subtree(trunk[k].clone(), vec![chain]);
+    }
+    let repo = repo_of(root, vec![chain], None);
+    // the d–f run passes lanes 1 and 2 (lane 1 only at lanes = 2, where
+    // `later` overflows); its count follows the rightmost of them
+    for (lanes, run) in [(2, "  ╎ │ 3"), (3, "  ╎ │ │ 3"), (4, "  ╎ │ │ 3")] {
+        let (mut i, cfg) = make_interp(backend_with(metas.clone()));
+        let src = format!(
+            "treeWith ({{ detail = 0, margin = false, elide = true, icons = false, color = \"never\", lanes = {}, author = false, date = false, files = false }}) . by @kwww",
+            lanes
+        );
+        let text = tree_text(&mut i, &cfg, &src, repo.clone());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "  ╎ 2", "lanes {}\n{}", lanes, text);
+        assert_eq!(lines[2], run, "lanes {}\n{}", lanes, text);
+        // the id column is where it is without the count
+        let id = col_of(row_of(&text, "@kggg"), "@kggg");
+        assert_eq!(id, 2 + 2 * lanes + 1, "lanes {}\n{}", lanes, text);
+    }
+}
 
 
 // ----------------------------------------------------------------------
-// terminal-width truncation (§Step 4). Only runs on a tty in the binary,
-// so it is driven directly here.
+// terminal-width truncation (§Step 4). Only a tty has a width in the
+// binary, so it is driven here through `tree_with_width`.
 // ----------------------------------------------------------------------
 
-fn truncate_one(line: &str, term_w: usize) -> String {
-    let mut lines = vec![line.to_string()];
-    // msg_off 18 matches the rendered layout: rails, glyph and id column
-    j::render::truncate_lines(&mut lines, term_w, 18, true, true);
-    lines.pop().unwrap()
+/// The tree rows `treeWith opts` draws on a terminal `w` columns wide, the
+/// legend (set at the bottom once a row fills the width) left out.
+fn rows_on_terminal(i: &mut Interp, cfg: &config::Config, opts: &str, repo: &Value, w: usize) -> Vec<String> {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(opts, outer).unwrap();
+    let env = i.global_env();
+    let o = i.eval(&Rc::new(e), &env).unwrap();
+    let text = j::render::tree_with_width(i, &o, repo, Some(w)).unwrap();
+    let text = text.as_text().unwrap();
+    text.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// A focused commit with `msg` and the label `lbl` on a root.
+fn one_row_repo(msg: &str) -> Value {
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", msg, &["lbl"], vec![("f", "x")]);
+    repo_of(root, vec![subtree(a, vec![])], Some(0))
+}
+
+const ONE_ROW_OPTS: &str =
+    "{ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false }";
+
+#[test]
+fn truncation_cuts_only_the_message() {
+    // the cut kept only what followed the *last* two-space run, the author
+    // initials: labels were cut (`mast…`) and the age dropped, and a message
+    // that fitted still got `…`
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let w = 40;
+    let rows = rows_on_terminal(&mut i, &cfg, &worked_opts(2, false), &repo, w);
+    let ctx = rows.join("\n");
+    let msg_col = col_of(row_of(&ctx, "@wqzt"), "wip");
+    let lab_col = col_of(row_of(&ctx, "@kpqx"), "main");
+    assert_eq!(col_of(row_of(&ctx, "@wqzt"), "feature"), lab_col, "labels moved\n{}", ctx);
+    // 18 columns before the message and 17 after it (`feature  2d  mo`)
+    // leave it 5
+    let fits = 5;
+    for (id, msg, age) in WORKED_ROWS.iter() {
+        let row = row_of(&ctx, id);
+        assert!(j::render::width(row) <= w, "{} is {} cols\n{}", id, j::render::width(row), ctx);
+        // labels and the margin are whole and in their columns
+        assert!(row.ends_with(&format!("{}  {}", age, if *id == "@ptlm" { "ak" } else { "mo" })),
+            "{} margin\n{}", id, ctx);
+        assert_eq!(col_of(row, age), col_of(row_of(&ctx, "@aaaa"), "3w"), "{} margin\n{}", id, ctx);
+        // the message column (`⋯ n` included): whole when it fits, else a
+        // prefix of it and `…`
+        let full = if *id == "@ptlm" { "docs  ⋯ 3" } else { msg };
+        let shown = between_cols(row, msg_col, lab_col);
+        let shown = shown.trim_end();
+        match shown.strip_suffix('…') {
+            Some(head) => assert!(
+                j::render::width(full) > fits && !head.is_empty() && full.starts_with(head),
+                "{} cut to {:?}\n{}", id, shown, ctx
+            ),
+            None => assert!(
+                j::render::width(full) <= fits && shown == full,
+                "{} shows {:?}\n{}", id, shown, ctx
+            ),
+        }
+    }
+}
+
+/// The characters of `line` from display column `from` up to `to`.
+fn between_cols(line: &str, from: usize, to: usize) -> String {
+    let mut col = 0;
+    let mut out = String::new();
+    for c in line.chars() {
+        if col >= from && col < to {
+            out.push(c);
+        }
+        col += j::render::width(&c.to_string());
+    }
+    out
+}
+
+#[test]
+fn truncation_cuts_rows_without_labels_or_margin() {
+    // with no label column and no margin nothing was ever cut
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let a = commit("kaaaaaaa", &"a long message ".repeat(6), &[], vec![("f", "x")]);
+    let repo = repo_of(root, vec![subtree(a, vec![])], Some(0));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 30).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.starts_with("▶ ◉") && row.ends_with('…'), "{:?}", row);
+    assert_eq!(j::render::width(row), 30, "{:?}", row);
+}
+
+#[test]
+fn truncation_keeps_the_tail_and_fits() {
+    let repo = one_row_repo(&"message ".repeat(20));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 60).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.ends_with("…  lbl"), "tail lost: {:?}", row);
+    assert!(j::render::width(row) <= 60, "{} cols: {:?}", j::render::width(row), row);
+}
+
+#[test]
+fn truncation_keeps_colours_closed() {
+    // the cut runs on the coloured message (bold on the focus row): the
+    // escape sequences are kept, not counted as width or cut in half
+    unsafe { std::env::remove_var("NO_COLOR") };
+    let repo = one_row_repo(&"message ".repeat(20));
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let opts = ONE_ROW_OPTS.replace("\"never\"", "\"always\"");
+    let rows = rows_on_terminal(&mut i, &cfg, &opts, &repo, 60).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.contains("…\x1b[0m"), "{:?}", row);
+    // the focus band pads the row to the terminal's width, and no further
+    assert_eq!(j::render::width(row), 60, "{:?}", row);
+}
+
+#[test]
+fn truncation_leaves_short_lines_alone() {
+    let repo = one_row_repo("short");
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
+    let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, 100).join("\n");
+    let row = row_of(&rows, "@kaaa");
+    assert!(row.contains("  short  lbl") && !row.contains('…'), "{:?}", row);
 }
 
 #[test]
 fn truncation_handles_multibyte_messages() {
     // the head was sliced with a *char* count used as a *byte* index, which
     // panics whenever that index lands inside a multi-byte character
-    let tail = "  label";
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
     for n in 1..80 {
+        let repo = one_row_repo(&"ω".repeat(n));
         for w in [20usize, 30, 40, 50, 60, 80] {
-            let msg: String = "ω".repeat(n);
-            let line = format!("  ●        @abcd  {}{}", msg, tail);
-            let got = truncate_one(&line, w);
+            let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, w).join("\n");
+            let row = row_of(&rows, "@kaaa");
+            // only the message is cut: the gutter, rails, id, bar and label
+            // take 25 columns whatever the width
             assert!(
-                j::render::width(&got) <= w.max(j::render::width(tail) + 2),
+                j::render::width(row) <= w.max(25),
                 "n={} w={} -> {:?} ({} cols)",
                 n,
                 w,
-                got,
-                j::render::width(&got)
+                row,
+                j::render::width(row)
             );
+            // (on a wide terminal the legend follows it)
+            assert!(row.contains("  lbl"), "n={} w={} -> {:?}", n, w, row);
         }
     }
 }
 
 #[test]
-fn truncation_keeps_the_tail_and_fits() {
-    let line = format!("  ●        @abcd  {}  bookmark", "message ".repeat(20));
-    let got = truncate_one(&line, 60);
-    assert!(got.contains('…'), "no ellipsis: {:?}", got);
-    assert!(got.ends_with("bookmark"), "tail lost: {:?}", got);
-    assert!(j::render::width(&got) <= 60, "{} cols: {:?}", j::render::width(&got), got);
-}
-
-#[test]
-fn truncation_leaves_short_lines_alone() {
-    let line = "  ●        @abcd  short  label";
-    assert_eq!(truncate_one(line, 100), line);
-}
-
-#[test]
 fn truncation_survives_mixed_scripts() {
     // wide (CJK), combining and ASCII in one message
+    let (mut i, cfg) = make_interp(backend_with(vec![meta(ROOT_ID, "R", 1)]));
     for msg in [
         "日本語のテキストがとても長い場合の折り返し処理",
         "réfactorisation très importante — étape finale ✓",
         "αβγδε ωωωωω ✓✓✓ ascii tail here",
         "a̐éö̲ combining marks",
     ] {
+        let repo = one_row_repo(msg);
         for w in [10usize, 25, 45, 70] {
-            let line = format!("  ●        @abcd  {}  lbl", msg);
-            let got = truncate_one(&line, w);
-            assert!(!got.is_empty(), "msg={:?} w={}", msg, w);
+            let rows = rows_on_terminal(&mut i, &cfg, ONE_ROW_OPTS, &repo, w).join("\n");
+            let row = row_of(&rows, "@kaaa");
+            assert!(j::render::width(row) <= w.max(25), "msg={:?} w={} -> {:?}", msg, w, row);
+            assert!(row.contains("  lbl"), "msg={:?} w={} -> {:?}", msg, w, row);
         }
     }
 }

@@ -99,6 +99,324 @@ fn alias_contracts_unfold() {
     assert!(m.contains("at"), "{}", m);
 }
 
+/// The reference config with `extra` appended, loaded and evaluated.
+fn make_interp_with(extra: &str) -> (Interp, config::Config) {
+    let src = format!("{}\n{}", CONFIG, extra);
+    let cfg = config::load_config(&src).expect("config must load");
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).expect("config must evaluate");
+    (i, cfg)
+}
+
+fn assert_value(i: &mut Interp, cfg: &config::Config, src: &str, want: Value) {
+    let got = ev(i, cfg, src).unwrap_or_else(|m| panic!("{} crashed: {}", src, m));
+    assert!(
+        value_eq(&got, &want).unwrap(),
+        "{} gave {}",
+        src,
+        j::show::show(i, &got).unwrap()
+    );
+}
+
+#[test]
+fn function_argument_to_a_signed_definition_is_a_contract_crash() {
+    // §4.13: every argument is checked against its parameter. A signed
+    // definition given a function where its signature wants a Repo or a
+    // Text composed with it instead, so `new new` was the edit "new twice"
+    // (and `j new new` persisted two commits) and `or` had nothing to catch.
+    let (mut i, cfg) = make_interp();
+    let m = crash_msg(&mut i, &cfg, "new new");
+    assert!(
+        m.contains("new expected Repo (record) as argument 1, got function"),
+        "{}",
+        m
+    );
+    let m = crash_msg(&mut i, &cfg, "describe (\\r -> \"m\")");
+    assert!(m.contains("describe expected Text as argument 1, got function"), "{}", m);
+    assert_value(&mut i, &cfg, "describe (\\r -> \"m\") or 42", Value::int(42));
+    let m = crash_msg(&mut i, &cfg, "squash new");
+    assert!(m.contains("squash expected Repo (record) as argument 1, got function"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "(tree . squash) new");
+    assert!(m.contains("expected Repo (record) as argument 1, got function"), "{}", m);
+}
+
+#[test]
+fn composition_applied_to_a_function_applies() {
+    // §4.9: (f . g) x = f (g x), whatever x is. A function argument composed
+    // pointwise instead, and so did every part whose next parameter was a
+    // type variable: `(show . id) not` crashed inside `not`.
+    let (mut i, cfg) = make_interp();
+    assert_value(&mut i, &cfg, "(show . id) not", Value::text("not"));
+    assert_value(&mut i, &cfg, "(const 1 . id) not", Value::int(1));
+    assert_value(&mut i, &cfg, "((\\x -> show x) . id) not", Value::text("not"));
+}
+
+#[test]
+fn composition_argument_belongs_to_the_right_operand() {
+    // §4.9: in (f . g) x the argument is g's. When g's contract was unknown
+    // (a selector, an unsigned composition, an `or`), x was checked against
+    // f's parameter instead.
+    let (mut i, cfg) = make_interp_with("foo : Int -> a\nfoo = \\x y -> [y]\n");
+    assert_value(&mut i, &cfg, "(length . .xs) ({ xs = [1 2] })", Value::int(2));
+    assert_value(&mut i, &cfg, "(not . .b) ({ b = true })", Value::bool(false));
+    assert_value(&mut i, &cfg, "(length . (\\r -> [r]) . (\\r -> r)) 5", Value::int(1));
+    assert_value(&mut i, &cfg, "(length . ((\\x -> [x]) or id) . id) 5", Value::int(1));
+    // g's own contract is used up, so x goes unchecked into it, not into f
+    assert_value(&mut i, &cfg, "(length . foo 1) \"abc\"", Value::int(1));
+    // a known g still checks its argument, numbered as g's
+    let m = crash_msg(&mut i, &cfg, "(length . head) 5");
+    assert!(
+        m.contains("(length . head) expected [a] (a list) as argument 1, got Int"),
+        "{}",
+        m
+    );
+}
+
+#[test]
+fn signatures_hold_whatever_the_definition_is_built_from() {
+    // §4.13: a signature is checked at every application of the definition,
+    // whether its value is a lambda, a composition, a builtin's partial
+    // application, an `or`, or a label.
+    let (mut i, cfg) = make_interp_with(
+        r#"
+inc : Int -> Int
+inc = \x -> x + 1
+
+twice : Int -> Text
+twice = inc . inc
+
+safeNew : Edit
+safeNew = new or id
+
+keep : Int -> Text
+keep = (\x -> x) or show
+
+choose : Int -> Int -> Int
+choose = (\a b -> a) or (\a b -> b)
+
+mainCount : Repo -> Int
+mainCount = %main
+
+addT : Int -> Int -> Text
+addT = (+) . inc
+
+sumInc : Int -> Int -> Int
+sumInc = (+) . inc
+
+badEdit : Text -> Edit
+badEdit = (\e r -> 5) . describe
+
+constT : Int -> Int -> Text
+constT = const (\y -> y)
+"#,
+    );
+    // a signed composition checks its argument and its result
+    let m = crash_msg(&mut i, &cfg, "twice 1");
+    assert!(m.contains("twice: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "twice \"x\"");
+    assert!(m.contains("twice expected Int as argument 1, got Text"), "{}", m);
+    // a signed `or` checks its argument before either side runs, and its
+    // result after the fallback, not inside either side (§4.6)
+    let m = crash_msg(&mut i, &cfg, "safeNew 5");
+    assert!(m.contains("safeNew expected Repo (record) as argument 1, got Int"), "{}", m);
+    assert_value(&mut i, &cfg, "safeNew 5 or 7", Value::int(7));
+    let m = crash_msg(&mut i, &cfg, "keep 1");
+    assert!(m.contains("keep: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "keep \"x\"");
+    assert!(m.contains("keep expected Int as argument 1, got Text"), "{}", m);
+    // ... through every argument the signature lists
+    assert_value(&mut i, &cfg, "choose 1 2", Value::int(1));
+    let m = crash_msg(&mut i, &cfg, "choose 1 \"x\"");
+    assert!(m.contains("choose expected Int as argument 2, got Text"), "{}", m);
+    // a signed label literal
+    let m = crash_msg(&mut i, &cfg, "mainCount 5");
+    assert!(m.contains("mainCount expected Repo (record) as argument 1, got Int"), "{}", m);
+    let m = crash_msg(
+        &mut i,
+        &cfg,
+        "mainCount ({ root = { files = [], message = \"\", labels = [], id = @ }, children = [], context = [] })",
+    );
+    assert!(m.contains("mainCount: result expected Int, got list"), "{}", m);
+    // a composition or a builtin's partial application that consumes fewer
+    // arguments than the signature lists returns a function, which is the
+    // definition's partial application under the rest of the signature: its
+    // later arguments and its result were checked by nothing, or by the
+    // builtin it happened to return
+    let m = crash_msg(&mut i, &cfg, "addT 1 5");
+    assert!(m.contains("addT: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "addT 1 \"x\"");
+    assert!(m.contains("addT expected Int as argument 2, got Text"), "{}", m);
+    assert_value(&mut i, &cfg, "sumInc 1 5", Value::int(7));
+    assert_value(&mut i, &cfg, "show (sumInc 1)", Value::text("sumInc 1"));
+    let m = crash_msg(
+        &mut i,
+        &cfg,
+        "badEdit \"x\" ({ root = { files = [], message = \"\", labels = [], id = @ }, children = [], context = [] })",
+    );
+    assert!(m.contains("badEdit: result expected record, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "constT 1 2");
+    assert!(m.contains("constT: result expected Text, got Int"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "constT 1 \"x\"");
+    assert!(m.contains("constT expected Int as argument 2, got Text"), "{}", m);
+    // the arguments baked into the value are not the definition's own
+    assert_value(&mut i, &cfg, "show (constT 1)", Value::text("constT 1"));
+}
+
+#[test]
+fn a_signed_definition_shows_as_its_name_and_its_own_arguments() {
+    // §5.2: a top-level definition with a signature whose value is a
+    // function renders as its name, and its partial application as its name
+    // followed by the arguments it was given; any other renders as its value.
+    // A signed definition bound to a lambda's partial application showed
+    // the arguments baked into its value as its own: `show prev` was
+    // `prev (parents)`, and `show (addTwo 2)` was `addTwo 1 2`, which is an
+    // Int, not the function it is. One bound to a builtin's partial
+    // application or a composition showed as that, `show tree` as
+    // `treeWith ({ … })`.
+    let (mut i, cfg) = make_interp_with(
+        r#"
+sum3 = \a b -> \c -> a + b + c
+
+addTwo : Int -> Int -> Int
+addTwo = sum3 1
+
+sum3b = \a b c -> a + b + c
+
+addB : Int -> Int -> Int
+addB = sum3b 1
+
+inc : Int -> Int
+inc = \x -> x + 1
+
+constS : Int -> Int -> Int
+constS = const inc
+
+plus : Int -> Int -> Int
+plus = (+)
+
+dd : Path -> a
+dd = difft
+
+k3 : (Int -> Int -> Int) -> b
+k3 = foldl
+
+ff : a
+ff = foldl
+
+k4 : a
+k4 = foldl (+)
+
+incU = \x -> x + 1
+
+incAll = map incU
+"#,
+    );
+    for (src, want) in [
+        ("show prev", "prev"),
+        ("show next", "next"),
+        ("show trunk", "trunk"),
+        ("show stack", "stack"),
+        ("show addTwo", "addTwo"),
+        ("show (addTwo 2)", "addTwo 2"),
+        ("show addB", "addB"),
+        ("show (addB 2)", "addB 2"),
+        ("show constS", "constS"),
+        ("show (constS 5)", "constS 5"),
+        ("show plus", "plus"),
+        ("show (plus 1)", "plus 1"),
+        ("show tree", "tree"),
+        ("show squash", "squash"),
+        ("show everything", "everything"),
+        // a builtin that takes more arguments than a signature ending in a
+        // type variable lists shows all it is given after the definition's
+        // name: the signature stops counting at its end, and `k3 (+) 0`
+        // showed as `k3 0`, which pasted back passes k3 `0` where it wants
+        // a function
+        ("show (dd ./a)", "dd [\"a\"]"),
+        ("show (dd ./a (blob \"x\"))", "dd [\"a\"] (blob \"x\")"),
+        ("show (k3 (+))", "k3 ((+))"),
+        ("show (k3 (+) 0)", "k3 ((+)) 0"),
+        ("show ff", "ff"),
+        ("show (ff (+))", "ff ((+))"),
+        ("show (ff (+) 0)", "ff ((+)) 0"),
+        ("show k4", "k4"),
+        ("show (k4 0)", "k4 0"),
+        // a builtin, and its partial application, keep theirs
+        ("show ((+) 1)", "(+) 1"),
+        ("show (const 1)", "const 1"),
+        ("show map", "map"),
+        // and any other definition renders as its value
+        ("show sum3", "\\a b -> \\c -> a + b + c"),
+        ("show (sum3 1)", "(\\a b -> \\c -> a + b + c) 1"),
+        ("show incU", "\\x -> x + 1"),
+        ("show incAll", "map (\\x -> x + 1)"),
+    ] {
+        assert_value(&mut i, &cfg, src, Value::text(want));
+    }
+    // `user` too, as it is not a function, though it has a signature
+    assert_value(
+        &mut i,
+        &cfg,
+        "show user == show ({ name = user.name, email = user.email })",
+        Value::bool(true),
+    );
+    // the arguments are still numbered by the signature, and applied
+    assert_value(&mut i, &cfg, "addTwo 2 3", Value::int(6));
+    assert_value(&mut i, &cfg, "plus 1 2", Value::int(3));
+    let m = crash_msg(&mut i, &cfg, "addTwo 2 \"x\"");
+    assert!(m.contains("addTwo expected Int as argument 2, got Text"), "{}", m);
+    let m = crash_msg(&mut i, &cfg, "plus 1 \"x\"");
+    assert!(m.contains("plus expected Int as argument 2, got Text"), "{}", m);
+    // what the ones past their signature show as pastes back to the same
+    // function
+    assert_value(&mut i, &cfg, "k3 ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "ff ((+)) 0 [1 2 3]", Value::int(6));
+    assert_value(&mut i, &cfg, "k4 0 [1 2 3]", Value::int(6));
+    // and a function displays as it shows (§5.1)
+    let v = ev(&mut i, &cfg, "{ a = tree, b = addTwo 2, c = k3 (+) 0 }").unwrap();
+    let out = display(&mut i, &v);
+    assert_eq!(out, "a  tree\nb  addTwo 2\nc  k3 ((+)) 0\n");
+}
+
+#[test]
+fn arguments_are_numbered_by_the_signature() {
+    // §4.13 ("describe expected Text as argument 1"): a definition that is a
+    // partial application or a composition counted the arguments baked into
+    // it, so `tree 5` said argument 2 and `squash 5` argument 3
+    let (mut i, cfg) = make_interp();
+    for (src, name) in [
+        ("tree 5", "tree"),
+        ("treeCompact 5", "treeCompact"),
+        ("trunk 5", "trunk"),
+        ("squash 5", "squash"),
+    ] {
+        let m = crash_msg(&mut i, &cfg, src);
+        assert!(
+            m.contains(&format!("{} expected Repo (record) as argument 1, got Int", name)),
+            "{}: {}",
+            src,
+            m
+        );
+    }
+}
+
+#[test]
+fn function_signature_on_a_non_function_value_fails_at_load() {
+    // §4.13: a definition that is not a lambda is checked against its
+    // signature at load; for a function type that means being a function
+    let src = format!("{}\nmyEdit : Edit\nmyEdit = 5\n", CONFIG);
+    let cfg = config::load_config(&src).unwrap();
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    match config::eval_config(&mut i, &cfg) {
+        Ok(_) => panic!("a non-function Edit should not load"),
+        Err(c) => assert!(
+            c.msg.contains("contract: myEdit: expected a function, got Int"),
+            "{}",
+            c.msg
+        ),
+    }
+}
+
 // ------------------------------------------------------------------
 // display shapes (§5.1)
 // ------------------------------------------------------------------
@@ -164,7 +482,10 @@ fn display_commit_block() {
     assert!(out.contains("Ann Author"), "{}", out);
     assert!(out.contains("2h"), "{}", out);
     assert!(out.contains("1 files"), "{}", out);
-    assert!(out.contains("a/b.rs"), "{}", out);
+    // no repository in context, so no parent to compare against: what it
+    // changes is not known, and its files are listed unmarked (§5.1)
+    assert!(out.contains("\n\n    a/b.rs\n"), "{}", out);
+    assert!(!out.contains('+'), "{}", out);
     // id renders with the unique prefix
     assert!(out.contains("kqqq"), "{}", out);
 }

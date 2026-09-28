@@ -2,7 +2,7 @@
 //! (§7, §10). Two implementations: an in-memory backend for tests, and the
 //! jj-lib backend.
 
-use crate::value::{BlobContent, BlobKind, BlobVal, Crash, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -42,18 +42,37 @@ pub trait Backend {
     fn meta(&self, id: &str) -> Result<MetaInfo, Crash>;
     /// True if the change id denotes a merge commit (2+ parents).
     fn is_merge(&self, id: &str) -> bool;
-    /// True if the commit's tree contains a conflict, if the backend can say
-    /// without reading files (jj: O(1)); None means "unknown, compare files".
+    /// True if the stored commit's tree contains a conflict, if the backend
+    /// can say without reading files (jj: O(1)); None means "unknown, compare
+    /// files". It describes a commit value only while that value still holds
+    /// the stored files (`ThunkVal::origin`), which is when the renderer asks.
     fn has_conflict(&self, _id: &str) -> Option<bool> {
         None
     }
-    /// True if the commit's tree equals its first parent's tree, if the
-    /// backend can say without reading files; None means "compare files".
-    fn is_empty(&self, _id: &str) -> Option<bool> {
+    /// True if the stored commit `id`'s tree equals the stored commit
+    /// `parent`'s, if the backend can say without reading files; None means
+    /// "compare files". Asked, like `has_conflict`, only for values that still
+    /// hold both stored trees.
+    fn is_empty(&self, _id: &str, _parent: &str) -> Option<bool> {
         None
     }
-    /// All ancestors (inclusive) of the given change ids.
+    /// All ancestors (inclusive) of the given change ids, through every
+    /// parent of a merge, not only the first (§7.5 step 3).
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String>;
+
+    /// True if the working directory's filesystem folds case, so `.GIT`
+    /// names `.git` and jj's checkout refuses it (§7.5 step 1).
+    fn folds_case(&self) -> bool {
+        false
+    }
+
+    /// True if the working directory's filesystem holds a file named
+    /// `name`, a path component longer than `repo::NAME_MAX` bytes that a
+    /// checkout would create (§7.5 step 1). A filesystem that counts its
+    /// limit in bytes, as ext4 does, holds none.
+    fn name_fits(&self, name: &str) -> bool {
+        name.len() <= crate::repo::NAME_MAX
+    }
 
     /// jj tree merge (§7.3): replay the change from->to onto `onto`.
     fn replay(
@@ -107,11 +126,54 @@ pub fn snapshot_map(entries: &[Value]) -> Result<BTreeMap<Vec<String>, Value>, C
                     .map_err(|_| Crash::new("replay: not a well-formed snapshot (path component not Text)"))
             })
             .collect::<Result<Vec<String>, Crash>>()?;
+        // `./` is the root directory, which no entry can be
+        if path.is_empty() {
+            return Err(Crash::new(
+                "replay: not a well-formed snapshot (an entry at the root path ./)",
+            ));
+        }
         if m.insert(path, content).is_some() {
             return Err(Crash::new("replay: not a well-formed snapshot (duplicate paths)"));
         }
     }
+    if let Some(p) = file_and_directory(m.keys()) {
+        return Err(Crash::new(format!(
+            "replay: not a well-formed snapshot (`{}` is both a file and a directory)",
+            p.join("/")
+        )));
+    }
     Ok(m)
+}
+
+/// The first of `sorted` paths that is also a directory of another: a tree
+/// holds `a` as a file or as a directory, never both (§7.3). A path's
+/// descendants sort directly after it (`a` < `a/b` < `a.txt`), so comparing
+/// each path with the next finds every clash.
+pub fn file_and_directory<'a>(
+    sorted: impl IntoIterator<Item = &'a Vec<String>>,
+) -> Option<&'a [String]> {
+    let mut prev: Option<&'a Vec<String>> = None;
+    for p in sorted {
+        if let Some(q) = prev {
+            if p.len() > q.len() && p.starts_with(q) {
+                return Some(q);
+            }
+        }
+        prev = Some(p);
+    }
+    None
+}
+
+/// The crash of a replay whose result would make `path` a file on one side
+/// and a directory on another, naming the path: one entry cannot list the
+/// directory's entries (§7.3). The jj backend merges such a path as one
+/// value and the in-memory one path by path, so they need not refuse the
+/// same merges (§10).
+pub fn file_directory_clash(path: &[String]) -> Crash {
+    Crash::new(format!(
+        "replay: `{}` would be a file on one side and a directory on another",
+        path.join("/")
+    ))
 }
 
 pub fn map_to_snapshot(m: BTreeMap<Vec<String>, Value>) -> Vec<Value> {
@@ -147,7 +209,7 @@ fn empty_blob() -> Value {
     }))
 }
 
-fn conflict_blob(sides: Vec<Rc<Vec<u8>>>) -> Value {
+fn conflict_blob(sides: Vec<Option<ConflictSide>>) -> Value {
     Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
         content: BlobContent::Conflict(sides),
@@ -202,27 +264,39 @@ pub fn simple_replay(
                 } else if !t_present && !o_present {
                     // both deleted
                 } else {
-                    // conflict: sides [to, from, onto] (add, remove, add)
-                    let get_bytes = |v: &Value, present: bool| -> Result<Rc<Vec<u8>>, Crash> {
+                    // conflict: sides [to, from, onto] (add, remove, add),
+                    // each absent or with its own file type (§7.3)
+                    let side = |v: &Value, present: bool| -> Result<Option<ConflictSide>, Crash> {
                         if !present {
-                            return Ok(Rc::new(Vec::new()));
+                            return Ok(None);
                         }
                         match v {
-                            Value::Blob(b) => Ok(Rc::new(b.bytes()?)),
-                            _ => Ok(Rc::new(Vec::new())),
+                            Value::Blob(b) => Ok(Some(ConflictSide {
+                                kind: b.kind.clone(),
+                                bytes: Rc::new(b.bytes()?),
+                                tree: None,
+                            })),
+                            _ => Ok(Some(ConflictSide::regular(&[]))),
                         }
                     };
                     out.insert(
                         p,
                         conflict_blob(vec![
-                            get_bytes(&t, t_present)?,
-                            get_bytes(&f, f_present)?,
-                            get_bytes(&o, o_present)?,
+                            side(&t, t_present)?,
+                            side(&f, f_present)?,
+                            side(&o, o_present)?,
                         ]),
                     );
                 }
             }
         }
+    }
+    // a file at a path and entries below it cannot be one snapshot. jj
+    // keeps the path as one conflict with the directory as a side, and
+    // refuses that unless one of the three held a conflict there; this
+    // merge keeps no directory as a side, so it always refuses (§7.3, §10)
+    if let Some(p) = file_and_directory(out.keys()) {
+        return Err(file_directory_clash(p));
     }
     Ok(map_to_snapshot(out))
 }
@@ -247,6 +321,9 @@ pub struct MemBackend {
     pub conflicts: HashMap<String, bool>,
     /// id -> the commit's tree equals its first parent's
     pub empties: HashMap<String, bool>,
+    /// what `folds_case` answers: a working directory on a case-folding
+    /// filesystem, which no test machine need have
+    pub folds_case: bool,
 }
 
 impl MemBackend {
@@ -264,11 +341,13 @@ impl MemBackend {
 }
 
 /// A snapshot that is only materialised on first use, the way the jj backend
-/// builds a commit's `files` (§7.2). The laziness must stay invisible to the
-/// language, which is exactly what is easy to get wrong, so tests need to be
-/// able to build repos this way.
-pub fn lazy_files(entries: Vec<Value>) -> Value {
-    Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+/// builds a commit's `files` (§7.2): tagged as the stored tree of commit `id`,
+/// so a backend's answers about that commit apply while it holds this list.
+/// The laziness must stay invisible to the language, which is exactly what is
+/// easy to get wrong, so tests need to be able to build repos this way. The
+/// tree has no name (`ThunkVal::tree`): nothing here makes `entries` a tree.
+pub fn lazy_files(id: &str, entries: Vec<Value>) -> Value {
+    Value::Thunk(Rc::new(crate::value::ThunkVal::stored(id.to_string(), None, move || {
         Ok(Value::list(entries))
     })))
 }
@@ -294,13 +373,18 @@ impl Backend for MemBackend {
         }
         Some(self.conflicts.get(id).copied().unwrap_or(false))
     }
-    fn is_empty(&self, id: &str) -> Option<bool> {
+    fn is_empty(&self, id: &str, parent: &str) -> Option<bool> {
         if !self.answers_tree_queries {
             return None;
         }
-        // like jj: only answerable against a recorded first parent
-        self.parents.get(id)?.first()?;
+        // `empties` records each commit against its first parent only
+        if self.parents.get(id)?.first()? != parent {
+            return None;
+        }
         Some(self.empties.get(id).copied().unwrap_or(false))
+    }
+    fn folds_case(&self) -> bool {
+        self.folds_case
     }
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();

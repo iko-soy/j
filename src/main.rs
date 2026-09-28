@@ -12,23 +12,37 @@ use std::rc::Rc;
 const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)";
 
 fn err(status: u8, msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("j: {}", msg);
+    j::report!("j: {}", msg);
     ExitCode::from(status)
 }
 
 /// Report a failure that ends the process, keeping the status as a number so
 /// callers do not have to recover it from an `ExitCode`.
 fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
-    eprintln!("j: {}", msg);
+    j::report!("j: {}", msg);
     status
 }
 
+/// Write a run's output to stdout (§1.2.9, `ops`). A reader that stops early
+/// (`j tree | head`) closes the pipe; that is not a failure (§1.4), so the
+/// rest is dropped and the run still succeeds. Any other write failure is an
+/// error line. `print!` would panic on either.
+fn print_output(s: &str) -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => err(1, format!("cannot write output: {}", e)),
+    }
+}
+
 fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
-    eprintln!("j: crash: {}", c.msg);
+    j::report!("j: crash: {}", c.msg);
     match (&c.def, expr_text) {
-        (Some(d), Some(e)) => eprintln!("   in {}, from {}", d, e),
-        (None, Some(e)) => eprintln!("   from {}", e),
-        (Some(d), None) => eprintln!("   in {}", d),
+        (Some(d), Some(e)) => j::report!("   in {}, from {}", d, e),
+        (None, Some(e)) => j::report!("   from {}", e),
+        (Some(d), None) => j::report!("   in {}", d),
         (None, None) => {}
     }
     ExitCode::from(1)
@@ -58,7 +72,7 @@ fn load_config_file() -> Result<(Config, String), u8> {
             if let Err(e) = write_default_config(&path) {
                 return Err(fail(3, format!("cannot create config at {}: {}", path, e)));
             }
-            eprintln!("j: created an editable default config at {}", path);
+            j::report!("j: created an editable default config at {}", path);
             match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => return Err(fail(3, format!("cannot read config at {}: {}", path, e))),
@@ -93,12 +107,16 @@ fn main() -> ExitCode {
     // evaluation builds deep continuation chains (trampolined, but the final
     // continuation still tears down by recursive Drop), so run the real work
     // on a thread with a large stack to keep very deep histories safe
-    std::thread::Builder::new()
+    let code = std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
         .spawn(run)
         .expect("failed to spawn worker thread")
         .join()
-        .expect("worker thread panicked")
+        .expect("worker thread panicked");
+    // §1.3: a signal to stop that came while the working copy was checked
+    // out takes effect now, once the run has said what it had to
+    j::jj::raise_deferred();
+    code
 }
 
 /// True when stdin has input (or end-of-input) waiting within `ms`
@@ -114,18 +132,25 @@ fn stdin_is_ready(ms: i32) -> bool {
 }
 
 fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // §1: an expression is text, so an argument that is not UTF-8 is a
+    // usage error (`std::env::args` would panic on it)
+    let args: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+        Ok(args) => args,
+        Err(a) => return err(2, format!("argument is not valid UTF-8: {:?}", a)),
+    };
     // §1: stdin vs arguments. With no arguments the expression comes from
     // stdin, so reading to end-of-input is the whole point. With arguments,
     // stdin is only read to report the "both" error — and reading it blindly
     // hangs whenever the process inherited a pipe nobody is writing to (a
     // shell loop, a CI step), so wait only briefly for input to appear.
-    let mut stdin_content = String::new();
+    // Bytes that are not UTF-8 are input too, and an error only once they
+    // are the expression.
+    let mut stdin_content = Vec::new();
     let stdin_has_data = {
         if std::io::stdin().is_terminal() {
             false
         } else if args.is_empty() || stdin_is_ready(50) {
-            match std::io::stdin().read_to_string(&mut stdin_content) {
+            match std::io::stdin().read_to_end(&mut stdin_content) {
                 Ok(n) => n > 0,
                 Err(_) => false,
             }
@@ -137,11 +162,14 @@ fn run() -> ExitCode {
         return err(2, "expression given both as arguments and on stdin");
     }
     let text = if stdin_has_data {
-        stdin_content
+        match String::from_utf8(stdin_content) {
+            Ok(text) => text,
+            Err(_) => return err(2, "the expression on stdin is not valid UTF-8"),
+        }
     } else if !args.is_empty() {
         args.join(" ")
     } else {
-        eprintln!("{}", USAGE);
+        j::report!("{}", USAGE);
         return ExitCode::from(2);
     };
 
@@ -172,12 +200,18 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             if words.len() != 2 && words.len() != 3 {
                 return err(2, "usage: j clone URL [DIR]");
             }
-            let (cfg, _) = or_exit(load_config_file());
             let dir = if words.len() == 3 {
                 words[2].to_string()
             } else {
-                default_clone_dir(words[1])
+                match default_clone_dir(words[1]) {
+                    Some(dir) => dir,
+                    None => {
+                        let msg = format!("`{}` names no directory to clone into; give one: j clone URL DIR", words[1]);
+                        return err(2, msg);
+                    }
+                }
             };
+            let (cfg, _) = or_exit(load_config_file());
             match j::jj::cmd_clone(&cfg, words[1], &dir) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => err(e.0, e.1),
@@ -243,7 +277,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             }
             let backend = or_exit(open_repo_noconfig());
             match backend.cmd_ops() {
-                Ok(()) => ExitCode::SUCCESS,
+                Ok(log) => print_output(&log),
                 Err(e) => err(e.0, e.1),
             }
         }
@@ -251,9 +285,24 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
     }
 }
 
-fn default_clone_dir(url: &str) -> String {
-    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo");
-    last.strip_suffix(".git").unwrap_or(last).to_string()
+/// `clone`'s default DIR (§1.1): the last component of `url`'s path, a
+/// final `.git` component skipped, minus `.git`, as `git clone` names it;
+/// in an scp-style `host:repo.git`, what follows the `:`. None when that
+/// leaves no name.
+fn default_clone_dir(url: &str) -> Option<String> {
+    let mut path = url.trim_end_matches('/');
+    if let Some(repo) = path.strip_suffix("/.git") {
+        path = repo.trim_end_matches('/');
+    }
+    let last = match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path.rsplit(':').next().unwrap_or(path),
+    };
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    match name {
+        "" | "." | ".." => None,
+        name => Some(name.to_string()),
+    }
 }
 
 fn or_exit<T>(r: Result<T, u8>) -> T {
@@ -319,11 +368,11 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         Err(failures) => {
             let (prefix, candidates) = &failures[0];
             if candidates.is_empty() {
-                eprintln!("j: crash: `@{}` matches no commit", prefix);
+                j::report!("j: crash: `@{}` matches no commit", prefix);
             } else {
-                eprintln!("j: crash: `@{}` is ambiguous", prefix);
+                j::report!("j: crash: `@{}` is ambiguous", prefix);
                 for c in candidates {
-                    eprintln!("   {}", c);
+                    j::report!("   {}", c);
                 }
             }
             return ExitCode::from(1);
@@ -335,6 +384,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         return err(3, format!("config.j: {}", c.msg));
     }
     *interp.old_repo.borrow_mut() = Some(loaded_repo.clone());
+    *interp.given_repo.borrow_mut() = Some(current_repo.clone());
     let env = interp.global_env();
     let expr_rc = Rc::new(expr);
     let mut v = match interp.eval(&expr_rc, &env) {
@@ -360,10 +410,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         // §1.2.9: display
         let color = j::render::color_enabled("auto");
         match j::render::display(&mut interp, &v, color) {
-            Ok(s) => {
-                print!("{}", s);
-                ExitCode::SUCCESS
-            }
+            Ok(s) => print_output(&s),
             Err(c) => crash_err(&c, Some(text)),
         }
     }

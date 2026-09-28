@@ -137,8 +137,10 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 ------------------------------------------------------------------------------
 
 -- Replay a change onto a snapshot: "onto, with the change from `from` to `to`
--- applied." Total: where the change collides with what is already there, the
--- path's blob is unresolved rather than an error.
+-- applied." Where the change collides with what is already there, the path's
+-- blob is unresolved rather than an error, except that a collision making a
+-- path a file on one side and a directory on another, as adding ./a/b onto a
+-- file ./a would, crashes, naming the path (§7.3).
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
 touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;
@@ -146,6 +148,8 @@ touchedPaths : Change -> [Path]            -- paths whose content differs, one p
 blob       : Text -> Blob                  -- a resolved regular file
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
+subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one
+                                           -- pass: what `commits` (below) is
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
                                            -- crash for a commit not yet persisted
 validate   : Repo -> Repo                  -- the repo unchanged, or the crash persisting
@@ -194,8 +198,11 @@ top = \repo -> top (up repo) or repo
 
 -- Every commit of a subtree (or of the focused subtree of a Repo), in preorder.
 -- Takes anything with `root` and `children`, so the signature is left open.
+-- The builtin is  \t -> t.root :: (concat (map commits t.children) or [])
+-- in one pass; written that way it copies the list below every commit, and
+-- so takes time quadratic in the length of the history.
 commits : a -> [Commit]
-commits = \t -> t.root :: (concat (map commits t.children) or [])
+commits = subtreeCommits
 
 
 ------------------------------------------------------------------------------
@@ -287,7 +294,7 @@ descendants : Revset                                            -- includes the 
 descendants = \repo -> map (.id) (commits repo)
 
 ancestors : Revset                                              -- includes the focus
-ancestors = \repo -> repo.root.id :: ((let p = up repo in ancestors p) or [])
+ancestors = \repo -> repo.root.id :: map (\f -> f.parent.id) repo.context
 
 siblings : Revset
 siblings = \repo -> filter (\i -> i /= repo.root.id) (kids (up repo)) or []
@@ -546,9 +553,13 @@ diffs = \repo ->
   in map (\p -> { path = p, diff = difft p (contentAt p ch.from) (contentAt p ch.to) }) (touched ch)
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
--- readable in the terminal.
+-- readable in the terminal. A focus that changes nothing reads "no changes";
+-- a difft that cannot be run (not on PATH) is a crash saying so, and
+-- otherwise whatever difft prints, even nothing, is the page.
 review : Repo -> Text
-review = \repo -> concat (map (\d -> d.diff) (diffs repo)) or "no changes\n"
+review = \repo ->
+  let ds = diffs repo
+  in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
 -- A summary of the focus.
 status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }

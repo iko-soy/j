@@ -2,8 +2,10 @@
 
 use crate::domain::ROOT_ID;
 use crate::eval::Interp;
-use crate::value::{Crash, ShapeKind, Value};
+use crate::value::{Crash, ListVal, RecordMap, ShapeKind, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
+use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
 // ----------------------------------------------------------------------
@@ -177,11 +179,57 @@ pub fn is_commit(interp: &Interp, v: &Value) -> bool {
 pub fn display(interp: &mut Interp, v: &Value, color: bool) -> Result<String, Crash> {
     let pal = Palette { on: color };
     let mut out = String::new();
-    display_block(interp, v, &pal, 0, &mut out)?;
+    let mut loaded = None;
+    let mut todo = vec![Block::Of(v.clone(), 0)];
+    while let Some(block) = todo.pop() {
+        match block {
+            Block::Of(v, indent) => {
+                display_block(interp, &v, &pal, indent, &mut out, &mut loaded, &mut todo)?
+            }
+            Block::Items { xs, next, indent } => {
+                if let Some(x) = xs.get(next).cloned() {
+                    // separated by a blank line
+                    if next > 0 {
+                        out.push('\n');
+                    }
+                    let next = next + 1;
+                    todo.push(Block::Items { xs, next, indent });
+                    todo.push(Block::Of(x, indent));
+                }
+            }
+            Block::Fields { m, after, name_w, indent } => display_fields(
+                interp,
+                &m,
+                after.as_deref(),
+                name_w,
+                &pal,
+                indent,
+                &mut out,
+                &mut loaded,
+                &mut todo,
+            )?,
+        }
+    }
     if !out.ends_with('\n') {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// A block still to be displayed, or the rest of one that holds blocks
+/// (§5.1): a list shown one block per item, and a generic record, whose list
+/// fields print in block form under their key. Blocks nest as deep as the
+/// value's lists do, so `display` keeps them on a stack of its own instead of
+/// recursing: at about 14 KB of native stack a level in a debug build, a list
+/// nested as deep as the parser allows (§3.4) overflowed the worker's 512 MB,
+/// and one built at run time is not bounded at all.
+enum Block {
+    /// a value in block form, at an indent
+    Of(Value, usize),
+    /// a list's items from the `next`th on, one block each
+    Items { xs: ListVal, next: usize, indent: usize },
+    /// a generic record's fields after the field `after`, or all of them
+    Fields { m: Rc<RecordMap>, after: Option<String>, name_w: usize, indent: usize },
 }
 
 fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
@@ -190,20 +238,18 @@ fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
     format!("{}{}", pal.bold(p.as_str()), pal.dim(&id[n..]))
 }
 
-fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Crash> {
+fn display_line(
+    interp: &mut Interp,
+    v: &Value,
+    pal: &Palette,
+    loaded: &mut Option<Loaded>,
+) -> Result<String, Crash> {
     let v = &v.forced()?;
     match v {
         Value::Thunk(_) => unreachable!("forced never returns a thunk"),
         Value::Int(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
-        Value::Text(t) => {
-            let first = t.lines().next().unwrap_or("");
-            if t.lines().count() > 1 {
-                Ok(format!("{}…", first))
-            } else {
-                Ok(first.to_string())
-            }
-        }
+        Value::Text(t) => Ok(first_line(t)),
         Value::Id(id) => Ok(display_id(interp, id, pal)),
         Value::Blob(b) => {
             let size = human_size(b.size());
@@ -213,43 +259,19 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
                 Ok(format!("‹{}›", size))
             }
         }
-        Value::Fun(f) => Ok(crate::show::show(&Interp::dummy(), &Value::Fun(f.clone()))),
+        // a lambda renders as its source (§5.2), which may run over several
+        // lines and hold comments; the line form keeps only the first
+        Value::Fun(_) => Ok(first_line(&crate::show::show(interp, v)?)),
         Value::Shape(s) => Ok(s.name.clone()),
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
                 match shape.as_str() {
-                    "Commit" => return commit_line(interp, v, pal, false, &BTreeSet::new(), false),
+                    "Commit" => return line_in(interp, v, pal, loaded, false),
                     "Entry" => return entry_line(interp, v, pal),
-                    "Subtree" => {
-                        return commit_line(
-                            interp,
-                            &v.field("root")?,
-                            pal,
-                            false,
-                            &BTreeSet::new(),
-                            false,
-                        )
-                    }
-                    "Repo" => {
-                        return commit_line(
-                            interp,
-                            &v.field("root")?,
-                            pal,
-                            true,
-                            &BTreeSet::new(),
-                            false,
-                        )
-                    }
-                    "Frame" => {
-                        return commit_line(
-                            interp,
-                            &v.field("parent")?,
-                            pal,
-                            false,
-                            &BTreeSet::new(),
-                            false,
-                        )
-                    }
+                    "Subtree" => return line_in(interp, &v.field("root")?, pal, loaded, false),
+                    // its focus's line, drawn as the focus
+                    "Repo" => return line_in(interp, &v.field("root")?, pal, loaded, true),
+                    "Frame" => return line_in(interp, &v.field("parent")?, pal, loaded, false),
                     "Change" => {
                         let n = touched_paths(v)?.len();
                         return Ok(format!("{} paths", n));
@@ -261,6 +283,18 @@ fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Cra
             Ok(format!("{{ {} }}", names.join(", ")))
         }
         Value::List(xs) => list_line(interp, xs, pal),
+    }
+}
+
+/// The line form of text that may run over several lines (§5.1): its first
+/// line, `…` if there are more.
+fn first_line(s: &str) -> String {
+    let mut lines = s.lines();
+    let first = lines.next().unwrap_or("");
+    if lines.next().is_some() {
+        format!("{}…", first)
+    } else {
+        first.to_string()
     }
 }
 
@@ -392,6 +426,323 @@ fn touched_in_maps(from: &SnapMap, to: &SnapMap) -> Result<Vec<(Vec<String>, cha
     Ok(out)
 }
 
+/// The line count from which the size bar draws its last glyph, `▇` (§7.11
+/// column 5): no count past it changes the bar, so none is computed.
+const SIZE_BAR_TOP: usize = 1000;
+
+/// Lines added plus removed between two versions of one path (§7.11 size
+/// bar), either possibly absent, counted up to `cap`: the length of a
+/// shortest line diff, or `cap` if that is at least `cap`. Lines are split
+/// after each `\n` as `line_count` counts them. A conflict counts as its
+/// materialized text, as it is checked out.
+///
+/// A line diff costs the product of the file's length and the size of the
+/// change, so a plain one of a rewritten or reordered long file takes
+/// seconds. The search here stops at the cap rather than at a clock, so the
+/// same two versions always give the same count. Every step before it keeps
+/// the count exact: the common prefix and suffix are equal lines of some
+/// shortest diff, and the difference in length is a lower bound. A small
+/// change is then settled by a short search over the lines as they are.
+/// Otherwise a line that does not occur on the other side at all cannot be
+/// part of any common subsequence, so, as git's xdiff does, it counts as
+/// changed up front, and the rest is searched unless `reorder_bound` already
+/// puts it past the cap. That search (`line_distance`) costs at most about
+/// twice what a bit-parallel search of `cap / 64 + 2` machine words per line
+/// does, whatever the lines are: Myers' search soon stops on most content,
+/// but on a long file of a few lines repeating it can make a pass over the
+/// lines for each of the `2 × cap + 1` diagonals it reaches, so once it has
+/// cost half that the bit-parallel search counts instead. A million lines of
+/// two alternating, with 480 pairs of neighbours swapped, took Myers' search
+/// alone some 5 × 10⁸ comparisons.
+fn changed_lines(from: Option<&Value>, to: Option<&Value>, cap: usize) -> Result<usize, Crash> {
+    use std::collections::HashMap;
+    // the rounds of the first, short search
+    const QUICK: usize = 64;
+    let text = |v: Option<&Value>| -> Result<Vec<u8>, Crash> {
+        match v {
+            Some(Value::Blob(b)) => b.bytes(),
+            _ => Ok(Vec::new()),
+        }
+    };
+    let (a, b) = (text(from)?, text(to)?);
+    let a: Vec<&[u8]> = a.split_inclusive(|c| *c == b'\n').collect();
+    let b: Vec<&[u8]> = b.split_inclusive(|c| *c == b'\n').collect();
+    let (a, b) = trim_common(&a, &b);
+    if a.len().abs_diff(b.len()) >= cap {
+        return Ok(cap);
+    }
+    // the short search's few rounds bound what it costs, so no step limit
+    let quick = cap.min(QUICK);
+    match edit_distance(a, b, quick, usize::MAX, &mut 0) {
+        Some(d) if d < quick || quick == cap => return Ok(d),
+        _ => {}
+    }
+    // number each distinct line, so the rest compares numbers; the lines
+    // numbered while reading `a` are those that occur in it
+    fn number<'l>(ids: &mut HashMap<&'l [u8], usize>, lines: &[&'l [u8]]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| {
+                let next = ids.len();
+                *ids.entry(*l).or_insert(next)
+            })
+            .collect()
+    }
+    let mut ids = HashMap::new();
+    let a = number(&mut ids, a);
+    let in_a = ids.len();
+    let b = number(&mut ids, b);
+    let mut in_b = vec![false; ids.len()];
+    for l in &b {
+        in_b[*l] = true;
+    }
+    let a_common: Vec<usize> = a.iter().copied().filter(|l| in_b[*l]).collect();
+    let b_common: Vec<usize> = b.iter().copied().filter(|l| *l < in_a).collect();
+    let unmatched = (a.len() - a_common.len()) + (b.len() - b_common.len());
+    if unmatched >= cap {
+        return Ok(cap);
+    }
+    let (a, b) = trim_common(&a_common, &b_common);
+    let max = cap - unmatched;
+    if reorder_bound(a, b, ids.len()) >= max {
+        return Ok(cap);
+    }
+    Ok(unmatched + line_distance(a, b, ids.len(), max, &mut 0))
+}
+
+/// `a` and `b` without the lines they start and end with in common.
+fn trim_common<'s, T: PartialEq>(a: &'s [T], b: &'s [T]) -> (&'s [T], &'s [T]) {
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[pre..], &b[pre..]);
+    let suf = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
+    (&a[..a.len() - suf], &b[..b.len() - suf])
+}
+
+/// The number of lines deleted plus inserted by a shortest diff of `a` to
+/// `b`, or `max` if that is at least `max`: Myers' greedy search, which
+/// reaches the end on round `d` exactly when the shortest diff has `d` steps,
+/// run for `max` rounds at most. A round extends each of its diagonals along
+/// equal lines from where the round before left off, so the work is at most
+/// `max` squared diagonals plus one pass over the lines per diagonal. Each
+/// pair of lines compared along a diagonal adds a step to `steps`, and each
+/// diagonal reached `DIAGONAL` steps; `None` once they pass `limit`.
+fn edit_distance<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    max: usize,
+    limit: usize,
+    steps: &mut usize,
+) -> Option<usize> {
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    // the furthest `x` reached on diagonal `k = x - y`, at `v[k + max]`;
+    // round `d` writes diagonals `-d..=d` from those round `d - 1` wrote, and
+    // round 0 starts from the zero on diagonal 1
+    let mut v = vec![0isize; 2 * max + 1];
+    let at = |k: isize| (k + max as isize) as usize;
+    for d in 0..max as isize {
+        for k in (-d..=d).step_by(2) {
+            // from diagonal `k + 1` by inserting a line of `b`, or from
+            // `k - 1` by deleting one of `a`, whichever gets further
+            let from = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+                v[at(k + 1)]
+            } else {
+                v[at(k - 1)] + 1
+            };
+            let (mut x, mut y) = (from, from - k);
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            *steps += DIAGONAL + (x - from) as usize;
+            if *steps > limit {
+                return None;
+            }
+            v[at(k)] = x;
+            if x >= n && y >= m {
+                return Some(d as usize);
+            }
+        }
+    }
+    Some(max)
+}
+
+/// What reaching a diagonal costs `edit_distance`, in comparisons of two
+/// lines along one, the unit both searches count their steps in: measured at
+/// about twelve in a debug build and seven in release.
+const DIAGONAL: usize = 8;
+
+/// What a word costs `banded_distance`, in the same comparisons: measured at
+/// about six in a debug build and three to four in release. Weighted so,
+/// `line_distance` gives up Myers' search once it has cost about what the
+/// other search will; counted alike, it gave it up on a long file of a few
+/// lines repeating where finishing would have taken half the time or less.
+const WORD: usize = 4;
+
+/// `edit_distance` of lines numbered below `ids`, in at most twice the steps
+/// `banded_distance` takes and one diagonal with its run, whatever the lines
+/// are. Myers' search soon stops on most content, but on a long file of a
+/// few lines repeating it runs along equal lines on many diagonals, a pass
+/// over the file for each, so it may take only as many steps as
+/// `banded_distance` takes at most, and that counts instead if it has not
+/// finished by then. Steps are weighted by what they cost (`DIAGONAL`,
+/// `WORD`), so that is when it has cost about as much as the other search
+/// will. Both find the same count; `steps` adds up the steps of both.
+fn line_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut usize) -> usize {
+    let limit = *steps + banded_steps(a.len(), b.len(), max);
+    match edit_distance(a, b, max, limit, steps) {
+        Some(d) => d,
+        None => banded_distance(a, b, ids, max, steps),
+    }
+}
+
+/// The diagonals `x - y` from `-ins` to `del` that a diff of `n` lines to
+/// `m` stays on, keeping line `x` of the one with line `y` of the other, when
+/// it deletes plus inserts fewer than `max` lines, or `None` if none does:
+/// it deletes `n - m` more lines than it inserts, so at most `del` and
+/// inserts at most `ins`.
+fn band(n: usize, m: usize, max: usize) -> Option<(usize, usize)> {
+    (n.abs_diff(m) < max).then(|| ((max - 1 + n - m) / 2, (max - 1 + m - n) / 2))
+}
+
+/// The most steps `banded_distance` takes on `n` lines and `m` under `max`:
+/// `WORD` per line of the first, to find where its lines are, and per word
+/// of it the band crosses, at most `(del + ins) / 64 + 2`, per line of the
+/// second.
+fn banded_steps(n: usize, m: usize, max: usize) -> usize {
+    match band(n, m, max) {
+        Some((del, ins)) if n > 0 && m > 0 => WORD * (n + m * ((del + ins) / 64 + 2)),
+        _ => 0,
+    }
+}
+
+/// `edit_distance` of lines numbered below `ids`, found a machine word of `a`
+/// at a time for each line of `b` (Hyyrö's bit-parallel longest common
+/// subsequence), over only the band of diagonals a diff counting less than
+/// `max` stays on, as Ukkonen bounds the search. Its steps, which it adds to
+/// `steps`, are `WORD` per line of `a` and per word of `a` the band crosses
+/// per line of `b`, whatever the lines are.
+///
+/// After each line of `b`, the zero bits of `a`'s words up to a place in
+/// `a` count a longest common subsequence of `a` up to there and `b` so far.
+/// Only the words the band crosses change: one above the band keeps what it
+/// last had, and one below it still has the ones it started with, as if the
+/// length grew no further down. Neither counts more than a common
+/// subsequence has, and inside the band the counts are exact whenever a diff
+/// of fewer than `max` lines exists, since such a diff keeps inside the band;
+/// otherwise the count is `max` whatever they are.
+fn banded_distance(a: &[usize], b: &[usize], ids: usize, max: usize, steps: &mut usize) -> usize {
+    let (n, m) = (a.len(), b.len());
+    let Some((del, ins)) = band(n, m, max) else {
+        return max;
+    };
+    if n == 0 || m == 0 {
+        return n + m;
+    }
+    *steps += WORD * n;
+    // per line, from `start[l]` to `start[l + 1]`: the words of `a` it occurs
+    // in, in order, with a bit where it occurs in each
+    let mut start = vec![0usize; ids + 1];
+    let mut last = vec![usize::MAX; ids];
+    for (i, l) in a.iter().enumerate() {
+        if last[*l] != i / 64 {
+            last[*l] = i / 64;
+            start[*l + 1] += 1;
+        }
+    }
+    drop(last);
+    for l in 0..ids {
+        start[l + 1] += start[l];
+    }
+    let (mut word, mut bits) = (vec![0usize; start[ids]], vec![0u64; start[ids]]);
+    let mut next = start[..ids].to_vec();
+    for (i, l) in a.iter().enumerate() {
+        let e = next[*l];
+        if e == start[*l] || word[e - 1] != i / 64 {
+            word[e] = i / 64;
+            next[*l] += 1;
+        }
+        bits[next[*l] - 1] |= 1 << (i % 64);
+    }
+    // before any line of `b` nothing is common; from here on `next[l]` is the
+    // first word line `l` occurs in that is not above the band
+    let mut v = vec![u64::MAX; n.div_ceil(64)];
+    next.copy_from_slice(&start[..ids]);
+    // as slices, which a debug build indexes without a call
+    let (v, next) = (&mut v[..], &mut next[..]);
+    let (start, word, bits) = (&start[..], &word[..], &bits[..]);
+    for (j, l) in b.iter().enumerate() {
+        // line `j` of `b` can only be kept with lines `j - ins` to `j + del`
+        // of `a`
+        let (lo, hi) = (j.saturating_sub(ins) / 64, (j + del).min(n - 1) / 64);
+        *steps += WORD * (hi + 1 - lo);
+        let end = start[*l + 1];
+        let mut e = next[*l];
+        while e < end && word[e] < lo {
+            e += 1;
+        }
+        next[*l] = e;
+        // the words above the band do not change, so nothing carries in
+        let mut carry = false;
+        for (w, v) in v[lo..=hi].iter_mut().enumerate() {
+            let here = if e < end && word[e] == lo + w {
+                e += 1;
+                bits[e - 1]
+            } else {
+                0
+            };
+            let x = *v;
+            let (sum, c1) = x.overflowing_add(x & here);
+            let (sum, c2) = sum.overflowing_add(carry as u64);
+            carry = c1 || c2;
+            *v = sum | (x & !here);
+        }
+    }
+    let common: usize = v.iter().map(|w| w.count_zeros() as usize).sum();
+    (n + m - 2 * common).min(max)
+}
+
+/// A lower bound on the lines deleted plus inserted by any diff of `a` to
+/// `b` (lines numbered below `ids`), cheap where the search is dearest: a
+/// long file whose lines were reordered, or one of a few lines repeating
+/// that now occur a different number of times. A line that occurs once on
+/// each side can only be kept by pairing those two, and the pairs kept keep
+/// their order on both sides, so at most the longest sequence of them in the
+/// same order on both sides is kept (patience sorting finds its length); any
+/// other line is kept at most as many times as it occurs on the side where
+/// it occurs fewer times.
+fn reorder_bound(a: &[usize], b: &[usize], ids: usize) -> usize {
+    // per line: its occurrences in `a` and in `b`, and where it is in `a`
+    let mut seen = vec![(0usize, 0usize, 0usize); ids];
+    for (i, l) in a.iter().enumerate() {
+        seen[*l].0 += 1;
+        seen[*l].2 = i;
+    }
+    for l in b {
+        seen[*l].1 += 1;
+    }
+    // over the lines once on each side, in `b`'s order, by where they are in
+    // `a`: `ends[i]` is the least last place of an increasing sequence of
+    // `i + 1` of them
+    let mut ends: Vec<usize> = Vec::new();
+    for l in b {
+        if let (1, 1, i) = seen[*l] {
+            let at = ends.partition_point(|e| *e < i);
+            if at == ends.len() {
+                ends.push(i);
+            } else {
+                ends[at] = i;
+            }
+        }
+    }
+    let others: usize = seen
+        .iter()
+        .filter(|(in_a, in_b, _)| (*in_a, *in_b) != (1, 1))
+        .map(|(in_a, in_b, _)| in_a.min(in_b))
+        .sum();
+    let kept = ends.len() + others;
+    a.len() + b.len() - 2 * kept
+}
+
 fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
     let mut m = BTreeMap::new();
     for e in snap.as_list()?.iter() {
@@ -406,13 +757,24 @@ fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
     Ok(m)
 }
 
+/// What a commit's glyph says about where it stands in a history
+/// (specs/tree.md §Glyphs), beyond what its own files say. A `Commit` value
+/// records none of it, so both its forms read it from the repository the
+/// expression was given (`Loaded`).
+struct Standing {
+    focus: bool,
+    /// an ancestor of the focus
+    ancestor: bool,
+    immutable: bool,
+    /// no change against its parent
+    empty: bool,
+}
+
 fn commit_line(
     interp: &Interp,
     c: &Value,
     pal: &Palette,
-    focus: bool,
-    immutable: &BTreeSet<String>,
-    has_conflicts_hint: bool,
+    standing: &Standing,
 ) -> Result<String, Crash> {
     let id = match c.field("id")? {
         Value::Id(i) => i.to_string(),
@@ -426,14 +788,13 @@ fn commit_line(
         .iter()
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
-    let glyph = node_glyph(interp, c, &id, focus, immutable, pal)?;
+    let glyph = node_glyph(c, &id, standing)?;
     let id_s = display_id(interp, &id, pal);
     let labels_s = if labels.is_empty() {
         String::new()
     } else {
         pal.green(&labels.join("  "))
     };
-    let _ = has_conflicts_hint;
     Ok(if labels_s.is_empty() {
         format!("{} {}  {}", glyph, id_s, msg_first)
     } else {
@@ -441,28 +802,23 @@ fn commit_line(
     })
 }
 
-fn node_glyph(
-    interp: &Interp,
-    c: &Value,
-    id: &str,
-    focus: bool,
-    immutable: &BTreeSet<String>,
-    pal: &Palette,
-) -> Result<String, Crash> {
+/// The glyph of a commit line, by `tree`'s precedence (`glyph_for`).
+fn node_glyph(c: &Value, id: &str, standing: &Standing) -> Result<String, Crash> {
     let g = if id == ROOT_ID {
         "⌂"
     } else if has_conflict(c)? {
         "⊗"
-    } else if is_empty_commit(interp, c)? {
+    } else if standing.empty {
         "◌"
-    } else if immutable.contains(id) {
+    } else if standing.immutable {
         "◆"
-    } else if focus {
+    } else if standing.focus {
         "◉"
+    } else if standing.ancestor {
+        "●"
     } else {
         "○"
     };
-    let _ = pal;
     Ok(g.to_string())
 }
 
@@ -478,18 +834,15 @@ fn has_conflict(c: &Value) -> Result<bool, Crash> {
     Ok(false)
 }
 
-/// empty: no change against its parent — needs the parent; we only compute
-/// this meaningfully in tree rendering. In line display, treat as false.
-fn is_empty_commit(_interp: &Interp, _c: &Value) -> Result<bool, Crash> {
-    Ok(false)
-}
-
+/// `v` in block form, the blocks it holds left on `todo` (see `Block`)
 fn display_block(
     interp: &mut Interp,
     v: &Value,
     pal: &Palette,
     indent: usize,
     out: &mut String,
+    loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
     let v = &v.forced()?;
@@ -504,18 +857,31 @@ fn display_block(
             out.push_str(&indent_multiline(&content, indent));
             return Ok(());
         }
-        Value::Int(_) | Value::Bool(_) | Value::Id(_) | Value::Fun(_) | Value::Shape(_) => {
+        Value::Int(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) => {
             out.push_str(&pad);
-            out.push_str(&display_line(interp, v, pal)?);
+            out.push_str(&display_line(interp, v, pal, loaded)?);
             out.push('\n');
             return Ok(());
         }
-        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out),
+        // all of a lambda's source, of which the line form keeps the first
+        // line (§5.1), each line under the block's indent
+        Value::Fun(_) => {
+            for l in crate::show::show(interp, v)?.lines() {
+                out.push_str(&pad);
+                out.push_str(l);
+                out.push('\n');
+            }
+            return Ok(());
+        }
+        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out, loaded, todo),
         Value::Record(_) => {}
     }
     if let Some(shape) = shape_of_record(interp, v) {
         match shape.as_str() {
-            "Commit" => return display_commit_block(interp, v, pal, indent, out),
+            "Commit" => {
+                let loaded = Loaded::cached(interp, loaded)?;
+                return display_commit_block(interp, v, pal, indent, out, loaded);
+            }
             "Entry" => {
                 out.push_str(&pad);
                 out.push_str(&entry_line(interp, v, pal)?);
@@ -529,7 +895,7 @@ fn display_block(
                     ("children", v.field("children")?),
                     ("context", Value::list(vec![])),
                 ]);
-                let text = tree_render(interp, &opts, &repo, pal, false)?;
+                let text = tree_render(interp, &opts, &repo, pal, false, tty_width())?;
                 out.push_str(&indent_multiline(&text, indent));
                 return Ok(());
             }
@@ -545,30 +911,14 @@ fn display_block(
             }
             "Frame" => {
                 out.push_str(&pad);
-                out.push_str(&commit_line(
-                    interp,
-                    &v.field("parent")?,
-                    pal,
-                    false,
-                    &BTreeSet::new(),
-                    false,
-                )?);
+                out.push_str(&line_in(interp, &v.field("parent")?, pal, loaded, false)?);
                 out.push('\n');
                 return Ok(());
             }
             "Change" => {
-                for (p, mark, unresolved) in touched_paths(v)? {
+                for (p, mark, _) in touched_paths(v)? {
                     out.push_str(&pad);
-                    let ms = mark.to_string();
-                    let colored = match mark {
-                        '+' => pal.green(&ms),
-                        '−' => pal.red(&ms),
-                        '~' => pal.yellow(&ms),
-                        '✖' => pal.red(&ms),
-                        _ => ms,
-                    };
-                    let _ = unresolved;
-                    out.push_str(&format!("{} {}\n", colored, p));
+                    out.push_str(&format!("{} {}\n", colored_mark(mark, pal), p));
                 }
                 return Ok(());
             }
@@ -581,19 +931,42 @@ fn display_block(
         _ => unreachable!(),
     };
     let name_w = m.keys().map(|k| width(k)).max().unwrap_or(0);
-    for (k, x) in m.iter() {
+    display_fields(interp, m, None, name_w, pal, indent, out, loaded, todo)
+}
+
+/// A generic record's fields after the field `after`, or all of them, one
+/// per line under names `name_w` wide, up to the first that is a non-empty
+/// list: its block is left on `todo` to be displayed next, and the fields
+/// after it to follow.
+#[allow(clippy::too_many_arguments)]
+fn display_fields(
+    interp: &mut Interp,
+    m: &Rc<RecordMap>,
+    after: Option<&str>,
+    name_w: usize,
+    pal: &Palette,
+    indent: usize,
+    out: &mut String,
+    loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
+) -> Result<(), Crash> {
+    let pad = " ".repeat(indent);
+    let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+    for (k, x) in m.range::<str, _>((from, Bound::Unbounded)) {
         out.push_str(&pad);
         out.push_str(&pal.dim(&pad_right(k, name_w)));
         out.push_str("  ");
         // lists print in block form under their key (§5.1)
         if matches!(x, Value::List(xs) if !xs.is_empty()) {
             out.push('\n');
-            display_block(interp, x, pal, indent + name_w + 2, out)?;
-        } else {
-            let line = display_line(interp, x, pal)?;
-            out.push_str(&line);
-            out.push('\n');
+            let after = Some(k.clone());
+            todo.push(Block::Fields { m: m.clone(), after, name_w, indent });
+            todo.push(Block::Of(x.clone(), indent + name_w + 2));
+            return Ok(());
         }
+        let line = display_line(interp, x, pal, loaded)?;
+        out.push_str(&line);
+        out.push('\n');
     }
     Ok(())
 }
@@ -610,42 +983,204 @@ fn indent_multiline(s: &str, indent: usize) -> String {
         + "\n"
 }
 
+/// A change mark (`+ ~ − ✖`), coloured by what it means.
+fn colored_mark(mark: char, pal: &Palette) -> String {
+    let ms = mark.to_string();
+    match mark {
+        '+' => pal.green(&ms),
+        '−' | '✖' => pal.red(&ms),
+        '~' => pal.yellow(&ms),
+        _ => ms,
+    }
+}
+
+/// The repository the expression was given (§1.2 step 4, after the
+/// snapshot), or, where only the loaded one is set (the interpreter tests),
+/// that one.
+fn given_repo(interp: &Interp) -> Option<Value> {
+    let given = interp.given_repo.borrow().clone();
+    given.or_else(|| interp.old_repo.borrow().clone())
+}
+
+/// The repository the expression was given (`given_repo`), indexed for
+/// displaying `Commit` values. A commit value records neither its parent nor
+/// where it stands, so both its forms read them from the commit with the
+/// same id there, as its block reads author and age (§5.1). Not the
+/// repository as loaded: the snapshot has rebased every descendant of the
+/// focus since, and the values displayed come from after it. Indexed once
+/// per displayed value, not once per commit: a table of commits would
+/// otherwise walk the history once for each row.
+struct Loaded {
+    /// the parent of every commit that has one
+    parents: BTreeMap<String, Value>,
+    focus: String,
+    /// the focus's ancestors, the focus excluded
+    ancestors: BTreeSet<String>,
+    immutable: BTreeSet<String>,
+}
+
+impl Loaded {
+    /// `cache`, indexed when a display first draws a commit
+    fn cached<'a>(interp: &mut Interp, cache: &'a mut Option<Loaded>) -> Result<&'a Loaded, Crash> {
+        if cache.is_none() {
+            *cache = Some(Loaded::of(interp)?);
+        }
+        Ok(cache.as_ref().expect("just set"))
+    }
+
+    fn of(interp: &mut Interp) -> Result<Loaded, Crash> {
+        let mut loaded = Loaded {
+            parents: BTreeMap::new(),
+            focus: String::new(),
+            ancestors: BTreeSet::new(),
+            immutable: BTreeSet::new(),
+        };
+        let Some(repo) = given_repo(interp) else {
+            return Ok(loaded);
+        };
+        if let Value::Id(i) = repo.field("root")?.field("id")? {
+            loaded.focus = i.to_string();
+        }
+        for frame in repo.field("context")?.as_list()?.iter() {
+            loaded.ancestors.insert(id_of_frame_parent(frame)?);
+        }
+        // as `tree_render` does: a config whose `immutable` crashes draws no `◆`
+        loaded.immutable = crate::repo::compute_immutable(interp, &repo).unwrap_or_default();
+        // every commit's parent, walking down from the top of the history
+        let top = crate::repo::by_id(&repo, &top_id(&repo)?)?.unwrap_or_else(|| repo.clone());
+        let mut todo = vec![(top.field("root")?, top.field("children")?)];
+        while let Some((parent, children)) = todo.pop() {
+            for c in children.as_list()?.iter() {
+                let root = c.field("root")?;
+                if let Value::Id(i) = root.field("id")? {
+                    loaded.parents.insert(i.to_string(), parent.clone());
+                }
+                todo.push((root, c.field("children")?));
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Where the commit with id `id` stands here, given whether it changes
+    /// nothing against its parent here.
+    fn standing(&self, id: &str, empty: bool) -> Standing {
+        Standing {
+            focus: id == self.focus,
+            ancestor: self.ancestors.contains(id),
+            immutable: self.immutable.contains(id),
+            empty,
+        }
+    }
+
+    /// Where the commit value `c` stands here, for its line form: `◌` judged
+    /// as the block judges it, by its files against its parent's here. While
+    /// both still hold their stored trees the backend answers from tree ids,
+    /// as for `tree` (`build_info`), so a table of commits reads no parent's
+    /// files. A commit with no parent here claims no `◌`.
+    fn line_standing(&self, interp: &Interp, c: &Value) -> Result<Standing, Crash> {
+        let id = match c.field("id")? {
+            Value::Id(i) => i.to_string(),
+            _ => String::new(),
+        };
+        let empty = match self.parents.get(&id) {
+            None => false,
+            Some(parent) => {
+                let parent_id = match parent.field("id")? {
+                    Value::Id(i) => i.to_string(),
+                    _ => String::new(),
+                };
+                let me = stored_origin(c).filter(|o| *o == id);
+                let stored_parent = stored_origin(parent).filter(|o| *o == parent_id);
+                let answer = match (me, stored_parent) {
+                    (Some(me), Some(parent)) => interp.backend.is_empty(me, parent),
+                    _ => None,
+                };
+                match answer {
+                    Some(e) => e,
+                    // in any order: a snapshot stands for a tree (§7.3)
+                    None => crate::repo::snapshot_eq(&c.field("files")?, &parent.field("files")?)?,
+                }
+            }
+        };
+        Ok(self.standing(&id, empty))
+    }
+}
+
+/// A commit's line form, drawn where it stands in the repository the
+/// expression was given (§5.1); `as_focus` draws it as a `Repo`'s focus.
+fn line_in(
+    interp: &mut Interp,
+    c: &Value,
+    pal: &Palette,
+    loaded: &mut Option<Loaded>,
+    as_focus: bool,
+) -> Result<String, Crash> {
+    let loaded = Loaded::cached(interp, loaded)?;
+    let mut standing = loaded.line_standing(interp, c)?;
+    standing.focus |= as_focus;
+    commit_line(interp, c, pal, &standing)
+}
+
 fn display_commit_block(
     interp: &mut Interp,
     c: &Value,
     pal: &Palette,
     indent: usize,
     out: &mut String,
+    loaded: &Loaded,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
-    out.push_str(&pad);
-    out.push_str(&commit_line(interp, c, pal, true, &BTreeSet::new(), false)?);
-    out.push('\n');
-    // author · age · n files — from metadata by id (§5.1)
     let id = match c.field("id")? {
         Value::Id(i) => i.to_string(),
         _ => String::new(),
     };
-    let files = c.field("files").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
+    let own = snapshot_map_of(&c.field("files")?)?;
+    // the paths it changes against its parent in the given repository; with
+    // no parent there — the root, or a commit the expression made, whose
+    // parent the value does not record — what it changes is not known
+    let touched = match loaded.parents.get(&id) {
+        Some(parent) => Some(touched_in_maps(
+            &snapshot_map_of(&parent.field("files")?)?,
+            &own,
+        )?),
+        None => None,
+    };
+    // the line `tree` draws for it (§5.1: "a `tree` line without rails")
+    let empty = touched.as_ref().is_some_and(|t| t.is_empty());
+    out.push_str(&pad);
+    out.push_str(&commit_line(interp, c, pal, &loaded.standing(&id, empty))?);
+    out.push('\n');
+    // author · age · n files — from metadata by id (§5.1)
+    let n = touched.as_ref().map_or(own.len(), |t| t.len());
     if let Ok(meta) = interp.backend.meta(&id) {
         let age = render_age(meta.time);
         out.push_str(&pad);
-        out.push_str(&format!(
-            "  {} · {} · {} files\n",
-            meta.author,
-            age,
-            files.len()
-        ));
+        out.push_str(&format!("  {} · {} · {} files\n", meta.author, age, n));
     }
-    for e in files.iter() {
-        let path = path_string(&e.field("path")?)?;
-        let content = e.field("content")?;
-        let unresolved = matches!(&content, Value::Blob(b) if b.is_unresolved());
-        out.push_str(&pad);
-        if unresolved {
-            out.push_str(&format!("  {} {}\n", pal.red("✖"), path));
-        } else {
-            out.push_str(&format!("    {}\n", path));
+    if n > 0 {
+        out.push('\n');
+    }
+    match &touched {
+        Some(touched) => {
+            for (path, mark, _) in touched {
+                out.push_str(&pad);
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    colored_mark(*mark, pal),
+                    path.join("/")
+                ));
+            }
+        }
+        // its files, unmarked but for `✖`
+        None => {
+            for (path, content) in &own {
+                out.push_str(&pad);
+                if matches!(content, Value::Blob(b) if b.is_unresolved()) {
+                    out.push_str(&format!("  {} {}\n", pal.red("✖"), path.join("/")));
+                } else {
+                    out.push_str(&format!("    {}\n", path.join("/")));
+                }
+            }
         }
     }
     Ok(())
@@ -690,19 +1225,23 @@ pub fn render_date(time: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// the repo value in context (the loaded repo), for resolving ids to commits
+/// the repo value in context (the one the expression was given), for
+/// resolving ids to commits
 fn top_of(interp: &Interp, _x: &Value) -> Result<Value, Crash> {
-    let old = interp.old_repo.borrow().clone();
-    old.ok_or_else(|| Crash::new("display: no repository in context"))
+    given_repo(interp).ok_or_else(|| Crash::new("display: no repository in context"))
 }
 
+/// `list` in block form, the blocks it holds left on `todo` (see `Block`)
 fn display_list_block(
     interp: &mut Interp,
-    xs: &[Value],
+    list: &ListVal,
     pal: &Palette,
     indent: usize,
     out: &mut String,
+    loaded: &mut Option<Loaded>,
+    todo: &mut Vec<Block>,
 ) -> Result<(), Crash> {
+    let xs: &[Value] = list;
     let pad = " ".repeat(indent);
     if xs.is_empty() {
         out.push_str(&pad);
@@ -721,6 +1260,7 @@ fn display_list_block(
                 commits.insert(i.to_string(), c);
             }
         }
+        let loaded = Loaded::cached(interp, loaded)?;
         for x in xs {
             let id = match x {
                 Value::Id(i) => i.to_string(),
@@ -730,12 +1270,10 @@ fn display_list_block(
             match commits.get(&id) {
                 Some(c) => {
                     let c = c.clone();
-                    let conflict = has_conflict(&c)?;
-                    let glyph = if conflict {
-                        pal.red("⊗")
-                    } else {
-                        "○".to_string()
-                    };
+                    // the glyph of its line form (§5.1)
+                    let glyph = node_glyph(&c, &id, &loaded.line_standing(interp, &c)?)?;
+                    let conflict = glyph == "⊗";
+                    let glyph = if conflict { pal.red(&glyph) } else { glyph };
                     let msg = c.field("message")?.as_text()?.to_string();
                     let msg_first = msg.lines().next().unwrap_or("");
                     let labels: Vec<String> = c
@@ -829,7 +1367,7 @@ fn display_list_block(
                 }
                 return Ok(());
             }
-            return display_table(interp, xs, pal, indent, out);
+            return display_table(interp, xs, pal, indent, out, loaded);
         }
     }
     // list of other scalars
@@ -842,13 +1380,8 @@ fn display_list_block(
         out.push('\n');
         return Ok(());
     }
-    // one block per item, separated by a blank line
-    for (i, x) in xs.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        display_block(interp, x, pal, indent, out)?;
-    }
+    // one block per item, separated by a blank line (see `Block`)
+    todo.push(Block::Items { xs: list.clone(), next: 0, indent });
     Ok(())
 }
 
@@ -858,6 +1391,7 @@ fn display_table(
     pal: &Palette,
     indent: usize,
     out: &mut String,
+    loaded: &mut Option<Loaded>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
     let fields: Vec<String> = field_set(&xs[0]).unwrap().into_iter().collect();
@@ -869,7 +1403,7 @@ fn display_table(
             let cell = match x.field(f)? {
                 Value::Bool(true) => "✓".to_string(),
                 Value::Bool(false) => String::new(),
-                other => display_line(interp, &other, pal)?,
+                other => display_line(interp, &other, pal, loaded)?,
             };
             row.push(cell);
         }
@@ -944,7 +1478,28 @@ fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
     })
 }
 
+/// The terminal's width when stdout is one — what rows are cut to and the
+/// legend is placed by (specs/tree.md Step 4, §Legend) — else `None`.
+fn tty_width() -> Option<usize> {
+    if crate::show::stdout_is_tty() {
+        crate::show::terminal_width()
+    } else {
+        None
+    }
+}
+
 pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Value, Crash> {
+    tree_with_width(interp, opts, repo, tty_width())
+}
+
+/// `treeWith` as if stdout were a terminal `term_w` columns wide (`None`: not
+/// a terminal). Public so the tests can drive truncation without a pty.
+pub fn tree_with_width(
+    interp: &mut Interp,
+    opts: &Value,
+    repo: &Value,
+    term_w: Option<usize>,
+) -> Result<Value, Crash> {
     let defaults = default_tree_options(interp)?;
     // a missing option falls back to its default, so an older config that
     // predates a newer option keeps working; a present option is type-checked
@@ -991,7 +1546,7 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
         date,
         files,
     };
-    let text = tree_render(interp, &o, repo, &pal, true)?;
+    let text = tree_render(interp, &o, repo, &pal, true, term_w)?;
     Ok(Value::text(text))
 }
 
@@ -1006,8 +1561,8 @@ struct CommitInfo {
     is_ancestor_of_focus: bool,
     is_child_of_ancestor: bool,
     meta: Option<crate::domain::MetaInfo>,
-    size: Option<usize>, // lines added+removed against parent
-    nfiles: usize,       // number of files in this commit's snapshot
+    size: Option<usize>, // lines added+removed against parent, up to SIZE_BAR_TOP
+    nfiles: usize,       // number of files changed against parent (`files` column)
     detail_marks: Vec<(String, char)>,
     children: Vec<CommitInfo>,
 }
@@ -1033,21 +1588,46 @@ impl CommitInfo {
     }
 }
 
-/// A parent commit's snapshot as seen by its children: the files value, plus
-/// its path-keyed map built at most once and shared by every child's diff.
+/// A parent commit's snapshot as seen by its children: the files value,
+/// loaded on first use — by the parent itself or by whichever child needs to
+/// compare against it, since only the child knows that it does — plus its
+/// path-keyed map built at most once and shared by every child's diff.
 /// Keying a snapshot allocates a `Vec<String>` per entry, so rebuilding it for
 /// each child dominated `treeFull`/`treeData` on a large history.
 struct ParentSnap<'a> {
-    files: &'a Value,
+    commit: &'a Value,
+    files: &'a std::cell::OnceCell<Value>,
     map: &'a std::cell::OnceCell<SnapMap>,
+    /// the commit's id when its files are still the stored tree
+    stored: Option<&'a str>,
 }
 
 impl ParentSnap<'_> {
+    fn files(&self) -> Result<&Value, Crash> {
+        if self.files.get().is_none() {
+            let _ = self.files.set(self.commit.field("files")?);
+        }
+        Ok(self.files.get().expect("just set"))
+    }
+
     fn map(&self) -> Result<&SnapMap, Crash> {
         if self.map.get().is_none() {
-            let _ = self.map.set(snapshot_map_of(self.files)?);
+            let _ = self.map.set(snapshot_map_of(self.files()?)?);
         }
         Ok(self.map.get().expect("just set"))
+    }
+}
+
+/// The id of the stored commit whose tree `commit`'s files are, read without
+/// loading them: the tag on the backend's lazy list (`ThunkVal::origin`). An
+/// edit that changes the files replaces that list, so this is `None` for them.
+fn stored_origin(commit: &Value) -> Option<&str> {
+    match commit {
+        Value::Record(m) => match m.get("files") {
+            Some(Value::Thunk(t)) => t.origin(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1077,9 +1657,13 @@ fn build_info(
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
     // conflict and empty are O(1) backend queries when the backend can answer
-    // them from tree ids (jj), without touching the file list at all; the
-    // in-memory backend cannot, so fall back to walking the files
-    let conflict = match interp.backend.has_conflict(&id) {
+    // them from tree ids (jj), without touching the file list at all. Those
+    // answers are about the stored commits, so they are asked only while this
+    // commit — and, for empty, its parent here — still holds its stored files:
+    // a dry run (§1.2) renders edits that keep their ids but not their files.
+    // Otherwise, as on the in-memory backend, fall back to walking the files.
+    let stored = stored_origin(commit).filter(|o| *o == id);
+    let conflict = match stored.and_then(|s| interp.backend.has_conflict(s)) {
         Some(c) => c,
         None => has_conflict(commit)?,
     };
@@ -1092,67 +1676,67 @@ fn build_info(
             matches!(c.field("root").and_then(|r| r.field("id")), Ok(Value::Id(i)) if *i == focus_id)
         });
     let want_diff = opts.detail >= 2 || is_focus_pre || child_is_focus || parent_is_focus;
-    let backend_empty = interp.backend.is_empty(&id);
+    let backend_empty = match (stored, parent_files.and_then(|p| p.stored)) {
+        (Some(me), Some(parent)) => interp.backend.is_empty(me, parent),
+        _ => None,
+    };
+    // this commit's own snapshot and its map, each built on first use — here
+    // or by a child that compares against it — and shared with every child
+    let my_files: std::cell::OnceCell<Value> = std::cell::OnceCell::new();
+    let my_map: std::cell::OnceCell<SnapMap> = std::cell::OnceCell::new();
+    let my_snap = ParentSnap {
+        commit,
+        files: &my_files,
+        map: &my_map,
+        stored,
+    };
     // the files list is only materialized when something needs it: the diff
     // (detail/focus), the files data column, or the emptiness fallback
-    let need_files = want_diff || opts.files || backend_empty.is_none();
-    let files = if need_files {
-        Some(commit.field("files")?)
-    } else {
-        None
-    };
-    let nfiles = files.as_ref().map(|f| f.as_list().map(|l| l.len())).transpose()?.unwrap_or(0);
-    // this commit's own snapshot map, built on first use and shared with every
-    // child that diffs against it
-    let my_map: std::cell::OnceCell<SnapMap> = std::cell::OnceCell::new();
-    let my_snap = files.as_ref().map(|f| ParentSnap {
-        files: f,
-        map: &my_map,
-    });
-    let (empty, size, detail_marks) = match parent_files {
+    let (empty, size, detail_marks, nfiles) = match parent_files {
         Some(parent) => {
-            let pf = parent.files;
             let empty = match backend_empty {
                 Some(e) => e,
-                None => crate::value::value_eq(files.as_ref().expect("files loaded"), pf)?,
+                // in any order: a snapshot stands for a tree (§7.3)
+                None => crate::repo::snapshot_eq(my_snap.files()?, parent.files()?)?,
             };
             if want_diff {
                 // both maps are built at most once per commit and reused by
                 // this commit's children, so a diff costs one keying, not four
                 let from_map = parent.map()?;
-                let to_map = my_snap.as_ref().expect("files loaded").map()?;
+                let to_map = my_snap.map()?;
                 let marks = touched_in_maps(from_map, to_map)?;
-                // size: lines added+removed against the parent
+                // size: lines added plus removed against the parent (§7.11
+                // column 5); a path changed without a changed line (an empty
+                // file, a new file type) counts one, so only an empty commit
+                // has no bar. The count stops where the bar does.
                 let mut lines = 0usize;
                 for (key, _, _) in &marks {
-                    let count = |m: &SnapMap| -> usize {
-                        match m.get(key) {
-                            Some(Value::Blob(b)) => b.line_count().max(1),
-                            _ => 1,
-                        }
-                    };
-                    lines += count(from_map) + count(to_map);
+                    if lines >= SIZE_BAR_TOP {
+                        break;
+                    }
+                    let cap = SIZE_BAR_TOP - lines;
+                    lines += changed_lines(from_map.get(key), to_map.get(key), cap)?.max(1);
                 }
                 let marks2: Vec<(String, char)> =
                     marks.iter().map(|(p, m, _)| (p.join("/"), *m)).collect();
-                (marks.is_empty(), Some(lines), marks2)
+                (marks.is_empty(), Some(lines), marks2, marks.len())
             } else {
-                (empty, None, Vec::new())
+                // the files column is the number of paths changed against the
+                // parent (specs/tree.md Step 4), so it diffs even without a bar
+                let nfiles = if opts.files && !empty {
+                    touched_in_maps(parent.map()?, my_snap.map()?)?.len()
+                } else {
+                    0
+                };
+                (empty, None, Vec::new(), nfiles)
             }
         }
         None => {
-            // No parent snapshot to compare against — either this is the top
-            // of the history, or the parent's file list was never materialized
-            // because nothing needed it. `nfiles` is 0 in that second case
-            // simply because the list was not loaded, so it cannot stand in
-            // for emptiness: ask the backend first, and fall back to the file
-            // count only when the list really was loaded (which is exactly
-            // when the backend could not answer).
-            let empty = match backend_empty {
-                Some(e) => e && id != ROOT_ID,
-                None => nfiles == 0 && id != ROOT_ID,
-            };
-            (empty, None, Vec::new())
+            // the top of the history: no parent to compare against, and so no
+            // backend answer either — it is empty iff it has no files (the
+            // root never counts as empty), and every file it has is added
+            let nfiles = my_snap.files()?.as_list()?.len();
+            (nfiles == 0 && id != ROOT_ID, None, Vec::new(), nfiles)
         }
     };
     let meta = interp.backend.meta(&id).ok();
@@ -1168,7 +1752,7 @@ fn build_info(
             immutable,
             focus_id,
             anc,
-            my_snap.as_ref(),
+            Some(&my_snap),
             with_focus,
             is_ancestor_of_focus,
             is_focus_pre,
@@ -1198,6 +1782,7 @@ fn tree_render(
     repo: &Value,
     pal: &Palette,
     with_focus: bool,
+    term_w: Option<usize>,
 ) -> Result<String, Crash> {
     // immutable set
     let immutable = crate::repo::compute_immutable(interp, repo).unwrap_or_default();
@@ -1281,7 +1866,7 @@ fn tree_render(
         crate::eval::unique_prefix_in(&ids, id).len()
     };
     // Step 4 — draw
-    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len)
+    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len, term_w)
 }
 
 fn id_of_frame_parent(frame: &Value) -> Result<String, Crash> {
@@ -1372,12 +1957,16 @@ impl Display {
         }
     }
 
-    fn time(&self) -> Option<i64> {
-        match self {
+    /// The node's time for the row order (Step 1). A node with no stored
+    /// counterpart (minted in this program) has time ∞: it sorts after every
+    /// stored one, not first as a `None` would.
+    fn time(&self) -> i64 {
+        let t = match self {
             Display::Commit { info, .. } => info.meta.as_ref().map(|m| m.time),
             Display::Run { time, .. } => *time,
             Display::Collapsed { info, .. } => info.meta.as_ref().map(|m| m.time),
-        }
+        };
+        t.unwrap_or(i64::MAX)
     }
 
     fn children(&self) -> &[Display] {
@@ -1538,6 +2127,10 @@ enum Rail {
 struct Placement {
     lane: Option<usize>,
     fork: Option<(usize, bool)>, // (source lane, source empties below)
+    // on a flattened last child of the trunk head (or of the root of an empty
+    // trunk): its parent's lane, which empties below this row though no fork
+    // is drawn (Step 3, §Overflow)
+    ends: Option<usize>,
     reservations: Vec<(usize, usize)>, // (lane, child uid)
     flattened: bool,
 }
@@ -1553,6 +2146,10 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
     let mut rails: Vec<Option<Rail>> = vec![None; lanes_n];
     let mut out: Vec<Placement> = Vec::new();
     let mut flattened: BTreeSet<usize> = BTreeSet::new();
+    // each node's row: "last child" and "after t" are in row order, which is
+    // not sibling order once an edit appends a child (`new`, `rebase`)
+    let row_of: BTreeMap<usize, usize> =
+        rows.iter().enumerate().map(|(i, n)| (n.uid(), i)).collect();
     for (idx, n) in rows.iter().enumerate() {
         let in_trunk = n.in_trunk(trunk);
         let parent = rows[..idx]
@@ -1561,14 +2158,12 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
             .find(|p| p.children().iter().any(|c| c.uid() == n.uid()));
         let parent_lane = parent.and_then(|p| out[rows[..idx].iter().position(|x| x.uid() == p.uid()).unwrap()].lane);
         let is_last_child = parent
-            .map(|p| {
-                let cs = p.children();
-                cs[cs.len() - 1].uid() == n.uid()
-            })
+            .map(|p| p.children().iter().all(|c| row_of[&c.uid()] <= idx))
             .unwrap_or(false);
         let was_flat = flattened.contains(&n.uid());
         let mut lane: Option<usize> = None;
         let mut fork: Option<(usize, bool)> = None;
+        let mut ends: Option<usize> = None;
         if !was_flat {
             if idx == 0 {
                 lane = Some(0);
@@ -1594,7 +2189,18 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
                                 fork = Some((pl, false));
                             }
                         }
-                        None => mark_subtree(n, &mut flattened),
+                        None => {
+                            // overflow is rule 5 too: when n is p's last
+                            // child (p is then the trunk head or the root of
+                            // an empty trunk, as any other trunk commit
+                            // reserves lanes for its later side children),
+                            // p's lane empties below this row (Step 3)
+                            mark_subtree(n, &mut flattened);
+                            if is_last_child {
+                                rails[pl] = None;
+                                ends = Some(pl);
+                            }
+                        }
                     }
                 }
             } else {
@@ -1616,8 +2222,13 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
         let mut reservations: Vec<(usize, usize)> = Vec::new();
         if !now_flat && in_trunk {
             let cs = n.children();
-            if let Some(tpos) = cs.iter().position(|c| c.in_trunk(trunk)) {
-                for c in &cs[tpos + 1..] {
+            if let Some(t) = cs.iter().find(|c| c.in_trunk(trunk)) {
+                let mut after: Vec<&Display> = cs
+                    .iter()
+                    .filter(|c| row_of[&c.uid()] > row_of[&t.uid()])
+                    .collect();
+                after.sort_by_key(|c| row_of[&c.uid()]);
+                for c in after {
                     if flattened.contains(&c.uid()) {
                         continue;
                     }
@@ -1634,6 +2245,7 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
         out.push(Placement {
             lane: if now_flat { None } else { lane },
             fork: if now_flat { None } else { fork },
+            ends,
             reservations,
             flattened: now_flat,
         });
@@ -1666,22 +2278,15 @@ fn build_row_text(
     pal: &Palette,
     with_focus: bool,
     prefix_len: &dyn Fn(&str) -> usize,
-    run_extra: usize,
     id_w: usize,
 ) -> RowText {
     let c = n.commit();
     let is_focus = c.map(|x| x.is_focus).unwrap_or(false);
     let gutter = if is_focus && with_focus { "▶ " } else { "  " }.to_string();
-    // id (on a run row the count follows ╎; only the part that overflows the
-    // rails area spills into the id column)
+    // id (blank on a run row, whose count `rail_row` draws: the part that
+    // overflows the rails area runs on into the id column)
     let id = match n {
-        Display::Run { .. } => {
-            let mut s = String::new();
-            while width(&s) < run_extra + id_w {
-                s.push(' ');
-            }
-            s
-        }
+        Display::Run { .. } => " ".repeat(id_w),
         _ => match c {
             Some(info) => {
                 let k = prefix_len(&info.id);
@@ -1754,22 +2359,20 @@ fn build_row_text(
         }
         _ => (String::new(), String::new(), String::new()),
     };
-    // extra columns (§Step 4): date, files changed, full author name
+    // extra columns (§Step 4): date, files changed, full author name — one
+    // entry per enabled column, blank without metadata (a minted commit), so
+    // entry k is the same column on every row
     let mut meta_extra: Vec<String> = Vec::new();
     if let Some(info) = c {
         if info.id != ROOT_ID {
             if opts.date {
-                if let Some(m) = info.meta.as_ref() {
-                    meta_extra.push(render_date(m.time));
-                }
+                meta_extra.push(info.meta.as_ref().map(|m| render_date(m.time)).unwrap_or_default());
             }
             if opts.files {
                 meta_extra.push(format!("{} files", info.nfiles));
             }
             if opts.author {
-                if let Some(m) = info.meta.as_ref() {
-                    meta_extra.push(m.author.clone());
-                }
+                meta_extra.push(info.meta.as_ref().map(|m| m.author.clone()).unwrap_or_default());
             }
         }
     }
@@ -1795,72 +2398,44 @@ fn draw_rows(
     lanes_n: usize,
     with_focus: bool,
     prefix_len: &dyn Fn(&str) -> usize,
+    term_w: Option<usize>,
 ) -> Result<String, Crash> {
     let rail_chars = 2 * lanes_n;
-    // id column width: 4-char min prefix plus the `@` literal prefix, and any
-    // overflow of a run count past the rails area
+    // each row's rails, drawn once; a run row's go on past the rails area
+    // when its count does not fit
+    let rails: Vec<(Vec<char>, Vec<bool>)> = (0..rows.len())
+        .map(|idx| rail_row(rows, placements, idx, lanes_n, opts))
+        .collect();
+    // id column width: 4-char min prefix plus the `@` literal prefix, and
+    // what a run count writes into it past the rails area and the space
+    // after it
     let mut id_w = 5usize;
-    for (idx, n) in rows.iter().enumerate() {
-        if let Display::Run { count, .. } = n {
-            if let Some(l) = placements[idx].lane {
-                let digits = format!("{}", count).len();
-                let extra = (2 * l + 1 + digits).saturating_sub(rail_chars);
-                // digits written from 2l+1; rails hold rail_chars; overflow
-                // goes into the id column
-                if extra > 0 {
-                    id_w = id_w.max(4 + extra);
-                }
-            }
-        }
+    for (chars, _) in &rails {
+        id_w = id_w.max(chars.len().saturating_sub(rail_chars + 1));
     }
     for n in rows {
         if let Some(c) = n.commit() {
             id_w = id_w.max(prefix_len(&c.id) + 1); // +1 for the `@`
         }
     }
-    let text_off = 2 + rail_chars + 1;
-    let msg_off = text_off + id_w + 2;
     let label_col = rows
         .iter()
         .any(|n| n.commit().map(|c| !c.labels.is_empty()).unwrap_or(false));
     // build row texts
     let mut texts: Vec<RowText> = Vec::new();
-    for (idx, n) in rows.iter().enumerate() {
-        let run_extra = match (n, placements[idx].lane) {
-            (Display::Run { count, .. }, Some(l)) => {
-                let digits = format!("{}", count).len();
-                (2 * l + 1 + digits).saturating_sub(rail_chars)
-            }
-            _ => 0,
-        };
-        texts.push(build_row_text(
-            n, rows, opts, pal, with_focus, prefix_len, run_extra, id_w,
-        ));
+    for n in rows {
+        texts.push(build_row_text(n, rows, opts, pal, with_focus, prefix_len, id_w));
     }
-    // right edges for the label and margin columns
-    let mut msg_end_max = 0usize;
-    let mut lab_end_max = 0usize;
-    for (idx, n) in rows.iter().enumerate() {
-        let t = &texts[idx];
-        if n.commit().is_none() {
-            continue;
-        }
-        let mut pos = msg_off;
-        if !t.bar.is_empty() {
-            pos += 1; // the bar takes one extra column before the message
-        }
-        pos += width(&t.msg);
-        if !t.labels.is_empty() {
-            pos += 2 + width(&t.labels);
-        }
-        msg_end_max = msg_end_max.max(pos - if t.labels.is_empty() { 0 } else { 2 + width(&t.labels) });
-        lab_end_max = lab_end_max.max(pos);
-    }
-    let mut lines: Vec<String> = Vec::new();
+    // Columns 4–8 start at the same offset on every row (§Step 4). The size
+    // bar's column is there when any row draws a bar — ` ▅`, two columns —
+    // and blank on the rows that draw none, so a bar never shifts a message.
+    let bar_col = texts.iter().any(|t| !t.bar.is_empty());
+    // each row up to its message: gutter, rails, id and bar
+    let mut heads: Vec<String> = Vec::new();
     for (idx, n) in rows.iter().enumerate() {
         let pl = &placements[idx];
         let t = &texts[idx];
-        let (chars, lane0) = rail_row(rows, placements, idx, lanes_n, opts);
+        let (chars, lane0) = &rails[idx];
         let mut line = String::new();
         line.push_str(&t.gutter);
         // the node glyph (on a commit row) is meaning-coloured; rails lane-coloured
@@ -1868,53 +2443,96 @@ fn draw_rows(
             (Display::Commit { info, .. }, Some(l)) => Some((2 * l, glyph_ansi(info))),
             _ => None,
         };
-        line.push_str(&color_rails(&chars, &lane0, pal, glyph));
+        line.push_str(&color_rails(chars, lane0, pal, glyph));
         line.push(' ');
         line.push_str(&t.id);
-        if !t.bar.is_empty() {
+        if bar_col {
             line.push(' ');
-            line.push_str(&t.bar);
+            line.push_str(if t.bar.is_empty() { " " } else { &t.bar });
         }
         line.push_str("  ");
+        heads.push(line);
+    }
+    // the columns are placed by display width as drawn (an `icons` glyph is
+    // two columns wide), from the message column on
+    let msg_col = rows
+        .iter()
+        .zip(&heads)
+        .filter(|(n, _)| n.commit().is_some())
+        .map(|(_, h)| width(h))
+        .max()
+        .unwrap_or(0);
+    let lab_w = texts.iter().map(|t| width(&t.labels)).max().unwrap_or(0);
+    // the data columns, each as wide as its widest entry, so that the margin
+    // after them starts at one offset too
+    let mut extra_w: Vec<usize> = Vec::new();
+    for t in &texts {
+        for (k, e) in t.meta_extra.iter().enumerate() {
+            if k == extra_w.len() {
+                extra_w.push(0);
+            }
+            extra_w[k] = extra_w[k].max(width(e));
+        }
+    }
+    // the margin's age and initials, each as wide as its widest entry, so
+    // that a `13m` among `9m`s or a single initial moves nothing
+    let margin_w = (
+        texts.iter().map(|t| width(&t.age)).max().unwrap_or(0),
+        texts.iter().map(|t| width(&t.initials)).max().unwrap_or(0),
+    );
+    let metas: Vec<String> = texts
+        .iter()
+        .map(|t| meta_block(t, &extra_w, margin_w, opts, pal))
+        .collect();
+    // message truncation to the terminal width (§Step 4): the widest part
+    // right of the message column (labels, data, margin) sets the room left
+    // for every message, and only messages are cut to it, so the label and
+    // margin columns hold
+    if let Some(w) = term_w {
+        let right = texts
+            .iter()
+            .zip(&metas)
+            .map(|(t, m)| {
+                if !m.is_empty() {
+                    (if label_col { 2 + lab_w } else { 0 }) + 2 + width(m)
+                } else if !t.labels.is_empty() {
+                    2 + width(&t.labels)
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let room = w.saturating_sub(msg_col + right);
+        for t in texts.iter_mut() {
+            t.msg = cut_to_width(&t.msg, room);
+        }
+    }
+    let msg_w = texts.iter().map(|t| width(&t.msg)).max().unwrap_or(0);
+    let lab_off = msg_col + msg_w + 2;
+    let meta_off = if label_col { lab_off + lab_w + 2 } else { lab_off };
+    let mut lines: Vec<String> = Vec::new();
+    for (idx, n) in rows.iter().enumerate() {
+        let t = &texts[idx];
+        let mut line = std::mem::take(&mut heads[idx]);
+        if n.commit().is_some() {
+            pad_to(&mut line, msg_col);
+        }
         line.push_str(&t.msg);
         if label_col && !t.labels.is_empty() {
-            let want = 2 + msg_end_max.saturating_sub(width(&t.msg));
-            line.push_str(&" ".repeat(want));
-            line.push_str(&pal.green(&pad_right(&t.labels, width(&t.labels))));
+            pad_to(&mut line, lab_off);
+            line.push_str(&pal.green(&t.labels));
         }
-        // metadata block: extra columns (date / files / author) then the margin
-        // (age + initials), right-aligned together past the message+labels edge
-        let has_margin = opts.margin && !t.age.is_empty();
-        if !t.meta_extra.is_empty() || has_margin {
-            let cur = if label_col && !t.labels.is_empty() {
-                msg_end_max + 2 + width(&t.labels)
-            } else {
-                width(&t.msg)
-            };
-            let want = 2 + lab_end_max.saturating_sub(cur);
-            line.push_str(&" ".repeat(want));
-            let mut meta: Vec<String> = Vec::new();
-            for e in &t.meta_extra {
-                meta.push(pal.grey(4, e));
-            }
-            if has_margin {
-                meta.push(pal.grey(4, &t.age));
-                meta.push(pal.author(&t.initials_author, &t.initials));
-            }
-            line.push_str(&meta.join("  "));
+        if !metas[idx].is_empty() {
+            pad_to(&mut line, meta_off);
+            line.push_str(&metas[idx]);
         }
-        let _ = pl;
         // the whole focus row is highlighted with a background band across the
         // full terminal width (§Colour; colour only — the ▶ gutter still marks
         // the focus when colour is off)
         let is_focus_row = n.commit().map(|c| c.is_focus).unwrap_or(false);
         if is_focus_row && pal.on {
-            let target_w = if crate::show::stdout_is_tty() {
-                crate::show::terminal_width()
-            } else {
-                None
-            };
-            let padded = match target_w {
+            let padded = match term_w {
                 Some(w) if width(&line) < w => {
                     format!("{}{}", line, " ".repeat(w - width(&line)))
                 }
@@ -1935,7 +2553,8 @@ fn draw_rows(
             dline.push_str("  ");
             dline.push_str(&color_rails(&dchars, &dlane0, pal, None));
             dline.push(' ');
-            dline.push_str(&" ".repeat(id_w + 2));
+            // the marks start two columns into the id column (§Step 4)
+            dline.push_str("  ");
             let marks: Vec<String> = c
                 .detail_marks
                 .iter()
@@ -1955,12 +2574,6 @@ fn draw_rows(
             lines.push(dline);
         }
     }
-    // message truncation to the terminal width (§Step 4)
-    if crate::show::stdout_is_tty() {
-        if let Some(w) = crate::show::terminal_width() {
-            truncate_lines(&mut lines, w, msg_off, label_col, opts.margin);
-        }
-    }
     // no trailing whitespace on any row
     for l in lines.iter_mut() {
         while l.ends_with(' ') {
@@ -1969,7 +2582,7 @@ fn draw_rows(
     }
     // Legend (§Legend): explain the symbols that actually appear, faintly, on
     // the right of the tree if it fits the terminal width, else at the bottom.
-    append_legend(&mut lines, rows, opts, pal);
+    append_legend(&mut lines, rows, opts, pal, term_w);
     let mut out = lines.join("\n");
     out.push('\n');
     Ok(out)
@@ -2075,7 +2688,13 @@ fn legend_lines(used: &UsedSymbols) -> Vec<String> {
 /// faint, to the right of a tree row starting one row from the top, past the
 /// widest tree line. If that would exceed the terminal width (or there is no
 /// terminal), put the legend at the bottom instead.
-fn append_legend(lines: &mut Vec<String>, rows: &[&Display], opts: &TreeOptions, pal: &Palette) {
+fn append_legend(
+    lines: &mut Vec<String>,
+    rows: &[&Display],
+    opts: &TreeOptions,
+    pal: &Palette,
+    tty_width: Option<usize>,
+) {
     let used = collect_used(rows, opts, opts.icons);
     let entries = legend_lines(&used);
     if entries.is_empty() {
@@ -2085,11 +2704,6 @@ fn append_legend(lines: &mut Vec<String>, rows: &[&Display], opts: &TreeOptions,
     let legend_w = entries.iter().map(|e| width(e)).max().unwrap_or(0);
     let gap = 4;
     let right_total = tree_w + gap + legend_w;
-    let tty_width = if crate::show::stdout_is_tty() {
-        crate::show::terminal_width()
-    } else {
-        None
-    };
     let fits_right = tty_width.map_or(false, |w| right_total <= w);
     if fits_right {
         // pad every tree line to tree_w, then append the legend entries dim
@@ -2133,6 +2747,9 @@ fn rail_state_below(
                 state[src] = None;
             }
         }
+        if let Some(l) = p.ends {
+            state[l] = None;
+        }
         if let Some(l) = p.lane {
             state[l] = if m.children().is_empty() {
                 None
@@ -2149,6 +2766,7 @@ fn rail_state_below(
 
 /// rails characters for the row of node `idx` (§Step 4, the character table).
 /// Returns the characters and, per character, whether it belongs to lane 0.
+/// On a run row they go on past the rails area when its count does not fit.
 fn rail_row(
     rows: &[&Display],
     placements: &[Placement],
@@ -2212,11 +2830,19 @@ fn rail_row(
         chars[2 * i] = c;
         lane0[2 * i] = i == 0;
     }
-    // on a run row the count follows ╎, written into the rails area
+    // on a run row the count follows ╎, or the rightmost rail drawn right of
+    // it, so that it covers none; it is written into the rails area and, if
+    // needed, on through the space after it into the blank id column. A run
+    // reserves no lane and any fork on its row comes from its left, so the
+    // rightmost character drawn so far is ╎ or such a rail.
     if let (Display::Run { count, .. }, Some(l)) = (n, pl.lane) {
+        let from = chars.iter().rposition(|&c| c != ' ').unwrap_or(2 * l) + 1;
         for (k, d) in format!(" {}", count).chars().enumerate() {
-            let pos = 2 * l + 1 + k;
-            if pos < chars.len() {
+            let pos = from + k;
+            if pos == chars.len() {
+                chars.push(d);
+                lane0.push(l == 0);
+            } else {
                 chars[pos] = d;
                 lane0[pos] = l == 0;
             }
@@ -2254,7 +2880,8 @@ fn detail_rail_row(
 
 /// Colour the rails. Rail connectors are lane-coloured (lane 0 = immutable
 /// blue, others dim); the node glyph at `glyph` (its lane position and ANSI
-/// code) is meaning-coloured.
+/// code) is meaning-coloured. A glyph two columns wide (`icons`) fills both
+/// characters of its lane, so the one after it is not drawn (§Glyphs).
 fn color_rails(
     chars: &[char],
     lane0: &[bool],
@@ -2262,7 +2889,12 @@ fn color_rails(
     glyph: Option<(usize, &str)>,
 ) -> String {
     let mut s = String::new();
+    let mut covered = false;
     for (i, c) in chars.iter().enumerate() {
+        if std::mem::take(&mut covered) {
+            continue;
+        }
+        covered = UnicodeWidthChar::width(*c) == Some(2);
         let t = c.to_string();
         if *c == ' ' {
             s.push(*c);
@@ -2283,112 +2915,82 @@ fn color_rails(
     s
 }
 
-/// Cut the message so labels and the margin keep their columns (§Step 4).
-/// Only applied on a tty, so it is exercised directly by the tests.
-pub fn truncate_lines(
-    lines: &mut [String],
-    term_w: usize,
-    msg_off: usize,
-    label_col: bool,
-    margin: bool,
-) {
-    for line in lines.iter_mut() {
-        if width(line) <= term_w {
+/// `s` cut to display width `w`, ending with `…` when anything is cut (and
+/// there is a column for it): the message on a terminal (§Step 4). Colour
+/// escapes are kept whole and not counted, and those past the cut still
+/// follow it, so every style `s` opens is closed.
+fn cut_to_width(s: &str, w: usize) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    let mut kept = String::new();
+    // escapes not yet followed by a kept character
+    let mut pending = String::new();
+    let mut used = 0usize;
+    let mut in_esc = false;
+    let mut full = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_esc = true;
+        }
+        if in_esc {
+            in_esc = c != 'm';
+            pending.push(c);
             continue;
         }
-        // find the message span: it starts at msg_off and ends where the
-        // label/margin padding (2+ spaces) begins
-        let plain = strip_ansi(line);
-        if width(&plain) <= term_w {
+        if full {
             continue;
         }
-        // walk characters, tracking display column. Walk the *plain* string:
-        // skipping only the ESC character would leave the rest of each escape
-        // sequence (`[1;36m`) counted as display width.
-        let mut col = 0usize;
-        let mut cut_at: Option<usize> = None;
-        let mut tail_start: Option<usize> = None;
-        let mut prev_two_spaces = 0usize;
-        for (bi, ch) in plain.char_indices() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if col >= msg_off {
-                if ch == ' ' {
-                    prev_two_spaces += 1;
-                } else {
-                    prev_two_spaces = 0;
-                }
-                if prev_two_spaces == 2 && tail_start.is_none() {
-                    tail_start = Some(bi);
-                }
-            }
-            if col + w >= term_w && cut_at.is_none() {
-                cut_at = Some(bi);
-            }
-            col += w;
-        }
-        if !label_col && !margin {
+        // one column is left for the `…`
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw >= w {
+            full = true;
             continue;
         }
-        if let (Some(_cut), Some(_tail)) = (cut_at, tail_start) {
-            // rebuild from the plain string: this path only matters on a tty,
-            // so keep it simple and operate on plain text
-            let p = &plain;
-            let pw = width(p);
-            if pw <= term_w {
-                continue;
-            }
-            // find message end (last run of 2+ spaces that starts the fixed tail)
-            let bytes = p.as_bytes();
-            let mut tail_bi = p.len();
-            let mut i = 0usize;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b' ' && bytes[i + 1] == b' ' {
-                    // candidate: is everything after this point the fixed tail?
-                    tail_bi = i;
-                }
-                i += 1;
-            }
-            let tail = &p[tail_bi..];
-            let tail_w = width(tail);
-            let head_budget = term_w.saturating_sub(tail_w + 1);
-            // the whole plain line; the loop below stops it at head_budget.
-            // (This used to slice by `char_indices().count()`, a *char* count
-            // used as a *byte* index — a panic on any line whose multi-byte
-            // characters put that index inside a character.)
-            let head = p.as_str();
-            let mut head_w = 0usize;
-            let mut head_end = 0usize;
-            for (bi, ch) in head.char_indices() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if head_w + cw > head_budget {
-                    break;
-                }
-                head_w += cw;
-                head_end = bi + ch.len_utf8();
-            }
-            let head = head[..head_end].trim_end();
-            *line = format!("{}…{}", head, tail);
-        }
+        kept.push_str(&pending);
+        pending.clear();
+        kept.push(c);
+        used += cw;
+    }
+    let ellipsis = if w == 0 { "" } else { "…" };
+    format!("{}{}{}", kept.trim_end_matches(' '), ellipsis, pending)
+}
+
+/// Pad `line` with spaces to display column `col`.
+fn pad_to(line: &mut String, col: usize) {
+    let w = width(line);
+    if w < col {
+        line.push_str(&" ".repeat(col - w));
     }
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::new();
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            if c == 'm' {
-                esc = false;
-            }
-            continue;
-        }
-        if c == '\x1b' {
-            esc = true;
-            continue;
-        }
-        out.push(c);
+/// A row's metadata block (§Step 4): the data columns (date / files /
+/// author), each padded to its column's width in `extra_w`, then the margin
+/// (age and initials), each right-aligned in its width in `margin_w`. Empty
+/// when the row shows none of them.
+fn meta_block(
+    t: &RowText,
+    extra_w: &[usize],
+    margin_w: (usize, usize),
+    opts: &TreeOptions,
+    pal: &Palette,
+) -> String {
+    let mut meta: Vec<String> = Vec::new();
+    for (e, w) in t.meta_extra.iter().zip(extra_w) {
+        let mut s = if e.is_empty() { String::new() } else { pal.grey(4, e) };
+        s.push_str(&" ".repeat(w - width(e)));
+        meta.push(s);
     }
-    out
+    if opts.margin && !t.age.is_empty() {
+        let (age_w, init_w) = margin_w;
+        let mut age = " ".repeat(age_w - width(&t.age));
+        age.push_str(&pal.grey(4, &t.age));
+        meta.push(age);
+        let mut init = " ".repeat(init_w - width(&t.initials));
+        init.push_str(&pal.author(&t.initials_author, &t.initials));
+        meta.push(init);
+    }
+    meta.join("  ").trim_end().to_string()
 }
 
 fn glyph_for(info: &CommitInfo, icons: bool) -> &'static str {
@@ -2449,16 +3051,17 @@ fn size_bar(size: Option<usize>, pal: &Palette) -> String {
     match size {
         None | Some(0) => String::new(),
         Some(n) => {
-            let (bar, level) = if n >= 1000 {
+            // one glyph per threshold 1, 10, 50, 200, 1000 (§7.11 column 5)
+            let (bar, level) = if n >= SIZE_BAR_TOP {
                 ("▇", 4)
             } else if n >= 200 {
-                ("▇", 3)
+                ("▅", 3)
             } else if n >= 50 {
-                ("▅", 2)
+                ("▃", 2)
             } else if n >= 10 {
-                ("▃", 1)
+                ("▂", 1)
             } else {
-                ("▂", 0)
+                ("▁", 0)
             };
             pal.accent(level, bar)
         }
@@ -2471,4 +3074,281 @@ fn initials(name: &str) -> String {
         .take(2)
         .collect::<String>()
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::BlobVal;
+    use std::collections::HashMap;
+
+    /// Lines deleted plus inserted by a shortest diff of `a` to `b`, uncapped
+    /// and found without anything `changed_lines` uses: both lengths less
+    /// twice a longest common subsequence, which Hyyrö's bit-parallel LCS
+    /// finds a machine word of `a` at a time.
+    fn exact(a: &[String], b: &[String]) -> usize {
+        let words = a.len().div_ceil(64);
+        // per line of `a`, a bit at each place it occurs in `a`
+        let mut masks: HashMap<&str, Vec<u64>> = HashMap::new();
+        for (i, l) in a.iter().enumerate() {
+            masks.entry(l.as_str()).or_insert_with(|| vec![0; words])[i / 64] |= 1 << (i % 64);
+        }
+        let absent = vec![0; words];
+        // after each line of `b`, the zero bits of `v` up to a place in `a`
+        // count a longest common subsequence of `a` up to there and `b` so
+        // far; the bits past the end of `a` stay ones
+        let mut v = vec![u64::MAX; words];
+        for l in b {
+            let m = masks.get(l.as_str()).unwrap_or(&absent);
+            let mut carry = false;
+            for (v, m) in v.iter_mut().zip(m) {
+                let (sum, c1) = v.overflowing_add(*v & m);
+                let (sum, c2) = sum.overflowing_add(carry as u64);
+                carry = c1 || c2;
+                *v = sum | (*v & !m);
+            }
+        }
+        let common: usize = v.iter().map(|w| w.count_zeros() as usize).sum();
+        a.len() + b.len() - 2 * common
+    }
+
+    /// `changed_lines` from `a` to `b` and back is the exact count, or the
+    /// cap if that is less: under the size bar's cap, caps on either side of
+    /// the first search's 64 rounds, `cap` if given, and the exact count plus
+    /// one, which leaves no room: a bound or a search stopped short that
+    /// overcounts at all returns the cap there.
+    fn check(a: &[String], b: &[String], cap: Option<usize>) {
+        let (va, vb) = (BlobVal::text_blob(&a.concat()), BlobVal::text_blob(&b.concat()));
+        let want = exact(a, b);
+        assert_eq!(want, exact(b, a));
+        let mut caps = vec![1, 64, 65, want + 1, SIZE_BAR_TOP];
+        caps.extend(cap);
+        caps.retain(|c| *c <= SIZE_BAR_TOP);
+        for cap in caps {
+            for (from, to) in [(&va, &vb), (&vb, &va)] {
+                let got = changed_lines(Some(from), Some(to), cap).unwrap();
+                assert_eq!(got, want.min(cap), "cap {}, {} and {} lines", cap, a.len(), b.len());
+            }
+        }
+    }
+
+    /// xorshift64*: the same numbers on every run
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as usize % n
+        }
+    }
+
+    #[test]
+    fn changed_lines_is_exact_up_to_its_cap() {
+        // the size bar is drawn from this count (§7.11 column 5), and no
+        // shortcut may change it, whatever the machine or the content.
+        // A few lines repeating, disjoint adjacent pairs of them swapped, or
+        // lines a whole number of periods apart each replaced by the line
+        // after it (two lines each): no line occurs once on either side, and
+        // every diagonal the period divides runs along equal lines from one
+        // change to the next. Swapping leaves how many times each line
+        // occurs as it was; replacing always turns the same line into the
+        // same other one, so the counts alone bound it by its size
+        for period in [2, 3] {
+            let lines: Vec<String> = (0..3000).map(|i| format!("l{}\n", i % period)).collect();
+            for changes in [1, 33, 499, 501] {
+                let (mut swapped, mut replaced) = (lines.clone(), lines.clone());
+                let step = 2990 / changes;
+                let periods = step / period * period;
+                for k in 0..changes {
+                    let at = 3 + step * k;
+                    swapped.swap(at, at + 1);
+                    let at = 3 + periods * k;
+                    replaced[at] = lines[at + 1].clone();
+                }
+                check(&lines, &swapped, None);
+                check(&lines, &replaced, None);
+            }
+        }
+        // runs of one line swapped: a shortest diff keeps the longer run
+        let runs = |x: &str, n: usize, y: &str, m: usize| -> Vec<String> {
+            let run = |l: &str, n| std::iter::repeat_n(format!("{}\n", l), n);
+            run(x, n).chain(run(y, m)).collect()
+        };
+        check(&runs("a", 499, "b", 501), &runs("b", 501, "a", 500), None);
+        check(&runs("a", 500, "b", 501), &runs("b", 501, "a", 500), None);
+        // distinct lines, blocks moved past as many others: two lines per line
+        // moved, where only the lines that occur once on each side bound it
+        let lines: Vec<String> = (0..4000).map(|i| format!("line {}\n", i)).collect();
+        for lens in [&[90; 5][..], &[100, 100, 100, 100, 99], &[100; 5], &[250, 251], &[600]] {
+            let mut moved = lines.clone();
+            for (j, len) in lens.iter().enumerate() {
+                let at = 100 + 700 * j;
+                let block: Vec<String> = moved.drain(at..at + len).collect();
+                moved.splice(at + len..at + len, block);
+            }
+            check(&lines, &moved, None);
+        }
+        // random edits of random files, of two lines up to mostly distinct
+        // ones: lines inserted, removed, replaced, and blocks moved
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..40 {
+            let distinct = [2, 5, 50, 1 << 20][rng.below(4)];
+            let line = |rng: &mut Rng| format!("{}\n", rng.below(distinct));
+            let a: Vec<String> = (0..rng.below(800)).map(|_| line(&mut rng)).collect();
+            let mut b = a.clone();
+            for _ in 0..rng.below(300) {
+                let at = rng.below(b.len() + 1);
+                match rng.below(4) {
+                    0 => b.insert(at, line(&mut rng)),
+                    1 if at < b.len() => {
+                        b.remove(at);
+                    }
+                    2 if at < b.len() => b[at] = line(&mut rng),
+                    _ => {
+                        let end = (at + rng.below(40)).min(b.len());
+                        let block: Vec<String> = b.drain(at..end).collect();
+                        let to = rng.below(b.len() + 1);
+                        b.splice(to..to, block);
+                    }
+                }
+            }
+            check(&a, &b, Some(1 + rng.below(SIZE_BAR_TOP)));
+        }
+    }
+
+    #[test]
+    fn banded_distance_is_exact_under_its_max() {
+        // the search `line_distance` falls back on, checked on its own,
+        // since `changed_lines` only reaches it where Myers' search would
+        // take long. Under the exact count plus one the band has no room to
+        // spare, so a word wrongly updated or left alone at its edges
+        // overcounts there. Files of a few words, random or repeating a few
+        // lines, with a band narrower than them under most caps
+        let text = |ls: &[usize]| -> Vec<String> {
+            ls.iter().map(|l| format!("{}\n", l)).collect()
+        };
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..200 {
+            let distinct = [1, 2, 3, 50][rng.below(4)];
+            let most = [70, 300, 700][rng.below(3)];
+            let len = rng.below(most);
+            let periodic = rng.below(2) == 0;
+            let a: Vec<usize> = (0..len)
+                .map(|i| if periodic { i % distinct } else { rng.below(distinct) })
+                .collect();
+            let mut b = a.clone();
+            for _ in 0..rng.below(60) {
+                let at = rng.below(b.len() + 1);
+                match rng.below(5) {
+                    0 => b.insert(at, rng.below(distinct)),
+                    1 if at < b.len() => {
+                        b.remove(at);
+                    }
+                    2 if at < b.len() => b[at] = rng.below(distinct),
+                    3 if at + 1 < b.len() => b.swap(at, at + 1),
+                    _ => {
+                        let end = (at + rng.below(40)).min(b.len());
+                        let block: Vec<usize> = b.drain(at..end).collect();
+                        let to = rng.below(b.len() + 1);
+                        b.splice(to..to, block);
+                    }
+                }
+            }
+            let want = exact(&text(&a), &text(&b));
+            for max in [1, 2, want + 1, want + 2, 64, 65, SIZE_BAR_TOP, 1 + rng.below(want + 2)] {
+                for (x, y) in [(&a, &b), (&b, &a)] {
+                    let mut steps = 0;
+                    let got = banded_distance(x, y, distinct, max, &mut steps);
+                    assert_eq!(got, want.min(max), "max {}, {:?} and {:?}", max, x, y);
+                    assert!(steps <= banded_steps(x.len(), y.len(), max));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_distance_takes_steps_by_the_band_not_by_the_file() {
+        // two lines alternating, 480 pairs of neighbours swapped: 960 lines.
+        // Myers' search runs along equal lines on every other diagonal from
+        // one swap to the next, a pass over the file for each of about 500
+        // diagonals, and on such a file of a million lines drawing the size
+        // bar took seconds. `line_distance` gives it up once it has taken as
+        // many steps as the bit-parallel search takes at most, 18 words per
+        // line under the size bar's cap, so it takes at most twice that and
+        // one diagonal with its run, whatever the lines are
+        let a: Vec<usize> = (0..100_000).map(|i| i % 2).collect();
+        let mut b = a.clone();
+        for k in 0..480 {
+            b.swap(1000 + 200 * k, 1001 + 200 * k);
+        }
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(960));
+        assert_eq!(line_distance(&a, &b, 2, SIZE_BAR_TOP, &mut steps), 960);
+        let most = banded_steps(a.len(), b.len(), SIZE_BAR_TOP);
+        assert!(most <= 18 * WORD * a.len(), "{} steps at most", most);
+        assert!(steps <= 2 * most + DIAGONAL + a.len(), "{} steps", steps);
+        assert!(plain > 400 * a.len(), "{} steps", plain);
+    }
+
+    #[test]
+    fn line_distance_gives_up_where_the_bit_parallel_search_costs_less() {
+        // the hand-over is where it saves time, not where the two searches
+        // have taken as many steps. Two lines alternating, 32 pairs of
+        // neighbours swapped far apart: Myers' search compares about twice
+        // as many pairs of lines as `banded_distance` takes word steps, but
+        // a word step costs several comparisons, so it is the cheaper search
+        // and finishes. Giving it up there made the search over a million
+        // such lines take three times as long in a debug build
+        let a: Vec<usize> = (0..100_000).map(|i| i % 2).collect();
+        let mut b = a.clone();
+        for k in 0..32 {
+            b.swap(1001 + 3000 * k, 1002 + 3000 * k);
+        }
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(64));
+        assert_eq!(line_distance(&a, &b, 2, SIZE_BAR_TOP, &mut steps), 64);
+        assert_eq!(steps, plain);
+        // distinct lines, a block of 400 moved past 10000 others: Myers'
+        // search reaches some 320000 diagonals, on most of which no line is
+        // equal, and reaching one costs about twice a word step, so it gives
+        // up and the two searches together take fewer steps than it alone
+        let a: Vec<usize> = (0..10_400).collect();
+        let b: Vec<usize> = (400..10_400).chain(0..400).collect();
+        let (mut plain, mut steps) = (0, 0);
+        assert_eq!(edit_distance(&a, &b, SIZE_BAR_TOP, usize::MAX, &mut plain), Some(800));
+        assert_eq!(line_distance(&a, &b, a.len(), SIZE_BAR_TOP, &mut steps), 800);
+        assert!(steps < plain, "{} steps, {} alone", steps, plain);
+    }
+
+    #[test]
+    fn reorder_bound_keeps_no_line_more_often_than_either_side_has_it() {
+        // the bound only spares `changed_lines` a search: the exact counts
+        // above hold with any lower bound, however loose, so only this pins
+        // how tight it is. Lines that occur once on each side keep at most a
+        // longest sequence of them in the same order on both: ten reversed
+        // keep one
+        let distinct: Vec<usize> = (0..10).collect();
+        let reversed: Vec<usize> = (0..10).rev().collect();
+        assert_eq!(reorder_bound(&distinct, &reversed, 10), 18);
+        // any other line is kept at most as many times as the side with
+        // fewer of it has it: two lines alternating with 501 of the 1500
+        // `0`s turned into `1`s keep 999 `0`s and 1500 `1`s. Counting them
+        // only up to the shorter side kept all 3000, a bound of 0, and the
+        // search ran over the whole file
+        let alternating: Vec<usize> = (0..3000).map(|i| i % 2).collect();
+        let mut replaced = alternating.clone();
+        for k in 0..501 {
+            replaced[2 * k] = 1;
+        }
+        assert_eq!(reorder_bound(&alternating, &replaced, 2), 1002);
+        assert_eq!(reorder_bound(&replaced, &alternating, 2), 1002);
+        // the two kinds side by side add up
+        let then = |once: &[usize], others: &[usize]| -> Vec<usize> {
+            once.iter().copied().chain(others.iter().map(|l| l + 10)).collect()
+        };
+        let (a, b) = (then(&distinct, &alternating), then(&reversed, &replaced));
+        assert_eq!(reorder_bound(&a, &b, 12), 1020);
+    }
 }

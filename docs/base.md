@@ -261,7 +261,7 @@ decides the result). Operands must be `Bool`.
 ```
 1 == 1 && 2 == 2        => true
 1 == 2 || 3 == 3        => true
-not (1 == 2)            => false
+not (1 == 2)            => true
 not true                => false
 ```
 
@@ -312,7 +312,7 @@ show "hi"               => "\"hi\""
 show [1 "a" true]       => "[1 \"a\" true]"
 show ({ x = 1 })        => "{ x = 1 }"
 show (describe "wip")   => "describe \"wip\""
-show (\x -> x + 1)      => "\x -> (x + 1)"
+show (\x -> x + 1)      => "\\x -> x + 1"
 ```
 
 ---
@@ -415,8 +415,14 @@ replay : Snapshot -> Change -> Snapshot
 ```
 
 `replay onto ch` computes "`onto`, with the change from `ch.from` to `ch.to`
-applied." It is **total**: where the change collides with what is already
-there, the path's blob becomes *unresolved* (a conflict) rather than an error.
+applied." Where the change collides with what is already there, the path's
+blob becomes *unresolved* (a conflict) rather than an error. The one
+exception is a collision that would make a path a file on one side and a
+directory on another, as adding `./a/b` onto a file `./a` would: one entry
+cannot list a directory's entries, so `replay` crashes, naming the path, and
+`or` catches it. A conflict already at the path in `onto`, `ch.from` or
+`ch.to` is carried, directory sides and all, so a child that resolves such a
+conflict can still be squashed into it.
 
 ```
 -- onto has "base", change takes "base" -> "theirs": no collision
@@ -467,6 +473,24 @@ no such visible commit. Backed by the change-id index. Applied to one argument
 by @wqzt        -- an edit: refocus on the commit @wqzt
 ```
 
+### `subtreeCommits` — every commit of a tree
+
+```
+subtreeCommits : a -> [Commit]
+```
+
+Every commit of a tree (anything with `root` and `children`, so a `Subtree`
+or a `Repo`'s focused subtree), in preorder, in one pass. It gives exactly
+what `\t -> t.root :: (concat (map subtreeCommits t.children) or [])` gives,
+but in time linear in the size of the tree: written that way, every level
+copies the list below it. The reference config's `commits` is this builtin
+(§6).
+
+```
+subtreeCommits ({ root = 1, children = [({ root = 2, children = [] })] })
+    => [1 2]
+```
+
 ### `meta` — commit metadata
 
 ```
@@ -510,7 +534,9 @@ diff (blob "a\nb\n") (blob "a\nc\n")
 `difft p a b` renders the comparison with **difftastic**, treating the input
 as the file `p` (its last component guides language detection). Needs `difft`
 on `PATH` (the Nix package provides it); options via `DFT_*` environment
-variables. Crashes naming the tool if absent.
+variables. Crashes naming the tool if absent. A `difft` that runs and fails
+is not an error: what it printed, even nothing, is the result, and what it
+says on stderr reaches the terminal.
 
 ### `treeWith` — the history tree
 
@@ -599,13 +625,16 @@ commits . top           -- every commit, preorder
 
 ```
 commits : a -> [Commit]
-commits = \t -> t.root :: (concat (map commits t.children) or [])
+commits = subtreeCommits
 ```
 
 Every commit of a subtree (or of the focused subtree of a `Repo`), in
 preorder. Takes anything with `root` and `children`, so the signature is left
-open. The `or []` handles a leaf (whose `children` is empty, so `concat`
-crashes and yields `[]`).
+open. It is the builtin `subtreeCommits` (§5), which computes
+`\t -> t.root :: (concat (map commits t.children) or [])` in one pass. (There
+the `or []` handles a leaf, whose `children` is empty, so `concat` crashes and
+yields `[]`.) Written in the language, it copies the list below every commit,
+and takes time quadratic in the length of the history.
 
 ```
 length . commits . top      -- how many commits are visible?
@@ -1032,8 +1061,11 @@ and its parent.
 rendered by difftastic, one record per changed path. (Replace `difft` with
 `(\p -> diff)` to use the built-in unified diff instead.)
 
-**`review : Repo -> Text`** — the same, as one page of text. A `Text` result
-prints raw, so `j review` is readable in the terminal.
+**`review : Repo -> Text`** — the same, as one page of text, or
+`"no changes\n"` when the focus changes nothing. A `Text` result prints raw,
+so `j review` is readable in the terminal. Like `diffs`, it crashes when
+`difft` cannot be run (not on `PATH`); otherwise whatever `difft` prints,
+even nothing, is the page, and what it says on stderr reaches the terminal.
 
 ```
 j 'review'              -- the focus's changes, as difftastic renders them
@@ -1182,6 +1214,7 @@ j 'tree'
 | `stack` | `Revset` | §7.3 |
 | `startsWith` | `Text -> Text -> Bool` | §4 |
 | `status` | `Repo -> {…}` | §10 |
+| `subtreeCommits` | `a -> [Commit]` | §5 |
 | `tail` | `[a] -> [a]` | §4 |
 | `take` | `Int -> [a] -> [a]` | §4 |
 | `text` | `Blob -> Text` | §5 |

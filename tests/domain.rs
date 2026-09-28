@@ -1,7 +1,7 @@
 //! In-memory backend and replay (§7.3, §10) plus repo zipper/validation (§7.5).
 
 use j::domain::{simple_replay, MemBackend, ROOT_ID};
-use j::value::{value_eq, BlobVal, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, Value};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -117,6 +117,35 @@ fn replay_conflict_kept_unresolved() {
 }
 
 #[test]
+fn replay_conflict_sides_keep_absence_and_file_type() {
+    // each side was kept as bare bytes, so a side the path is absent on
+    // equalled an empty file and a side's file type was dropped (§7.3)
+    let from = snap(vec![entry("a", "1")]);
+    let onto = snap(vec![entry("a", "2")]);
+    let deleted = simple_replay(&onto, &from, &snap(vec![])).unwrap();
+    let emptied = simple_replay(&onto, &from, &snap(vec![entry("a", "")])).unwrap();
+    assert!(unresolved_at(&deleted, "a") && unresolved_at(&emptied, "a"));
+    let (d, e) = (content_at(&deleted, "a").unwrap(), content_at(&emptied, "a").unwrap());
+    assert!(!value_eq(&d, &e).unwrap(), "a deletion conflict equals an emptying one");
+    let exec_entry = |content: &str| {
+        Value::record(&[
+            (
+                "content",
+                Value::Blob(Rc::new(BlobVal {
+                    kind: BlobKind::Executable,
+                    content: BlobContent::Resolved(Rc::new(content.as_bytes().to_vec())),
+                })),
+            ),
+            ("path", Value::list(vec![Value::text("a")])),
+        ])
+    };
+    let exec = simple_replay(&[exec_entry("2")], &[exec_entry("1")], &[exec_entry("3")]).unwrap();
+    let plain = simple_replay(&onto, &from, &snap(vec![entry("a", "3")])).unwrap();
+    let (x, p) = (content_at(&exec, "a").unwrap(), content_at(&plain, "a").unwrap());
+    assert!(!value_eq(&x, &p).unwrap(), "executable sides equal regular ones");
+}
+
+#[test]
 fn replay_malformed_snapshots_crash() {
     // duplicate paths
     let bad = snap(vec![entry("a", "1"), entry("a", "2")]);
@@ -130,6 +159,87 @@ fn replay_malformed_snapshots_crash() {
         ("path", Value::text("a")),
     ])];
     assert!(simple_replay(&bad2, &[], &[]).is_err());
+}
+
+#[test]
+fn replay_rejects_root_entries_and_file_directory_clashes() {
+    // an entry at the root path ./ names no file: jj's tree builder panicked
+    // on it (exit 101) while this backend accepted it
+    let at_root = vec![Value::record(&[
+        ("content", BlobVal::text_blob("x")),
+        ("path", Value::list(vec![])),
+    ])];
+    for (onto, from, to) in [
+        (&at_root[..], &[][..], &[][..]),
+        (&[][..], &[][..], &at_root[..]),
+        (&[][..], &at_root[..], &[][..]),
+    ] {
+        let e = simple_replay(onto, from, to).unwrap_err();
+        assert!(e.msg.contains("not a well-formed snapshot"), "{}", e.msg);
+    }
+    // `a` as a file and a directory at once: jj's tree keeps only one of
+    // them, so the real backend silently dropped the file `a` (§7.3, §10)
+    let clash = snap(vec![entry("a", "file"), entry("a/b", "nested")]);
+    let e = simple_replay(&clash, &[], &[]).unwrap_err();
+    assert!(e.msg.contains("both a file and a directory"), "{}", e.msg);
+    let deep = snap(vec![entry("d/e", "1"), entry("d/e0", "2"), entry("d/e/f/g", "3")]);
+    assert!(simple_replay(&[], &[], &deep).is_err());
+    // sharing a prefix of a component's text is no clash
+    let fine = snap(vec![entry("a.txt", "1"), entry("a/b", "2"), entry("ab", "3")]);
+    let out = simple_replay(&fine, &fine, &fine).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b", "a.txt", "ab"]);
+}
+
+#[test]
+fn replay_refuses_a_path_both_a_file_and_a_directory() {
+    // adding `a/b` onto a file `a` left both in the result: a snapshot that
+    // the next replay (replayTree's, for a child) refused as malformed, and
+    // one jj's merge makes into a single conflict at `a` whose directory
+    // side cannot be listed as entries. Replay now crashes, naming the path
+    // (§7.3, §10).
+    let file = snap(vec![entry("a", "x")]);
+    let dir = snap(vec![entry("a/b", "y")]);
+    for (onto, to) in [(&file, &dir), (&dir, &file)] {
+        let e = simple_replay(onto, &[], to).unwrap_err();
+        assert!(
+            e.msg.contains("`a` would be a file on one side and a directory on another"),
+            "{}",
+            e.msg
+        );
+    }
+    // a file on one side, and a file below it on another, deeper down
+    let e = simple_replay(&dir, &[], &snap(vec![entry("a/b/c", "z")])).unwrap_err();
+    assert!(e.msg.contains("`a/b` would be a file"), "{}", e.msg);
+    // one side replacing the file with a directory is no clash
+    let out = simple_replay(&file, &file, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
+    let out = simple_replay(&dir, &dir, &file).unwrap();
+    assert_eq!(paths_of(&out), vec!["a"]);
+
+    // where a file meets a directory this merge goes path by path, and jj's
+    // takes the path as one value, so the backends may differ (§7.3, §10).
+    // The deletion of `a/z` onto a snapshot that made the directory `a` a
+    // file gives that file, where jj refuses
+    let yz = snap(vec![entry("a/y", "y"), entry("a/z", "z")]);
+    let out = simple_replay(&file, &yz, &snap(vec![entry("a/y", "y")])).unwrap();
+    assert_eq!(paths_of(&out), vec!["a"]);
+    // a file `a` made `a/b`, onto a snapshot without `a`, gives `a/b`, where
+    // jj keeps a conflict at `a` with the directory as a side
+    let out = simple_replay(&[], &file, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
+    // `a/b` added beside a conflict at `a` is refused, where jj carries the
+    // conflict with the directory as a side
+    let conflicted =
+        simple_replay(&[entry("a", "left")], &[entry("a", "base")], &[entry("a", "right")]).unwrap();
+    assert!(unresolved_at(&conflicted, "a"));
+    let e = simple_replay(&conflicted, &[], &dir).unwrap_err();
+    assert!(e.msg.contains("`a` would be a file"), "{}", e.msg);
+    // a child resolving that conflict into `a/b`, replayed with `from` the
+    // conflict onto the same resolution, as contract replays the child when
+    // squashing it: this gives `a/b`, where jj keeps a conflict at `a`. Only
+    // the squash as a whole agrees, as abandon then drops that replayed child
+    let out = simple_replay(&dir, &conflicted, &dir).unwrap();
+    assert_eq!(paths_of(&out), vec!["a/b"]);
 }
 
 #[test]

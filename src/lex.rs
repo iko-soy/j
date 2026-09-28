@@ -45,6 +45,9 @@ pub struct SpTok {
     pub tok: Tok,
     pub line: usize, // 1-based
     pub col: usize,  // 1-based
+    /// byte offsets of the token in the source: `start..end`
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug)]
@@ -84,6 +87,13 @@ fn valid_label(s: &str) -> bool {
 pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
     let mut toks: Vec<SpTok> = Vec::new();
     let chars: Vec<char> = src.chars().collect();
+    // byte offset of each char, and of the end: tokens carry byte spans so
+    // the parser can keep a lambda's source text (§5.2)
+    let bytes: Vec<usize> = src
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(src.len()))
+        .collect();
     let mut i = 0usize;
     let mut line = 1usize;
     let mut col = 1usize; // column of next char
@@ -97,13 +107,15 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
         };
     }
 
-    // push helper
+    // push helper; `$s..$e` are the token's char indices
     macro_rules! push {
-        ($t:expr, $l:expr, $c:expr) => {
+        ($t:expr, $l:expr, $c:expr, $s:expr, $e:expr) => {
             toks.push(SpTok {
                 tok: $t,
                 line: $l,
                 col: $c,
+                start: bytes[$s],
+                end: bytes[$e],
             })
         };
     }
@@ -111,7 +123,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
     while i < chars.len() {
         let c = chars[i];
         if c == '\n' {
-            push!(Tok::Newline, line, col);
+            push!(Tok::Newline, line, col, i, i + 1);
             i += 1;
             line += 1;
             col = 1;
@@ -124,6 +136,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
         }
         let start_line = line;
         let start_col = col;
+        let start = i;
         // comments
         if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
             // could be `--` comment, but `->`? no: `->` is dash-gt, distinct.
@@ -147,7 +160,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                     i += 2;
                     col += 2;
                 } else if chars[i] == '\n' {
-                    push!(Tok::Newline, line, col);
+                    push!(Tok::Newline, line, col, i, i + 1);
                     i += 1;
                     line += 1;
                     col = 1;
@@ -159,14 +172,14 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             if depth > 0 {
                 err!("unterminated block comment");
             }
-            // a comment spanning lines must not leave later tokens looking
-            // like continuations of the line it started on
-            push!(Tok::Newline, line, col);
+            // a comment is whitespace (§3.1): one spanning lines has already
+            // ended the line it started on, with the Newlines pushed above,
+            // and one that does not must leave its line unbroken
             continue;
         }
         // arrow `->` (check before operator `-`)
         if c == '-' && i + 1 < chars.len() && chars[i + 1] == '>' {
-            push!(Tok::Arrow, start_line, start_col);
+            push!(Tok::Arrow, start_line, start_col, i, i + 2);
             i += 2;
             col += 2;
             continue;
@@ -202,7 +215,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             if !comp.is_empty() {
                 comps.push(comp);
             }
-            push!(Tok::PathLit(comps), start_line, start_col);
+            push!(Tok::PathLit(comps), start_line, start_col, start, i);
             continue;
         }
         // selector: `.` immediately followed by identifier-start
@@ -215,13 +228,13 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                 i += 1;
                 col += 1;
             }
-            push!(Tok::Selector(name), start_line, start_col);
+            push!(Tok::Selector(name), start_line, start_col, start, i);
             continue;
         }
         // `@` id literals
         if c == '@' {
             if i + 1 >= chars.len() || !is_ident_char(chars[i + 1]) {
-                push!(Tok::NewId, start_line, start_col);
+                push!(Tok::NewId, start_line, start_col, i, i + 1);
                 i += 1;
                 col += 1;
                 continue;
@@ -239,7 +252,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                 if i < chars.len() && is_ident_char(chars[i]) {
                     err!("invalid id literal");
                 }
-                push!(Tok::IdLit(s), start_line, start_col);
+                push!(Tok::IdLit(s), start_line, start_col, start, i);
                 continue;
             }
             err!("`@` followed by an identifier character outside k-z is not a valid id literal");
@@ -262,7 +275,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             if !valid_label(&s) {
                 err!("invalid label literal");
             }
-            push!(Tok::LabelLit(s), start_line, start_col);
+            push!(Tok::LabelLit(s), start_line, start_col, start, i);
             continue;
         }
         // text literal, double- or single-quoted
@@ -308,7 +321,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                     }
                 }
             }
-            push!(Tok::Text(s), start_line, start_col);
+            push!(Tok::Text(s), start_line, start_col, start, i);
             continue;
         }
         // integer
@@ -319,7 +332,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                 i += 1;
                 col += 1;
             }
-            push!(Tok::Int(s.parse::<BigInt>().unwrap()), start_line, start_col);
+            push!(Tok::Int(s.parse::<BigInt>().unwrap()), start_line, start_col, start, i);
             continue;
         }
         // identifier / keyword
@@ -348,7 +361,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                 }
                 _ => Tok::Ident(s),
             };
-            push!(t, start_line, start_col);
+            push!(t, start_line, start_col, start, i);
             continue;
         }
         // type name
@@ -364,7 +377,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                     break;
                 }
             }
-            push!(Tok::TypeName(s), start_line, start_col);
+            push!(Tok::TypeName(s), start_line, start_col, start, i);
             continue;
         }
         // symbolic operators: longest match
@@ -387,7 +400,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             }
         }
         if let Some(op) = matched {
-            push!(Tok::Op(op), start_line, start_col);
+            push!(Tok::Op(op), start_line, start_col, i, i + op.len());
             i += op.len();
             col += op.len();
             continue;
@@ -407,11 +420,11 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             '=' => Tok::Equals,
             _ => err!(format!("unexpected character `{}`", c)),
         };
-        push!(t, start_line, start_col);
+        push!(t, start_line, start_col, i, i + 1);
         i += 1;
         col += 1;
     }
-    push!(Tok::Eof, line, col);
+    push!(Tok::Eof, line, col, i, i);
     Ok(toks)
 }
 

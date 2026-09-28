@@ -42,11 +42,15 @@ fn commit_strategy(id: String) -> impl Strategy<Value = GCommit> {
         ),
     )
         .prop_map(|(id, message, labels, files)| {
-            // unique paths
-            let mut seen = BTreeSet::new();
+            // a well-formed snapshot (§7.3): unique paths, none both a file
+            // and a directory
+            let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
             let files: Vec<(Vec<String>, String)> = files
                 .into_iter()
-                .filter(|(p, _)| seen.insert(p.clone()))
+                .filter(|(p, _)| {
+                    !seen.iter().any(|q| q.starts_with(p) || p.starts_with(q))
+                        && seen.insert(p.clone())
+                })
                 .collect();
             GCommit {
                 id,
@@ -266,7 +270,9 @@ fn repos_match(a: &Value, b: &Value, backend_ids: &BTreeSet<String>) -> bool {
     };
     let ma = to_map(&ca, pa);
     let mb = to_map(&cb, pb);
-    // match commits by (parent, files, message, labels), ignoring minted ids
+    // match commits by (parent, files, message, labels), ignoring minted ids;
+    // files compare as the trees they stand for, whatever their order (§7.3)
+    let same_files = |a: &Value, b: &Value| j::repo::snapshot_eq(a, b).unwrap_or(false);
     let mut unmatched: Vec<(String, Value, Value, Value)> = mb.values().cloned().collect();
     for (ida, va) in &ma {
         if backend_ids.contains(ida) {
@@ -275,7 +281,7 @@ fn repos_match(a: &Value, b: &Value, backend_ids: &BTreeSet<String>) -> bool {
                 Some(vb) => {
                     let pos = unmatched.iter().position(|x| {
                         x.0 == vb.0
-                            && value_eq(&x.1, &vb.1).unwrap_or(false)
+                            && same_files(&x.1, &vb.1)
                             && value_eq(&x.2, &vb.2).unwrap_or(false)
                             && value_eq(&x.3, &vb.3).unwrap_or(false)
                     });
@@ -291,7 +297,7 @@ fn repos_match(a: &Value, b: &Value, backend_ids: &BTreeSet<String>) -> bool {
         } else {
             // minted: match any unmatched with same content
             let pos = unmatched.iter().position(|x| {
-                value_eq(&x.1, &va.1).unwrap_or(false)
+                same_files(&x.1, &va.1)
                     && value_eq(&x.2, &va.2).unwrap_or(false)
                     && value_eq(&x.3, &va.3).unwrap_or(false)
             });
@@ -369,6 +375,49 @@ proptest! {
         let got = eval_fn(&mut i, &cfg, "rebase parents", repo.clone());
         prop_assert!(got.is_ok(), "rebase parents failed: {:?}", got.err());
         prop_assert!(repos_match(&got.unwrap(), &repo, &stored));
+    }
+
+    #[test]
+    fn law_abandon_contract_split((tree, focus, backend) in arb_repo()) {
+        // (abandon . contract m . split m) r = r, up to minted ids: abandon
+        // leaves a new focus holding r's files on the commit it folded into,
+        // and removing that focus gives r back. For an m that matches some
+        // paths and not others, `select` lists the entries in another order,
+        // which is no difference: snapshots compare path by path (§7.3, §8).
+        prop_assume!(!focus.is_empty(), "needs a parent");
+        let repo = repo_value(&tree, &focus);
+        let stored: BTreeSet<String> = backend.metas.keys().cloned().collect();
+        // filesets over the first components of the focus's and its parent's
+        // paths; `under` a one-component path cannot pair a file with a
+        // directory of the same name across the two halves `select` joins
+        let (mut parent, mut cur) = (&tree, &tree);
+        for &k in &focus {
+            parent = cur;
+            cur = &cur.children[k];
+        }
+        let firsts: BTreeSet<&String> = parent.root.files.iter()
+            .chain(cur.root.files.iter())
+            .map(|(p, _)| &p[0])
+            .collect();
+        let mut filesets = vec!["everything".to_string(), "(neg everything)".to_string()];
+        for c in firsts {
+            filesets.push(format!("(under [\"{}\"])", c));
+            filesets.push(format!("(neg (under [\"{}\"]))", c));
+        }
+        let (mut i, cfg) = make_interp(backend);
+        let files = |r: &Value| r.field("root").unwrap().field("files").unwrap();
+        for m in &filesets {
+            let src = format!("abandon . contract {} . split {}", m, m);
+            let got = eval_fn(&mut i, &cfg, &src, repo.clone());
+            prop_assert!(got.is_ok(), "{} failed: {:?}", src, got.err());
+            let got = got.unwrap();
+            prop_assert!(
+                j::repo::snapshot_eq(&files(&got), &files(&repo)).unwrap(),
+                "{}: the new focus does not hold r's files", src
+            );
+            let back = eval_fn(&mut i, &cfg, "remove", got).expect("remove");
+            prop_assert!(repos_match(&back, &repo, &stored), "{}", src);
+        }
     }
 
     #[test]
@@ -538,6 +587,23 @@ proptest! {
         let b = eval_fn(&mut i, &cfg, "top", repo).expect("top");
         let _ = a;
         prop_assert!(repos_match(&a2, &b, &stored));
+    }
+
+    #[test]
+    fn law_history_walks_are_their_recursive_definitions((tree, focus, backend) in arb_repo()) {
+        // `commits` is the builtin `subtreeCommits` and `ancestors` reads the
+        // context frames, so that neither is quadratic in the depth of the
+        // history; from any focus they give what the recursive definitions
+        // they replaced give (§4.9, §9)
+        let repo = repo_value(&tree, &focus);
+        let (mut i, cfg) = make_interp(backend);
+        let src = "let oldCommits = \\t -> t.root :: (concat (map oldCommits t.children) or []); \
+                       oldAncestors = \\r -> r.root.id :: ((let p = up r in oldAncestors p) or []) \
+                   in \\r -> [(commits (top r) == oldCommits (top r)) \
+                              (commits r == oldCommits r) \
+                              (ancestors r == oldAncestors r)]";
+        let got = eval_fn(&mut i, &cfg, src, repo).expect("history walks");
+        prop_assert!(value_eq(&got, &Value::list(vec![Value::Bool(true); 3])).unwrap());
     }
 
     #[test]

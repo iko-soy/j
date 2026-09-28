@@ -53,6 +53,12 @@ impl ListVal {
     pub fn as_slice(&self) -> &[Value] {
         &self.items[self.start..]
     }
+    /// which list this is, while it is held: two lists of one identity
+    /// share their elements from the same first one, so are the same list
+    /// without either being compared
+    pub fn identity(&self) -> (*const Vec<Value>, usize) {
+        (Rc::as_ptr(&self.items), self.start)
+    }
 }
 
 impl std::ops::Deref for ListVal {
@@ -64,18 +70,38 @@ impl std::ops::Deref for ListVal {
 
 pub struct ThunkVal {
     state: std::cell::RefCell<ThunkState>,
+    /// for a commit's `files` as the backend built them: the change id of the
+    /// stored commit whose tree this loads. An edit that changes the files
+    /// replaces the thunk, so a commit still holding the one tagged with its
+    /// own id holds exactly the stored tree — the only case in which the
+    /// backend's answers about that tree describe the value (§7.2).
+    origin: Option<String>,
+    /// for a commit's `files` as the backend built them: a name for the
+    /// stored tree this loads. Two lists loaded under the same name are
+    /// equal, and a list the backend loads from a tree is a snapshot (§7.3),
+    /// so persisting compares and validates a commit the program left as
+    /// loaded without reading its files (§7.5).
+    tree: Option<String>,
 }
 
 enum ThunkState {
     Pending(Box<dyn FnOnce() -> Result<Value, Crash>>),
+    /// the computation has been taken out of `Pending` and is running
+    Forcing,
     Ready(Value),
+    /// the computation crashed (a store read failed). Every later force
+    /// crashes the same way (§7.2): a crash caught by `or`, or swallowed by
+    /// rendering, must not leave some other value behind.
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for ThunkVal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &*self.state.borrow() {
             ThunkState::Pending(_) => write!(f, "Thunk(pending)"),
+            ThunkState::Forcing => write!(f, "Thunk(forcing)"),
             ThunkState::Ready(v) => write!(f, "Thunk({:?})", v),
+            ThunkState::Failed(c) => write!(f, "Thunk(failed: {})", c.msg),
         }
     }
 }
@@ -84,27 +110,64 @@ impl ThunkVal {
     pub fn new(f: impl FnOnce() -> Result<Value, Crash> + 'static) -> Self {
         ThunkVal {
             state: std::cell::RefCell::new(ThunkState::Pending(Box::new(f))),
+            origin: None,
+            tree: None,
         }
     }
 
-    /// the value, computing it on first call and memoizing
-    pub fn force(&self) -> Result<Value, Crash> {
-        if let ThunkState::Ready(v) = &*self.state.borrow() {
-            return Ok(v.clone());
+    /// the lazy `files` of the stored commit with change id `origin`, which
+    /// load the stored tree named `tree`, if the backend names its trees
+    pub fn stored(
+        origin: String,
+        tree: Option<String>,
+        f: impl FnOnce() -> Result<Value, Crash> + 'static,
+    ) -> Self {
+        ThunkVal {
+            origin: Some(origin),
+            tree,
+            ..ThunkVal::new(f)
         }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, ThunkState::Ready(Value::Bool(false))) {
-                ThunkState::Pending(t) => t,
-                ThunkState::Ready(v) => {
-                    *st = ThunkState::Ready(v.clone());
-                    return Ok(v);
-                }
+    }
+
+    /// the change id of the stored commit whose tree this loads, if any
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
+    /// the name of the stored tree this loads, if the backend gave one
+    pub fn tree(&self) -> Option<&str> {
+        self.tree.as_deref()
+    }
+
+    /// the value, where it has been computed; nothing is computed here
+    pub fn peek(&self) -> Option<Value> {
+        match &*self.state.borrow() {
+            ThunkState::Ready(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// the value, computing it on first call and memoizing the outcome, a
+    /// crash included
+    pub fn force(&self) -> Result<Value, Crash> {
+        match &*self.state.borrow() {
+            ThunkState::Ready(v) => return Ok(v.clone()),
+            ThunkState::Failed(c) => return Err(c.clone()),
+            ThunkState::Forcing => {
+                return Err(Crash::new("internal: a lazy value was forced re-entrantly"))
             }
+            ThunkState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), ThunkState::Forcing) {
+            ThunkState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let v = thunk()?;
-        *self.state.borrow_mut() = ThunkState::Ready(v.clone());
-        Ok(v)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(v) => ThunkState::Ready(v.clone()),
+            Err(c) => ThunkState::Failed(c.clone()),
+        };
+        out
     }
 }
 
@@ -135,8 +198,31 @@ pub enum BlobContent {
     Lazy(Rc<LazyBlob>),
     /// Conflict sides, jj order: alternating adds and removes, starting and
     /// ending with an add: [add, (remove, add)*]. For the in-memory backend:
-    /// [to, from, onto]-style three sides as [add, remove, add].
-    Conflict(Vec<Rc<Vec<u8>>>),
+    /// [to, from, onto]-style three sides as [add, remove, add]. `None` is a
+    /// side on which the path is absent (a deletion conflict, §7.3).
+    Conflict(Vec<Option<ConflictSide>>),
+}
+
+/// One present side of a conflict: its content and its own file type, which
+/// jj keeps per side (§7.3)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictSide {
+    pub kind: BlobKind,
+    pub bytes: Rc<Vec<u8>>,
+    /// a side on which jj holds a directory, in a conflict between a file
+    /// and a directory: the hex id of that tree, kept opaque so the side is
+    /// written back as the directory it was. Its `bytes` are empty (§7.3).
+    pub tree: Option<String>,
+}
+
+impl ConflictSide {
+    pub fn regular(bytes: &[u8]) -> ConflictSide {
+        ConflictSide {
+            kind: BlobKind::Regular,
+            bytes: Rc::new(bytes.to_vec()),
+            tree: None,
+        }
+    }
 }
 
 /// A blob whose bytes are read from the store only on first use (§7.2):
@@ -149,7 +235,12 @@ pub struct LazyBlob {
 
 enum LazyState {
     Pending(Box<dyn FnOnce() -> Result<Rc<Vec<u8>>, Crash>>),
+    /// the read has been taken out of `Pending` and is running
+    Forcing,
     Ready(Rc<Vec<u8>>),
+    /// the read failed: every later force fails the same way, so the blob
+    /// never reads as empty (§7.2), whoever caught or swallowed the crash
+    Failed(Crash),
 }
 
 impl std::fmt::Debug for LazyBlob {
@@ -176,25 +267,28 @@ impl LazyBlob {
         }
     }
 
-    /// the bytes, reading from the store on first call and memoizing
+    /// the bytes, reading from the store on first call and memoizing the
+    /// outcome, a failed read included
     pub fn force(&self) -> Result<Rc<Vec<u8>>, Crash> {
         // fast path: already forced
-        if let LazyState::Ready(b) = &*self.state.borrow() {
-            return Ok(b.clone());
-        }
-        let thunk = {
-            let mut st = self.state.borrow_mut();
-            match std::mem::replace(&mut *st, LazyState::Ready(Rc::new(Vec::new()))) {
-                LazyState::Pending(t) => t,
-                LazyState::Ready(b) => {
-                    *st = LazyState::Ready(b.clone());
-                    return Ok(b);
-                }
+        match &*self.state.borrow() {
+            LazyState::Ready(b) => return Ok(b.clone()),
+            LazyState::Failed(c) => return Err(c.clone()),
+            LazyState::Forcing => {
+                return Err(Crash::new("internal: a lazy blob was read re-entrantly"))
             }
+            LazyState::Pending(_) => {}
+        }
+        let thunk = match std::mem::replace(&mut *self.state.borrow_mut(), LazyState::Forcing) {
+            LazyState::Pending(t) => t,
+            _ => unreachable!("the state was Pending just above"),
         };
-        let bytes = thunk()?;
-        *self.state.borrow_mut() = LazyState::Ready(bytes.clone());
-        Ok(bytes)
+        let out = thunk();
+        *self.state.borrow_mut() = match &out {
+            Ok(b) => LazyState::Ready(b.clone()),
+            Err(c) => LazyState::Failed(c.clone()),
+        };
+        out
     }
 }
 
@@ -220,7 +314,7 @@ impl BlobVal {
         match &self.content {
             BlobContent::Resolved(b) => b.len(),
             BlobContent::Lazy(l) => l.force().map(|b| b.len()).unwrap_or(0),
-            BlobContent::Conflict(sides) => sides.iter().map(|s| s.len()).sum(),
+            BlobContent::Conflict(sides) => sides.iter().flatten().map(|s| s.bytes.len()).sum(),
         }
     }
     /// content as bytes, forcing a lazy blob; conflicts render with jj-style
@@ -264,20 +358,22 @@ impl BlobVal {
     }
 }
 
-/// Render a conflict with jj-style markers.
-pub fn render_conflict(sides: &[Rc<Vec<u8>>]) -> Vec<u8> {
+/// Render a conflict with jj-style markers; a side the path is absent on
+/// renders as empty content, as jj materialises it.
+pub fn render_conflict(sides: &[Option<ConflictSide>]) -> Vec<u8> {
     // sides: [add0, remove0, add1, remove1, ... addN]
     let mut out = Vec::new();
     out.extend_from_slice(b"<<<<<<<\n");
     let mut i = 0;
     while i < sides.len() {
+        let bytes: &[u8] = sides[i].as_ref().map_or(&[], |s| &s.bytes);
         if i % 2 == 0 {
             out.extend_from_slice(b"+++++++\n");
-            out.extend_from_slice(&sides[i]);
+            out.extend_from_slice(bytes);
             ensure_newline(&mut out);
         } else {
             out.extend_from_slice(b"%%%%%%%\n");
-            out.extend_from_slice(&sides[i]);
+            out.extend_from_slice(bytes);
             ensure_newline(&mut out);
         }
         i += 1;
@@ -317,9 +413,6 @@ impl PrimKind {
 pub enum ShapeKind {
     Record(BTreeSet<String>),
     Prim(PrimKind),
-    /// an alias that could not be resolved to a record shape yet (function,
-    /// list, or a typedecl processed later); resolved lazily at check time
-    Aliased(String),
 }
 
 #[derive(Clone, Debug)]
@@ -342,7 +435,11 @@ pub enum FunVal {
         arity: usize,
         args: Vec<Value>,
         f: BuiltinFn,
-        pending: Option<(String, Rc<crate::shape::ContractExpr>)>,
+        /// the name this function is under, its contract as further
+        /// arguments arrive, and how many of `args` it held when it was
+        /// given that name, which are its value's, not the arguments a
+        /// signed definition was given (§5.2)
+        pending: Option<(String, Rc<crate::shape::ContractExpr>, usize)>,
     },
     Closure {
         name: Option<String>, // top-level definition name, if any
@@ -350,23 +447,92 @@ pub enum FunVal {
         applied: usize,
         /// the arguments supplied so far, for rendering (§5.2)
         applied_args: Vec<Value>,
-        /// the body has not been evaluated yet (the definition's contract is
-        /// not exhausted): the next application evaluates it, then applies
-        deferred: bool,
         body: Rc<Expr>,
         env: Env,
-        src: String,
+        /// the lambda's source, which it renders as (§5.2)
+        src: crate::ast::Source,
         /// contract of this function as further arguments arrive
         pending: Option<(String, Rc<crate::shape::ContractExpr>)>,
     },
     /// `f or g` lifted pointwise over functions (§4.6)
     OrFun(Value, Value),
-    /// unevaluated composition: unfolds only when applied to a non-function
-    /// (§4.1 note — `abandon . contract everything` is a value before it is
-    /// applied, and must not run at load)
+    /// a composition `f . g` applied as `f (g x)` (§4.9); `(.)` itself
+    /// builds a builtin node instead (builtins::compose_values)
     ComposeLazy(Value, Value),
     /// a label literal %name: applies as `labelled "name"`
     Labelled(String, Value),
+}
+
+/// What a function holds that may hold further functions: a closure's
+/// environment and arguments, a builtin's arguments, the operands of an
+/// `or` or a composition, a label's `labelled`. It is only ever dropped.
+#[allow(dead_code)]
+enum Held {
+    Closure(Env, Vec<Value>),
+    Args(Vec<Value>),
+    Two(Value, Value),
+    One(Value),
+}
+
+/// How many function drops run inside one another before the next one's
+/// contents are put off to the outermost.
+const INLINE_FUN_DROPS: usize = 64;
+
+struct FunDrops {
+    depth: std::cell::Cell<usize>,
+    put_off: std::cell::RefCell<Vec<Held>>,
+}
+
+thread_local! {
+    static FUN_DROPS: FunDrops = const {
+        FunDrops {
+            depth: std::cell::Cell::new(0),
+            put_off: std::cell::RefCell::new(Vec::new()),
+        }
+    };
+}
+
+/// A function is dropped with what it holds, which may be a function holding
+/// a function, and so on: a closure over a closure, a composition of
+/// compositions, a named wrapper around another (named_apply). Dropped the
+/// usual way, such a chain recursed once per link on the native stack, and a
+/// chain a recursion had built a million links long aborted the process
+/// (§4.1). Past a small depth, what a function holds is put off, and the
+/// outermost function drop drops it, so the stack a drop takes is bounded.
+impl Drop for FunVal {
+    fn drop(&mut self) {
+        let held = match self {
+            FunVal::Closure {
+                env, applied_args, ..
+            } => Held::Closure(std::mem::replace(env, Env::empty()), std::mem::take(applied_args)),
+            FunVal::Builtin { args, .. } => Held::Args(std::mem::take(args)),
+            FunVal::OrFun(a, b) | FunVal::ComposeLazy(a, b) => Held::Two(
+                std::mem::replace(a, Value::Bool(false)),
+                std::mem::replace(b, Value::Bool(false)),
+            ),
+            FunVal::Labelled(_, v) => Held::One(std::mem::replace(v, Value::Bool(false))),
+        };
+        // once the thread's locals are gone, `held` simply drops here
+        let _ = FUN_DROPS.try_with(move |d| {
+            let depth = d.depth.get();
+            if depth >= INLINE_FUN_DROPS {
+                d.put_off.borrow_mut().push(held);
+                return;
+            }
+            d.depth.set(depth + 1);
+            drop(held);
+            if depth == 0 {
+                loop {
+                    let next = d.put_off.borrow_mut().pop();
+                    match next {
+                        Some(h) => drop(h),
+                        None => break,
+                    }
+                }
+            }
+            d.depth.set(depth);
+        });
+    }
 }
 
 impl Value {
@@ -457,17 +623,13 @@ impl Value {
 
 /// Attach a definition name and contract to a function value (§4.13).
 pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract>) -> Value {
-    let pending = Some((
-        name.to_string(),
-        Rc::new(crate::shape::ContractExpr::Known { contract, at: 0 }),
-    ));
+    let cexpr = Rc::new(crate::shape::ContractExpr::Known { contract, at: 0 });
+    let pending = Some((name.to_string(), cexpr.clone()));
     match v {
         Value::Fun(fv) => match fv.as_ref() {
             FunVal::Closure {
                 params,
                 applied,
-                applied_args,
-                deferred,
                 body,
                 env,
                 src,
@@ -476,8 +638,10 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 name: Some(name.to_string()),
                 params: params.clone(),
                 applied: *applied,
-                applied_args: applied_args.clone(),
-                deferred: *deferred,
+                // the definition renders as its name, followed only by the
+                // arguments it is given, not those its value holds: `prev`,
+                // not `prev (parents)` (§5.2)
+                applied_args: Vec::new(),
                 body: body.clone(),
                 env: env.clone(),
                 src: src.clone(),
@@ -494,11 +658,78 @@ pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract
                 arity: *arity,
                 args: args.clone(),
                 f: *f,
-                pending,
+                // the arguments it holds now are its value's, and those
+                // after them the definition's own: `k3 ((+)) 0` with
+                // `k3 = foldl`, past a signature that ends in a type
+                // variable and so stops counting (§5.2)
+                pending: Some((name.to_string(), cexpr, args.len())),
             })),
-            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => v.clone(),
+            // `f or g` and `%name` have nowhere to hold a contract, so the
+            // definition becomes `\x -> v x` under its name, which the
+            // closure machinery checks at every argument the signature lists
+            // and at the result. The check is around the lifted `or` as a
+            // whole (§4.6): a result that violates the signature is a crash,
+            // not a reason to try the other side.
+            FunVal::OrFun(_, _) | FunVal::ComposeLazy(_, _) | FunVal::Labelled(_, _) => {
+                named_apply(v.clone(), Vec::new(), name, cexpr)
+            }
         },
         _ => v.clone(),
+    }
+}
+
+/// `\x -> f x` under a definition's name and contract: it renders as the
+/// name followed by `applied_args` (§5.2), and its further arguments and its
+/// result are checked against the contract (§4.13)
+pub fn named_apply(
+    f: Value,
+    applied_args: Vec<Value>,
+    name: &str,
+    cexpr: Rc<crate::shape::ContractExpr>,
+) -> Value {
+    Value::Fun(Rc::new(FunVal::Closure {
+        name: Some(name.to_string()),
+        params: vec![Pattern::Var("x".to_string())],
+        applied: 0,
+        applied_args,
+        body: NAMED_APPLY_BODY.with(Rc::clone),
+        env: Env::empty().extend(vec![("f".to_string(), f)]),
+        // a named closure renders by its name, not its source (§5.2)
+        src: crate::ast::Source::new(Rc::from(""), 0, 0),
+        pending: Some((name.to_string(), cexpr)),
+    }))
+}
+
+thread_local! {
+    /// `f x`, the body every named_apply wrapper shares, by which one is
+    /// told from a lambda written in the language
+    static NAMED_APPLY_BODY: Rc<Expr> = {
+        let var = |n: &str| Rc::new(Expr::Var(n.to_string()));
+        Rc::new(Expr::App(var("f"), var("x")))
+    };
+}
+
+/// The function `v` wraps when it is a named_apply wrapper under `name` and a
+/// contract the same as `cexpr`. Naming that function afresh under them
+/// checks all the wrapper would, so a definition that names the value of its
+/// own recursive call wraps it once, not once per call (§4.13).
+pub fn named_inner(v: &Value, name: &str, cexpr: &crate::shape::ContractExpr) -> Option<Value> {
+    match v {
+        Value::Fun(fv) => match fv.as_ref() {
+            FunVal::Closure {
+                body,
+                env,
+                pending: Some((n, c)),
+                ..
+            } if n == name
+                && c.same_as(cexpr)
+                && NAMED_APPLY_BODY.with(|b| Rc::ptr_eq(b, body)) =>
+            {
+                env.lookup("f")
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -536,9 +767,10 @@ pub struct Frame {
 enum FrameKind {
     Small(Vec<(String, Value)>),
     Big(HashMap<String, Value>),
-    /// recursive let bindings: filled incrementally, read through the cell so
+    /// recursive let bindings: the names the block binds, and their values
+    /// in that order, filled incrementally and read through the cell so
     /// closures capturing the frame see later bindings (§4.1)
-    Rec(Rc<std::cell::RefCell<Vec<(String, Value)>>>),
+    Rec(Rc<[String]>, Rc<std::cell::RefCell<Vec<Value>>>),
 }
 
 impl Env {
@@ -564,13 +796,14 @@ impl Env {
         }
     }
 
-    /// extend with a recursive frame (for `let` blocks)
-    pub fn extend_rec(&self) -> (Env, Rc<std::cell::RefCell<Vec<(String, Value)>>>) {
-        let cell = Rc::new(std::cell::RefCell::new(Vec::new()));
+    /// extend with a recursive frame (for `let` blocks) binding `names`,
+    /// whose values are pushed to the returned cell in the same order
+    pub fn extend_rec(&self, names: Rc<[String]>) -> (Env, Rc<std::cell::RefCell<Vec<Value>>>) {
+        let cell = Rc::new(std::cell::RefCell::new(Vec::with_capacity(names.len())));
         (
             Env {
                 frame: Some(Rc::new(Frame {
-                    kind: FrameKind::Rec(cell.clone()),
+                    kind: FrameKind::Rec(names, cell.clone()),
                     parent: self.clone(),
                 })),
             },
@@ -589,11 +822,13 @@ impl Env {
                         }
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, v) in cell.borrow().iter().rev() {
-                        if n == name {
-                            return Some(v.clone());
-                        }
+                FrameKind::Rec(names, cell) => {
+                    // the frame binds its names before it holds their values:
+                    // one not evaluated yet is unbound here, not a same-named
+                    // definition further out, which config.j's binders may
+                    // reuse (§4.2)
+                    if let Some(i) = names.iter().rposition(|n| n == name) {
+                        return cell.borrow().get(i).cloned();
                     }
                 }
                 FrameKind::Big(m) => {
@@ -615,7 +850,7 @@ impl Env {
         while let Some(f) = cur {
             match &f.kind {
                 FrameKind::Small(_) => small_frames += 1,
-                FrameKind::Big(_) | FrameKind::Rec(_) => {}
+                FrameKind::Big(_) | FrameKind::Rec(..) => {}
             }
             cur = f.parent.frame.as_ref();
         }
@@ -631,8 +866,8 @@ impl Env {
                         out.insert(n.clone());
                     }
                 }
-                FrameKind::Rec(cell) => {
-                    for (n, _) in cell.borrow().iter() {
+                FrameKind::Rec(names, _) => {
+                    for n in names.iter() {
                         out.insert(n.clone());
                     }
                 }

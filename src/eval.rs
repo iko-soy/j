@@ -4,7 +4,7 @@
 use crate::ast::{Expr, Pattern};
 use crate::domain::Backend;
 use crate::shape::{check as contract_check, Contract, Shapes};
-use crate::value::{Crash, Env, FunVal, Value};
+use crate::value::{Crash, Env, FunVal, ListVal, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -20,8 +20,18 @@ pub struct Interp {
     fresh: RefCell<u64>,
     /// the currently executing top-level definition (for crash reports)
     pub current_def: RefCell<Option<String>>,
+    /// The definitions written as lambdas, by the address of the lambda's
+    /// body, which every closure made from it shares: while that body runs,
+    /// the definition is executing (§1.4), whatever name its closure has
+    /// been bound to since (`prev = goto parents` runs goto's body). The body
+    /// is held so its address cannot be reused.
+    def_bodies: HashMap<*const Expr, (Rc<str>, Rc<Expr>)>,
     /// the repository as loaded, before snapshotting (for `validate`)
     pub old_repo: RefCell<Option<Value>>,
+    /// the repository the expression was given (§1.2 step 4, after the
+    /// snapshot), where displaying a `Commit` reads where it stands (§5.1);
+    /// `old_repo` when unset
+    pub given_repo: RefCell<Option<Value>>,
     /// Results of applying a config revset the binary itself calls (`trunk`,
     /// `immutable`), keyed by the identity of the Repo record they were
     /// applied to. Both are pure and both are asked for more than once per
@@ -84,11 +94,11 @@ pub(crate) enum Cont {
     Arg(Rc<Expr>, Env, Rc<Cont>),
     Fun(Value, Rc<Cont>),
     If(Rc<Expr>, Rc<Expr>, Env, Rc<Cont>),
+    /// the bindings of a `let` block, in evaluation order, whose values so
+    /// far are in the block's frame
     LetRest {
-        names: Vec<String>,
         exprs: Vec<Rc<Expr>>,
-        acc: Vec<(String, Value)>,
-        cell: Rc<RefCell<Vec<(String, Value)>>>,
+        cell: Rc<RefCell<Vec<Value>>>,
         body: Rc<Expr>,
         env: Env,
         cont: Rc<Cont>,
@@ -102,8 +112,6 @@ pub(crate) enum Cont {
     OrBoth(Value, Rc<Cont>),
     /// a shared continuation (used when both `or` outcomes continue the same way)
     Shared(Rc<Cont>),
-    /// unconditionally crash with a fixed message (deferred-body failure)
-    CrashWith(String),
     /// run the continuation's computation, catching crashes: on success pass
     /// the value to `on_ok`, on crash switch to `on_crash` (§4.6)
     Try {
@@ -111,8 +119,9 @@ pub(crate) enum Cont {
         snapshot: u64,
         on_crash: Box<State>,
     },
-    /// applying a Labelled: apply inner `labelled` result to the real arg
-    LabelledArg(Value, Rc<Cont>),
+    /// apply the returned function to this argument: the `labelled "name"`
+    /// of a Labelled to the real arg
+    ApplyTo(Value, Rc<Cont>),
     UpdateBase(Vec<(String, Rc<Expr>)>, Env, Rc<Cont>),
     UpdateFields {
         base: Value,
@@ -141,12 +150,73 @@ pub(crate) enum Cont {
         cexpr: Rc<crate::shape::ContractExpr>,
         cont: Rc<Cont>,
     },
+    /// the function a signed definition's value returned when it ran out of
+    /// parameters before its signature (a lambda's body, or a builtin or a
+    /// composition given its last argument): make it the named partial
+    /// application of `args` (§5.2), checked against the rest of `cexpr`
+    NamePartial {
+        name: String,
+        cexpr: Rc<crate::shape::ContractExpr>,
+        args: Vec<Value>,
+        cont: Rc<Cont>,
+    },
     /// after applying, check the (partial) result against the contract
     #[allow(dead_code)]
     CheckResult {
         name: String,
         contract: Rc<Contract>,
         supplied: usize,
+        cont: Rc<Cont>,
+    },
+    /// the body of a definition's lambda is running (§1.4); passes its value
+    /// on unchanged
+    InDef {
+        name: Rc<str>,
+        cont: Rc<Cont>,
+    },
+    // The builtins that apply functions they are given run as steps of this
+    // machine, not in a nested run, so a recursion through them takes no
+    // native stack (§4.1; Interp::step_applying). Each frame below receives
+    // one value, so `acc` is pushed to once per element and shared, not
+    // copied, when the trampoline clones the continuation.
+    /// `map f xs`, receiving `f` of the element at `idx`
+    MapNext {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        acc: Rc<RefCell<Vec<Value>>>,
+        cont: Rc<Cont>,
+    },
+    /// `filter p xs`, receiving `p` of the element at `idx`
+    FilterNext {
+        p: Value,
+        xs: ListVal,
+        idx: usize,
+        acc: Rc<RefCell<Vec<Value>>>,
+        cont: Rc<Cont>,
+    },
+    /// `foldl f z xs`, receiving `f` applied to the accumulator, to be
+    /// applied to the element at `idx`
+    FoldlArg {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        cont: Rc<Cont>,
+    },
+    /// `foldl f z xs`, receiving the accumulator after the element at `idx`
+    FoldlAcc {
+        f: Value,
+        xs: ListVal,
+        idx: usize,
+        cont: Rc<Cont>,
+    },
+    /// the result of such a builtin, checked against its contract once the
+    /// functions it applies have run (§4.13); `def` is the signed definition
+    /// the builtin is the value of, which a crash under this frame is in (§1.4)
+    BuiltinResult {
+        cname: String,
+        check: Option<Rc<crate::shape::ContractExpr>>,
+        def: Option<String>,
         cont: Rc<Cont>,
     },
 }
@@ -163,12 +233,13 @@ pub(crate) enum TryOk {
         env: Env,
         cont: Rc<Cont>,
     },
-    /// the deferred body of a signed definition: apply it to the pending arg
-    DeferredBody { arg: Value, cont: Rc<Cont> },
-    /// the inner leg of a lazy composition: apply the outer function
-    ComposeInner { f: Value, cont: Rc<Cont> },
-    /// the lhs of a lifted `or` applied to an argument
-    OrFunLhs { cont: Rc<Cont> },
+    /// the lhs of a lifted `or` applied to an argument: like `OrLhs`, with
+    /// the rhs function still to be applied to the same argument
+    OrFunLhs {
+        rhs: Value,
+        arg: Value,
+        cont: Rc<Cont>,
+    },
 }
 
 pub(crate) enum Run {
@@ -180,7 +251,7 @@ pub(crate) enum Run {
 /// the parent continuation Rc of `k`, for iterative drop and unwinding
 fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
     match k {
-        Cont::Halt | Cont::CrashWith(_) | Cont::Try { .. } => None,
+        Cont::Halt | Cont::Try { .. } => None,
         Cont::Arg(_, _, k) => Some(k),
         Cont::Fun(_, k) => Some(k),
         Cont::If(_, _, _, k) => Some(k),
@@ -190,19 +261,119 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::ExpectBool(_, k) => Some(k),
         Cont::OrBoth(_, k) => Some(k),
         Cont::Shared(k) => Some(k),
-        Cont::LabelledArg(_, k) => Some(k),
+        Cont::ApplyTo(_, k) => Some(k),
         Cont::UpdateBase(_, _, k) => Some(k),
         Cont::UpdateFields { cont, .. } => Some(cont),
         Cont::RecordFields { cont, .. } => Some(cont),
         Cont::ListElems { cont, .. } => Some(cont),
         Cont::CheckExpr { cont, .. } => Some(cont),
+        Cont::NamePartial { cont, .. } => Some(cont),
         Cont::CheckResult { cont, .. } => Some(cont),
+        Cont::InDef { cont, .. } => Some(cont),
+        Cont::MapNext { cont, .. } => Some(cont),
+        Cont::FilterNext { cont, .. } => Some(cont),
+        Cont::FoldlArg { cont, .. } => Some(cont),
+        Cont::FoldlAcc { cont, .. } => Some(cont),
+        Cont::BuiltinResult { cont, .. } => Some(cont),
     }
 }
 
 /// the parent continuation of `k`, for unwinding to the nearest Try on crash
 pub(crate) fn pop_cont(k: &Cont) -> Option<Cont> {
     parent_rc(k).map(|r| (**r).clone())
+}
+
+/// Drop `k`, a continuation a crash abandons, one frame at a time. A frame
+/// drops its parent with it, so dropping a chain as long as the recursion a
+/// crash ended took native stack per frame, and a crash at the bottom of a
+/// deep recursion aborted the process instead of being reported or caught
+/// (§4.1, §4.7). The walk stops at a frame another chain still holds.
+fn drop_chain(k: Cont) {
+    let mut parent = parent_rc(&k).cloned();
+    drop(k);
+    while let Some(rc) = parent {
+        parent = match Rc::try_unwrap(rc) {
+            Ok(frame) => parent_rc(&frame).cloned(),
+            Err(_) => None,
+        };
+    }
+}
+
+/// The innermost definition whose application `k` continues (§1.4): a
+/// signed definition's application runs under the `CheckExpr` of its result,
+/// the body of a definition's lambda under an `InDef` naming it unless that
+/// `CheckExpr` names it already, and the functions a builtin applies as a
+/// signed definition's value under a `BuiltinResult` naming it; each stays on
+/// the chain until the body has returned. Only used on a crash no `Try`
+/// caught, so there is no `Try` on the chain to stop the walk early.
+fn innermost_def(k: &Cont) -> Option<String> {
+    let mut k = k;
+    loop {
+        match k {
+            Cont::CheckExpr { name, .. }
+            | Cont::BuiltinResult {
+                def: Some(name), ..
+            } => return Some(name.clone()),
+            Cont::InDef { name, .. } => return Some(name.to_string()),
+            _ => {}
+        }
+        k = parent_rc(k)?;
+    }
+}
+
+/// True when `k` starts with the frames a body of the signed definition
+/// `name` pushes when `cexpr` is what remains of its signature: the check of
+/// its value and, while `cexpr` lists further arguments, the naming of that
+/// value as the definition's partial application. A body applied under them
+/// is a call in tail position of the same definition (`shortS (n - 1)` in
+/// `shortS`'s body), and its own frames would check the same value against
+/// the same contract under the same name once more and name it afresh, only
+/// for the outer naming to replace that name (NamePartial). The outer frames
+/// serve for both, so a signed tail recursion keeps its continuation
+/// constant in size, as an unsigned one does (§4.1, §4.13).
+fn checks_already(k: &Cont, name: &str, cexpr: &crate::shape::ContractExpr) -> bool {
+    match k {
+        Cont::CheckExpr { name: n, cexpr: c, cont } if n == name && c.same_as(cexpr) => {
+            cexpr.is_exhausted()
+                || matches!(&**cont, Cont::NamePartial { name: m, cexpr: d, .. }
+                    if m == name && d.same_as(cexpr))
+        }
+        _ => false,
+    }
+}
+
+/// the builtins that apply the functions they are given; they run as steps
+/// of the machine (Interp::step_applying)
+fn applies_functions(builtin: &str) -> bool {
+    matches!(builtin, "map" | "filter" | "foldl" | "(.)")
+}
+
+/// a builtin's function argument
+fn function_arg(v: &Value) -> Result<Value, Crash> {
+    match v {
+        Value::Fun(_) => Ok(v.clone()),
+        v => Err(Crash::new(format!(
+            "expected a function, got a {}",
+            v.kind_name()
+        ))),
+    }
+}
+
+/// a builtin's list argument, sharing its elements
+fn list_arg(v: &Value) -> Result<ListVal, Crash> {
+    match v {
+        Value::List(xs) => Ok(xs.clone()),
+        v => Err(Crash::new(format!("expected a list, got a {}", v.kind_name()))),
+    }
+}
+
+/// `c`, raised while applying the definition `def`, is in it unless
+/// something nearer, a nested run, already named one (§1.4)
+fn in_def(mut c: Crash, def: &str) -> Crash {
+    if c.def.is_none() {
+        c.def = Some(def.to_string());
+    }
+    c
 }
 
 impl Interp {
@@ -214,7 +385,9 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
+            given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
         }
@@ -272,7 +445,9 @@ impl Interp {
             contracts: HashMap::new(),
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
+            def_bodies: HashMap::new(),
             old_repo: RefCell::new(None),
+            given_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
             sorted_ids: RefCell::new(None),
         }
@@ -305,6 +480,26 @@ impl Interp {
         self.globals.clone()
     }
 
+    /// Record `expr`, the expression of the definition `name`: the body of
+    /// the lambda it is written as runs as `name`'s (§1.4), and so does the
+    /// body of each lambda that body is in turn (`\a -> \b -> e`). A lambda
+    /// in parentheses or ending a `let` is the definition's lambda too.
+    pub fn name_bodies(&mut self, name: &str, expr: &Rc<Expr>) {
+        let name: Rc<str> = Rc::from(name);
+        let mut e = expr;
+        loop {
+            match &**e {
+                Expr::Paren(inner) | Expr::Let(_, inner) => e = inner,
+                Expr::Lambda(_, body, _) => {
+                    self.def_bodies
+                        .insert(Rc::as_ptr(body), (name.clone(), body.clone()));
+                    e = body;
+                }
+                _ => break,
+            }
+        }
+    }
+
     /// Main entry: evaluate an expression in an environment.
     pub fn eval(&mut self, e: &Rc<Expr>, env: &Env) -> EResult {
         self.run(State::Eval(e.clone(), env.clone(), Cont::Halt))
@@ -319,6 +514,96 @@ impl Interp {
             c.def = self.current_def.borrow().clone();
         }
         c
+    }
+
+    /// `c`, raised while applying the builtin `builtin` under the contract
+    /// named `cname`, is in that definition when the builtin is a signed
+    /// definition's value (`squash = abandon . …`). A builtin's own name, or
+    /// a composition's made from its operands', names no definition, and the
+    /// crash is in whichever definition applied it (§1.4).
+    fn blame_builtin(&self, c: Crash, builtin: &str, cname: &str) -> Crash {
+        match self.builtin_def(builtin, cname) {
+            Some(def) => in_def(c, &def),
+            None => c,
+        }
+    }
+
+    /// the definition a crash while applying `builtin` under the contract
+    /// named `cname` is in, as blame_builtin decides, and which the builtin
+    /// renders as (§5.2)
+    pub(crate) fn builtin_def(&self, builtin: &str, cname: &str) -> Option<String> {
+        if cname != builtin && self.contracts.contains_key(cname) {
+            Some(cname.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// `map`, `filter`, `foldl` or a composition node given all its
+    /// arguments, continuing in `k`. They apply the functions they are given,
+    /// so they run as steps of this machine: applying them in a nested run
+    /// put every level of a recursion through one of them on the native
+    /// stack, which overflowed and aborted where plain recursion runs (§4.1).
+    /// Evaluation stays left to right, element by element (§4).
+    fn step_applying(&mut self, builtin: &str, args: &[Value], k: Cont) -> Result<Run, Crash> {
+        match builtin {
+            // (f . g) x = f (g x) (§4.9), whatever x is: a function argument
+            // is applied like any other, and g's contract checks it (§4.13).
+            // `squash = abandon . contract everything` waits for the
+            // repository because it is this node, not because anything
+            // composes on a function argument.
+            "(.)" => Ok(Run::Step(State::Apply(
+                args[1].clone(),
+                args[2].clone(),
+                Cont::Fun(args[0].clone(), Rc::new(k)),
+            ))),
+            "map" | "filter" => {
+                let f = function_arg(&args[0])?;
+                let xs = list_arg(&args[1])?;
+                if xs.is_empty() {
+                    return Ok(Run::Step(State::Ret(Value::list(vec![]), k)));
+                }
+                let x = xs[0].clone();
+                let acc = Rc::new(RefCell::new(Vec::new()));
+                let cont = Rc::new(k);
+                let next = if builtin == "map" {
+                    Cont::MapNext {
+                        f: f.clone(),
+                        xs,
+                        idx: 0,
+                        acc,
+                        cont,
+                    }
+                } else {
+                    Cont::FilterNext {
+                        p: f.clone(),
+                        xs,
+                        idx: 0,
+                        acc,
+                        cont,
+                    }
+                };
+                Ok(Run::Step(State::Apply(f, x, next)))
+            }
+            "foldl" => {
+                let f = function_arg(&args[0])?;
+                let xs = list_arg(&args[2])?;
+                if xs.is_empty() {
+                    return Ok(Run::Step(State::Ret(args[1].clone(), k)));
+                }
+                let next = Cont::FoldlArg {
+                    f: f.clone(),
+                    xs,
+                    idx: 0,
+                    cont: Rc::new(k),
+                };
+                Ok(Run::Step(State::Apply(f, args[1].clone(), next)))
+            }
+            _ => Err(Crash::new(format!(
+                "internal: `{}` does not apply functions",
+                builtin
+            ))),
+        }
     }
 
     fn run(&mut self, st: State) -> EResult {
@@ -371,9 +656,20 @@ impl Interp {
                             None => break None,
                         }
                     };
+                    // the frames up to the Try, or all of them, are abandoned
                     match caught {
-                        Some(next) => st = next,
-                        None => return Err(c),
+                        Some(next) => {
+                            drop_chain(active);
+                            st = next
+                        }
+                        None => {
+                            let mut c = c;
+                            if c.def.is_none() {
+                                c.def = innermost_def(&active);
+                            }
+                            drop_chain(active);
+                            return Err(c);
+                        }
                     }
                 }
             }
@@ -424,7 +720,6 @@ impl Interp {
                     params: params.clone(),
                     applied: 0,
                     applied_args: Vec::new(),
-                    deferred: false,
                     body: body.clone(),
                     env,
                     src: src.clone(),
@@ -441,18 +736,22 @@ impl Interp {
                 if bs.is_empty() {
                     return Run::Step(State::Eval(body.clone(), env, k));
                 }
-                let names: Vec<String> = bs.iter().map(|(n, _)| n.clone()).collect();
-                let exprs: Vec<Rc<Expr>> = bs.iter().map(|(_, e)| e.clone()).collect();
+                // the bindings are evaluated in dependency order, not source
+                // order, and a cycle among them is a crash (§4.1)
+                let order = match crate::config::let_order(bs) {
+                    Some(order) => order,
+                    None => return Run::Crash(Crash::new("let: a cycle among the bindings")),
+                };
+                let names: Rc<[String]> = order.iter().map(|&i| bs[i].0.clone()).collect();
+                let exprs: Vec<Rc<Expr>> = order.iter().map(|&i| bs[i].1.clone()).collect();
                 // one recursive frame shared by every binding and the body, so
                 // the block is mutually recursive (§4.1)
-                let (env2, cell) = env.extend_rec();
+                let (env2, cell) = env.extend_rec(names);
                 Run::Step(State::Eval(
                     exprs[0].clone(),
                     env2.clone(),
                     Cont::LetRest {
-                        names,
                         exprs,
-                        acc: Vec::new(),
                         cell,
                         body: body.clone(),
                         env: env2,
@@ -573,29 +872,26 @@ impl Interp {
                 ))),
             },
             Cont::LetRest {
-                names,
                 exprs,
-                mut acc,
                 cell,
                 body,
                 env,
                 cont,
             } => {
-                let idx = acc.len();
-                let pair = (names[idx].clone(), v);
-                cell.borrow_mut().push(pair.clone());
-                acc.push(pair);
-                if acc.len() == names.len() {
+                let filled = {
+                    let mut values = cell.borrow_mut();
+                    values.push(v);
+                    values.len()
+                };
+                if filled == exprs.len() {
                     Run::Step(State::Eval(body, env, (*cont).clone()))
                 } else {
-                    let next = exprs[acc.len()].clone();
+                    let next = exprs[filled].clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),
                         Cont::LetRest {
-                            names,
                             exprs,
-                            acc,
                             cell,
                             body,
                             env,
@@ -652,16 +948,24 @@ impl Interp {
                             Run::Step(State::Ret(v, Cont::Shared(cont)))
                         }
                     }
-                    Some(TryOk::DeferredBody { arg, cont, .. }) => {
-                        Run::Step(State::Apply(v, arg, (*cont).clone()))
+                    Some(TryOk::OrFunLhs { rhs, arg, cont }) => {
+                        // `f x or g x` (§4.6): when `f x` is itself a
+                        // function, apply `g` too and lift again, so the
+                        // fallback keeps guarding the later arguments
+                        if matches!(v, Value::Fun(_)) {
+                            Run::Step(State::Apply(
+                                rhs,
+                                arg,
+                                Cont::OrBoth(v, Rc::new(Cont::Shared(cont))),
+                            ))
+                        } else {
+                            Run::Step(State::Ret(v, (*cont).clone()))
+                        }
                     }
-                    Some(TryOk::ComposeInner { f, cont }) => Run::Step(State::Apply(f, v, (*cont).clone())),
-                    Some(TryOk::OrFunLhs { cont, .. }) => Run::Step(State::Ret(v, (*cont).clone())),
                     None => Run::Crash(Crash::new("internal: Try with no success handler")),
                 }
             }
-            Cont::LabelledArg(real, k) => Run::Step(State::Apply(v, real, (*k).clone())),
-            Cont::CrashWith(msg) => Run::Crash(Crash::new(msg)),
+            Cont::ApplyTo(real, k) => Run::Step(State::Apply(v, real, (*k).clone())),
             Cont::UpdateBase(fields, env, k) => {
                 if !matches!(v, Value::Record(_)) {
                     return Run::Crash(Crash::new(format!(
@@ -784,6 +1088,19 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::NamePartial {
+                name,
+                cexpr,
+                args,
+                cont,
+            } => {
+                // a value the same definition named already, by a recursive
+                // call that was no tail call (`let r = f (n - 1) in r`), is
+                // named afresh rather than wrapped once more per call
+                let v = crate::value::named_inner(&v, &name, &cexpr).unwrap_or(v);
+                let named = crate::value::named_apply(v, args, &name, cexpr);
+                Run::Step(State::Ret(named, (*cont).clone()))
+            }
             Cont::CheckResult {
                 name,
                 contract,
@@ -808,6 +1125,96 @@ impl Interp {
                 }
                 Run::Step(State::Ret(v, (*cont).clone()))
             }
+            Cont::InDef { cont, .. } => Run::Step(State::Ret(v, (*cont).clone())),
+            Cont::MapNext {
+                f,
+                xs,
+                idx,
+                acc,
+                cont,
+            } => {
+                acc.borrow_mut().push(v);
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let x = xs[idx].clone();
+                    let next = Cont::MapNext {
+                        f: f.clone(),
+                        xs,
+                        idx,
+                        acc,
+                        cont,
+                    };
+                    Run::Step(State::Apply(f, x, next))
+                } else {
+                    Run::Step(State::Ret(Value::list(acc.take()), (*cont).clone()))
+                }
+            }
+            Cont::FilterNext {
+                p,
+                xs,
+                idx,
+                acc,
+                cont,
+            } => {
+                match v {
+                    Value::Bool(true) => acc.borrow_mut().push(xs[idx].clone()),
+                    Value::Bool(false) => (),
+                    v => {
+                        return Run::Crash(Crash::new(format!(
+                            "filter: predicate returned a {}",
+                            v.kind_name()
+                        )))
+                    }
+                }
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let x = xs[idx].clone();
+                    let next = Cont::FilterNext {
+                        p: p.clone(),
+                        xs,
+                        idx,
+                        acc,
+                        cont,
+                    };
+                    Run::Step(State::Apply(p, x, next))
+                } else {
+                    Run::Step(State::Ret(Value::list(acc.take()), (*cont).clone()))
+                }
+            }
+            Cont::FoldlArg { f, xs, idx, cont } => {
+                let x = xs[idx].clone();
+                Run::Step(State::Apply(v, x, Cont::FoldlAcc { f, xs, idx, cont }))
+            }
+            Cont::FoldlAcc { f, xs, idx, cont } => {
+                let idx = idx + 1;
+                if idx < xs.len() {
+                    let next = Cont::FoldlArg {
+                        f: f.clone(),
+                        xs,
+                        idx,
+                        cont,
+                    };
+                    Run::Step(State::Apply(f, v, next))
+                } else {
+                    Run::Step(State::Ret(v, (*cont).clone()))
+                }
+            }
+            Cont::BuiltinResult {
+                cname,
+                check,
+                def,
+                cont,
+            } => {
+                if let Some(c) = &check {
+                    if let Err(cr) = c.check_result(&self.shapes, &cname, &v) {
+                        return Run::Crash(match &def {
+                            Some(d) => in_def(cr, d),
+                            None => cr,
+                        });
+                    }
+                }
+                Run::Step(State::Ret(v, (*cont).clone()))
+            }
         }
     }
 
@@ -823,40 +1230,83 @@ impl Interp {
                     pending,
                 } => {
                     let mut all = args.clone();
-                    let (cname, cexpr) = match pending {
-                        Some((n, c)) => (n.clone(), Some(c.clone())),
-                        None => (name.clone(), None),
+                    let (cname, cexpr, named_at) = match pending {
+                        Some((n, c, at)) => (n.clone(), Some(c.clone()), *at),
+                        None => (name.clone(), None, 0),
                     };
-                    // compose nodes handle function arguments pointwise in
-                    // compose_apply; do not contract-check them here
-                    let skip_check = name == "(.)" && matches!(arg, Value::Fun(_));
                     if let Some(c) = &cexpr {
-                        if !skip_check {
-                            if let Err(cr) = c.check_arg_at(&self.shapes, &cname, args.len(), &arg) {
-                                return Run::Crash(cr);
-                            }
+                        // numbered by the signature, not by the arguments
+                        // baked into a partial application (§4.13)
+                        let at = c.position().unwrap_or(args.len());
+                        if let Err(cr) = c.check_arg_at(&self.shapes, &cname, at, &arg) {
+                            return Run::Crash(self.blame_builtin(cr, name, &cname));
                         }
                     }
                     all.push(arg);
                     let advanced = cexpr
                         .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
                     if all.len() == *arity {
+                        // a composition's contract derived from its operands
+                        // leaves results to theirs, checked as the
+                        // composition runs; a signature attached to it is
+                        // checked like any other
+                        let check = advanced.filter(|c| {
+                            name != "(.)"
+                                || matches!(**c, crate::shape::ContractExpr::Known { .. })
+                        });
+                        // a signed definition's builtin or composition that
+                        // consumes fewer arguments than its signature lists
+                        // (`addT = (+) . inc` under `Int -> Int -> Text`)
+                        // returns a function, which becomes the named partial
+                        // application `addT 1` under the rest of the
+                        // signature, as a lambda that runs out of parameters
+                        // first does (§4.13, §5.2)
+                        let k = match &check {
+                            Some(c)
+                                if !c.is_exhausted()
+                                    && self.builtin_def(name, &cname).is_some() =>
+                            {
+                                // the arguments the definition was given, not
+                                // those baked into its value
+                                Cont::NamePartial {
+                                    name: cname.clone(),
+                                    cexpr: c.clone(),
+                                    args: all[named_at.min(all.len())..].to_vec(),
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
+                        if applies_functions(name) {
+                            // the result is checked once the functions have
+                            // run, and a crash while they run is blamed as
+                            // one in the builtin itself
+                            let def = self.builtin_def(name, &cname);
+                            let k = if check.is_some() || def.is_some() {
+                                Cont::BuiltinResult {
+                                    cname: cname.clone(),
+                                    check,
+                                    def,
+                                    cont: Rc::new(k),
+                                }
+                            } else {
+                                k
+                            };
+                            return match self.step_applying(name, &all, k) {
+                                Ok(run) => run,
+                                Err(c) => Run::Crash(self.blame_builtin(c, name, &cname)),
+                            };
+                        }
                         match bf(self, &all) {
                             Ok(r) => {
-                                // compose applications check results
-                                // incrementally as the composition runs
-                                if let Some(c) = &advanced {
-                                    if name != "(.)" {
-                                        if let Err(cr) =
-                                            c.check_result(&self.shapes, &cname, &r)
-                                        {
-                                            return Run::Crash(cr);
-                                        }
+                                if let Some(c) = &check {
+                                    if let Err(cr) = c.check_result(&self.shapes, &cname, &r) {
+                                        return Run::Crash(self.blame_builtin(cr, name, &cname));
                                     }
                                 }
                                 Run::Step(State::Ret(r, k))
                             }
-                            Err(c) => Run::Crash(c),
+                            Err(c) => Run::Crash(self.blame_builtin(c, name, &cname)),
                         }
                     } else {
                         Run::Step(State::Ret(
@@ -865,7 +1315,7 @@ impl Interp {
                                 arity: *arity,
                                 args: all,
                                 f: *bf,
-                                pending: advanced.map(|c| (cname, c)),
+                                pending: advanced.map(|c| (cname, c, named_at)),
                             })),
                             k,
                         ))
@@ -876,77 +1326,25 @@ impl Interp {
                     params,
                     applied,
                     applied_args,
-                    deferred,
                     body,
                     env,
                     src,
                     pending,
                 } => {
-                    if *deferred {
-                        // the body was deferred at the last application:
-                        // evaluate it now (catching crashes), then apply
-                        let msg = format!(
-                            "{}: body crashed when applied",
-                            name.clone().unwrap_or_default()
-                        );
-                        return Run::Step(State::Eval(
-                            body.clone(),
-                            env.clone(),
-                            Cont::Try {
-                                on_ok: Some(TryOk::DeferredBody {
-                                    arg,
-                                    cont: Rc::new(k),
-                                }),
-                                snapshot: *self.fresh.borrow(),
-                                on_crash: Box::new(State::Ret(
-                                    Value::Bool(false),
-                                    Cont::CrashWith(msg),
-                                )),
-                            },
-                        ));
-                    }
                     let (cname, cexpr) = match pending {
                         Some((n, c)) => (Some(n.clone()), Some(c.clone())),
                         None => (name.clone(), None),
                     };
-                    // A signed definition's application to a function value is
-                    // tried as a plain application first; if that crashes (as
-                    // `abandon (contract everything)` does at load time, since
-                    // the definition is a Repo-level function), it is function
-                    // composition instead (§4.1 note: the composition is a
-                    // value before it is applied to the repository).
-                    if *applied == 0 && matches!(arg, Value::Fun(_)) && pending.is_some() {
-                        // probe: contract-check the argument; if it fails, the
-                        // application is composition instead (§4.1 note)
-                        let probe_ok = match &cexpr {
-                            Some(c) => {
-                                let r = c.check_arg(&self.shapes, "", &arg).is_ok();
-                                r
-                            }
-                            None => true,
-                        };
-                        if !probe_ok {
-                            let f = Value::Fun(Rc::new(FunVal::Closure {
-                                name: name.clone(),
-                                params: params.clone(),
-                                applied: *applied,
-                                applied_args: applied_args.clone(),
-                                deferred: false,
-                                body: body.clone(),
-                                env: env.clone(),
-                                src: src.clone(),
-                                pending: pending.clone(),
-                            }));
-                            return match crate::builtins::compose_values(self, f, arg) {
-                                Ok(composed) => Run::Step(State::Ret(composed, k)),
-                                Err(cr) => Run::Crash(cr),
-                            };
-                        }
-                    }
+                    // a function argument is checked like any other: where
+                    // the signature wants a Repo, `new new` is a contract
+                    // crash, not a composition (§4.13, §4.9)
                     if let Some(c) = &cexpr {
                         let fname = cname.clone().unwrap_or_default();
-                        if let Err(cr) = c.check_arg_at(&self.shapes, &fname, applied_args.len(), &arg) {
-                            return Run::Crash(cr);
+                        let at = c.position().unwrap_or(applied_args.len());
+                        if let Err(cr) = c.check_arg_at(&self.shapes, &fname, at, &arg) {
+                            // a violation is in the definition checked
+                            // (§1.4, §4.13's `describe 3`)
+                            return Run::Crash(in_def(cr, &fname));
                         }
                     }
                     let p = &params[*applied];
@@ -957,47 +1355,78 @@ impl Interp {
                     let new_applied = applied + 1;
                     let advanced = cexpr
                         .map(|c| Rc::new(crate::shape::ContractExpr::apply_first_rc(c)));
-                    // a signed definition's body is not evaluated until its
-                    // contract is exhausted, so partial applications of named
-                    // definitions stay named values (§5.2's `describe "wip"`)
                     let contract_exhausted = match &advanced {
                         Some(c) => c.is_exhausted(),
                         None => true,
                     };
-                    if new_applied == params.len() && contract_exhausted {
-                        Run::Step(State::Eval(
-                            body.clone(),
-                            env2,
-                            match (&cname, &advanced) {
-                                (Some(n), Some(c)) => Cont::CheckExpr {
-                                    name: n.clone(),
-                                    cexpr: c.clone(),
+                    if new_applied == params.len() {
+                        // the definition whose lambda this body is, if any,
+                        // executes while it runs (§1.4)
+                        let def = self
+                            .def_bodies
+                            .get(&Rc::as_ptr(body))
+                            .map(|(d, _)| d.clone());
+                        // a call in tail position of a definition's body
+                        // leaves that definition nothing to do but pass this
+                        // body's value on, so its frame gives way to the one
+                        // this body runs under, and unsigned tail recursion
+                        // keeps its continuation constant in size
+                        let signed = cname.is_some() && advanced.is_some();
+                        let k = match k {
+                            Cont::InDef { cont, .. } if signed || def.is_some() => {
+                                (*cont).clone()
+                            }
+                            k => k,
+                        };
+                        // the body is evaluated now, as at any application
+                        // (§4.1): a signature adds checks and never changes
+                        // when a body runs, or whether an `or` around the
+                        // application catches its crash (§4.6, §4.13)
+                        let k = match (cname, advanced) {
+                            // a tail call of the signed definition whose
+                            // body `k` continues: its frames serve this one
+                            (Some(n), Some(c)) if checks_already(&k, &n, &c) => k,
+                            (Some(n), Some(c)) => {
+                                // a lambda that runs out of parameters before
+                                // its signature (`describe = \m -> mapRoot …`)
+                                // returns a function, which becomes the named
+                                // partial application `describe "wip"` (§5.2)
+                                // under the rest of the signature
+                                let k = if c.is_exhausted() {
+                                    k
+                                } else {
+                                    let mut args = applied_args.clone();
+                                    args.push(arg);
+                                    Cont::NamePartial {
+                                        name: n.clone(),
+                                        cexpr: c.clone(),
+                                        args,
+                                        cont: Rc::new(k),
+                                    }
+                                };
+                                Cont::CheckExpr {
+                                    name: n,
+                                    cexpr: c,
                                     cont: Rc::new(k),
-                                },
-                                _ => k,
-                            },
-                        ))
-                    } else if new_applied == params.len() {
-                        // the lambda is exhausted but the contract is not:
-                        // defer the body so the definition stays a named
-                        // partial application (§5.2)
-                        let mut new_args = applied_args.clone();
-                        new_args.push(arg.clone());
-                        let v = Value::Fun(Rc::new(FunVal::Closure {
-                            name: name.clone(),
-                            params: params.clone(),
-                            applied: new_applied,
-                            applied_args: new_args,
-                            deferred: true,
-                            body: body.clone(),
-                            env: env2,
-                            src: src.clone(),
-                            pending: match (&cname, &advanced) {
-                                (Some(n), Some(c)) => Some((n.clone(), c.clone())),
-                                _ => None,
-                            },
-                        }));
-                        Run::Step(State::Ret(v, k))
+                                }
+                            }
+                            _ => k,
+                        };
+                        // inside the check of the definition it was bound to,
+                        // which names this one already when it is the same
+                        let k = match def {
+                            Some(d)
+                                if !matches!(&k, Cont::CheckExpr { name, .. }
+                                    if **name == *d) =>
+                            {
+                                Cont::InDef {
+                                    name: d,
+                                    cont: Rc::new(k),
+                                }
+                            }
+                            _ => k,
+                        };
+                        Run::Step(State::Eval(body.clone(), env2, k))
                     } else if contract_exhausted {
                         // lambda params remain but the contract is satisfied;
                         // keep currying (unsigned tail)
@@ -1008,7 +1437,6 @@ impl Interp {
                             params: params.clone(),
                             applied: new_applied,
                             applied_args: new_args,
-                            deferred: false,
                             body: body.clone(),
                             env: env2,
                             src: src.clone(),
@@ -1026,7 +1454,6 @@ impl Interp {
                             params: params.clone(),
                             applied: new_applied,
                             applied_args: new_args,
-                            deferred: false,
                             body: body.clone(),
                             env: env2,
                             src: src.clone(),
@@ -1039,34 +1466,10 @@ impl Interp {
                     }
                 }
                 FunVal::ComposeLazy(f, g) => {
-                    let f = f.clone();
-                    let g = g.clone();
-                    if matches!(arg, Value::Fun(_)) {
-                        // pointwise: (f . g) h = f (g h) — but g h is not
-                        // evaluated yet either; compose lazily
-                        let inner = Value::Fun(Rc::new(FunVal::ComposeLazy(g, arg)));
-                        Run::Step(State::Ret(
-                            Value::Fun(Rc::new(FunVal::ComposeLazy(f, inner))),
-                            k,
-                        ))
-                    } else {
-                        // apply g, catching crashes, then apply f to the result
-                        Run::Step(State::Apply(
-                            g,
-                            arg,
-                            Cont::Try {
-                                on_ok: Some(TryOk::ComposeInner {
-                                    f,
-                                    cont: Rc::new(k),
-                                }),
-                                snapshot: *self.fresh.borrow(),
-                                on_crash: Box::new(State::Ret(
-                                    Value::Bool(false),
-                                    Cont::CrashWith("composition crashed".to_string()),
-                                )),
-                            },
-                        ))
-                    }
+                    // (f . g) x = f (g x) (§4.9), whatever x is: apply g,
+                    // then f to the result; a crash in either keeps its
+                    // message and unwinds to any enclosing `or` (§4.7)
+                    Run::Step(State::Apply(g.clone(), arg, Cont::Fun(f.clone(), Rc::new(k))))
                 }
                 FunVal::OrFun(a, b) => {
                     // (f or g) x = f x or g x
@@ -1077,7 +1480,11 @@ impl Interp {
                         a,
                         arg.clone(),
                         Cont::Try {
-                            on_ok: Some(TryOk::OrFunLhs { cont: k.clone() }),
+                            on_ok: Some(TryOk::OrFunLhs {
+                                rhs: b.clone(),
+                                arg: arg.clone(),
+                                cont: k.clone(),
+                            }),
                             snapshot: *self.fresh.borrow(),
                             on_crash: Box::new(State::Apply(b, arg, Cont::Shared(k))),
                         },
@@ -1089,7 +1496,7 @@ impl Interp {
                     Run::Step(State::Apply(
                         labelled.clone(),
                         text,
-                        Cont::LabelledArg(arg, Rc::new(k)),
+                        Cont::ApplyTo(arg, Rc::new(k)),
                     ))
                 }
             },

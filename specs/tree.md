@@ -113,6 +113,8 @@ After `n` is placed in lane `ℓ`:
 * If `n` was the last child of `p` and did not inherit `p`'s lane (rule 5 with
   `p` the trunk head, or `p` the root of an empty trunk), `p`'s lane becomes
   empty below this row: the fork on this row is drawn with `╰` instead of `├`.
+  When `n` finds no lane (§Overflow) no fork is drawn, but `p`'s lane empties
+  all the same; the rail that reaches `n`'s row is drawn there as `│`.
 
 **Reservations.** When a node `p ∈ T` is placed and has a trunk child `t`,
 every side child of `p` that comes *after* `t` in row order needs its own
@@ -152,21 +154,27 @@ Columns, left to right, at fixed offsets:
    display tree, minimum 4 — so the rendered id is itself a valid id literal
    (§3.1). Blank on a run row.
 5. **Size bar** (`detail ≥ 1`, focus and its parent and children only; all
-   commits at `detail = 2`): `▁ ▂ ▃ ▅ ▇`, as before.
+   commits at `detail = 2`): `▁ ▂ ▃ ▅ ▇`, as before. A row without a bar
+   keeps the column blank; it is left out only when no row has a bar.
 6. **Message**: first line; nothing if empty; followed by `⋯ n` on a
    collapsed node.
-7. **Labels**: right-aligned column, present only if any rendered commit has
+7. **Labels**: left-aligned column, present only if any rendered commit has
    a label; names separated by two spaces.
-8. **Margin** (`margin = true`): age and author initials, right-aligned, as
-   before.
+8. **Margin** (`margin = true`): age and author initials, as before, each
+   right-aligned in its own column (a `9m` ends under a `13m`), so the margin
+   ends at one column on every row.
 9. **Data columns** (off unless enabled): `date` shows the commit's absolute
    date `YYYY-MM-DD`; `files` shows the number of files changed as `n files`;
    `author` shows the full author name. They appear in that order, grey,
    immediately before the margin in the same right-aligned block.
 
-Columns 4–8 start at the same offset on every row. When stdout is a terminal
-and a row would exceed its width, the message is cut and ends with `…` so that
-labels and the margin keep their columns; otherwise nothing is cut.
+Columns 4–8 start at the same offset on every row. Labels start two columns
+past the widest message, and the data columns and the margin start two
+columns past the widest label (past the widest message when there is no
+label column). Each data column, the age and the initials are as wide as
+their widest entry and two columns apart. When stdout is a terminal and a row
+would exceed its width, the message is cut and ends with `…` so that labels
+and the margin keep their columns; otherwise nothing is cut.
 
 **Rails characters.** For lane `i` on the row of node `n` placed in lane
 `ℓ`, character `2i` is, first rule that applies:
@@ -185,12 +193,17 @@ labels and the margin keep their columns; otherwise nothing is cut.
 Character `2i+1` is `─` if it lies inside a horizontal segment (from a fork
 source to its target, or from a node to its rightmost reservation), else a
 space. On a run row the count follows the `╎`, written into the rails area
-and, if needed, into the empty id column.
+and, if needed, into the empty id column; when lanes to the right of the run
+hold rails, it follows the rightmost of them instead, so that it covers no
+rail. The count is never cut: what does not fit the rails area runs on,
+unbroken, through the space after it into the id column, which is widened if
+it cannot hold the rest.
 
 **Detail line** (`detail = 2`, focus only): one extra row directly under the
 focus. Its rails show `│` in every lane that holds a rail below the focus row
 (including the focus's own lane if it has children); the text starts two
-characters past the id column and lists the changed paths with a mark each:
+columns into the id column, under the focus's id, and lists the changed paths
+with a mark each:
 `+` added, `~` modified, `−` deleted, `✖` unresolved.
 
 #### Glyphs
@@ -208,6 +221,11 @@ Unchanged from before:
 | `⌂` | root | `🌱` |
 
 Precedence: `⌂`, then `⊗`, then `◌`, then `◆`, then the position glyphs.
+`⊗` and `◌` are properties of the history being drawn — a commit's files, and
+its parent's in that history — not of the stored commit with the same id, so
+a dry run (§1.2) draws them as the edit would leave them.
+An `icons = true` glyph is two columns wide, so it fills both characters of
+its lane: character `2ℓ+1` of its row is not drawn.
 Rails use `│ ├ ╰ ─ ┼ ╮ ┬ ╎ »`.
 
 #### Elision (`elide = true`)
@@ -290,20 +308,21 @@ Rendered:
 
 ```
   ╎ 14
-  ◆─╮    @aaaa ▅  add parser                 3w  mo
-  ◆ │    @kpqx ▅  release 1.2      main      2w  mo
-  │ ○    @mnrv ▂  fix lexer                  1w  mo
-▶ ├─⊗    @wqzt ▃  wip              feature   2d  mo
+  ◆─╮    @aaaa ▅  add parser            3w  mo
+  ◆ │    @kpqx ▅  release 1.2  main     2w  mo
+  │ ○    @mnrv ▂  fix lexer             1w  mo
+▶ ├─⊗    @wqzt ▃  wip          feature  2d  mo
   │ │      ✖ src/lexer.rs   ~ src/parser.rs   + tests/lexer.rs
-  ╰─┼─◌  @ptlm    docs  ⋯ 3                  1d  ak
-    ├─○  @qrst ▁  spike                      5h  mo
-    ○    @yxsk ▃                             1h  mo
+  ╰─┼─◌  @ptlm    docs  ⋯ 3             1d  ak
+    ├─○  @qrst ▁  spike                 5h  mo
+    ○    @yxsk ▃                        1h  mo
 ```
 
-Column offsets in this example: gutter 0–1, rails 2–7, id from 9. Lane 0 is
-`◆ ◆ │ ├ ╰` from `aaaa` to `ptlm` and then empty; the reservation for `mnrv`
-is drawn on `aaaa`'s row as `─╮` and consumed on `mnrv`'s row; `ptlm` forks
-to lane 2 across the live lane 1, hence `┼`.
+Column offsets in this example: gutter 0–1, rails 2–7, id from 9, size bar
+15, message from 18, labels from 31, margin from 40, and the detail line's
+marks from 11. Lane 0 is `◆ ◆ │ ├ ╰` from `aaaa` to `ptlm` and then empty;
+the reservation for `mnrv` is drawn on `aaaa`'s row as `─╮` and consumed on
+`mnrv`'s row; `ptlm` forks to lane 2 across the live lane 1, hence `┼`.
 
 The reference `config.j` defines `tree` with `detail = 1, margin = false,
 elide = false` (every commit, time-sorted), `treeCompact` with `elide = true`
