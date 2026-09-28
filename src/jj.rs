@@ -2035,7 +2035,17 @@ impl JjBackend {
         .map_err(|e| (1, format!("cannot set the remote: {}", e)))
     }
 
+    /// Run from the top of the workspace, as git runs from the top of its
+    /// working tree: git resolves a relative local URL (one stored by git,
+    /// or by `j` before §7.8 resolved them) against the directory it runs
+    /// in, and jj-lib's git and ours inherit this process's
+    fn enter_workspace_root(&self) -> Result<(), OpenError> {
+        std::env::set_current_dir(&self.inner.workspace_root)
+            .map_err(|e| (1, format!("cannot enter {}: {}", self.inner.workspace_root.display(), e)))
+    }
+
     pub fn cmd_fetch(&self) -> Result<(), OpenError> {
+        self.enter_workspace_root()?;
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
         let mut tx = base.start_transaction();
@@ -2049,6 +2059,7 @@ impl JjBackend {
         Ok(())
     }
     pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<(), OpenError> {
+        self.enter_workspace_root()?;
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
         let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;

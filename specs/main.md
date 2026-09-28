@@ -1299,7 +1299,10 @@ stored as given, since git expands it to that home directory on every
 `fetch` and `push`; `./~/x.git` names a directory called `~`. Any other
 `URL` is stored unresolved. A `URL` that cannot be parsed, or a path that
 cannot be resolved or whose absolute path is not UTF-8, is a usage error
-(exit 2) that changes nothing.
+(exit 2) that changes nothing. `fetch` and `push` run git from the top of
+the workspace, as git runs from the top of its working tree, so a relative
+local path stored some other way (by `git remote add`, say) is resolved
+from there, whichever directory they run in.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
 at most one operation, described `init` and `clone URL` (`URL` as given, a

@@ -1719,6 +1719,32 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
 }
 
 #[test]
+fn a_relative_remote_is_reached_from_a_subdirectory() {
+    // §7.8: an origin stored relative (by git, or by j before it resolved
+    // local paths) was resolved against the directory j ran in, so fetch
+    // and push failed from a subdirectory with "Could not find
+    // repository"; git resolves it from the top of the working tree
+    let env = setup();
+    let g = env.dir.join("g");
+    std::fs::create_dir(&g).unwrap();
+    git(&g, &["init", "-q", "."]);
+    let name = env.remote.file_name().unwrap().to_str().unwrap();
+    git(&g, &["remote", "add", "origin", &format!("../../{}", name)]);
+    env.j(&g, &["init"]).ok();
+    let sub = g.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    env.j(&sub, &["fetch"]).ok();
+    assert!(env.j(&g, &["tree"]).ok().stdout.contains("master"));
+    std::fs::write(g.join("b.txt"), "b\n").unwrap();
+    env.j(&sub, &["describe \"b\""]).ok();
+    env.j(&sub, &["push (label \"feature\" here)"]).ok();
+    git(&env.remote, &["rev-parse", "--verify", "-q", "refs/heads/feature"]);
+    // the push records where the bookmark went
+    let out = env.j(&sub, &["\\r -> (focus r).labels"]).ok();
+    assert!(out.stdout.contains("feature"), "{}", out.stdout);
+}
+
+#[test]
 fn a_local_remote_under_home_is_stored_as_given() {
     // §7.8: a `~` the shell did not expand (`j 'remote ~/r.git'`, or any
     // URL on stdin) was resolved as a directory named `~` in the current
