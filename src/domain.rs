@@ -344,9 +344,10 @@ impl MemBackend {
 /// builds a commit's `files` (§7.2): tagged as the stored tree of commit `id`,
 /// so a backend's answers about that commit apply while it holds this list.
 /// The laziness must stay invisible to the language, which is exactly what is
-/// easy to get wrong, so tests need to be able to build repos this way.
+/// easy to get wrong, so tests need to be able to build repos this way. The
+/// tree has no name (`ThunkVal::tree`): nothing here makes `entries` a tree.
 pub fn lazy_files(id: &str, entries: Vec<Value>) -> Value {
-    Value::Thunk(Rc::new(crate::value::ThunkVal::stored(id.to_string(), move || {
+    Value::Thunk(Rc::new(crate::value::ThunkVal::stored(id.to_string(), None, move || {
         Ok(Value::list(entries))
     })))
 }

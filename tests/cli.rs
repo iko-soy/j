@@ -376,6 +376,37 @@ fn validate_catches_what_persistence_refuses() {
 }
 
 #[test]
+fn persisting_reads_no_tree_of_a_commit_it_keeps() {
+    // validation checked the paths of every commit's snapshot, and the walk
+    // compared every commit with its stored tree entry by entry, so each
+    // persisting run read the files of the whole history: `describe` took
+    // two minutes (a debug build) on 2,500 commits of 3,000 files. A commit
+    // whose files are still its stored tree's is now compared by tree (§7.5).
+    // Here A's tree is missing from the store, which a run that keeps A
+    // does not notice
+    let r = setup();
+    r.write("a.txt", "only in A\n");
+    r.j(&["describe \"A\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("b.txt", "B\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    let hash = |kind, bytes: &[u8]| gix::objs::compute_hash(gix::hash::Kind::Sha1, kind, bytes).unwrap();
+    let mut tree = b"100644 a.txt\0".to_vec();
+    tree.extend_from_slice(hash(gix::objs::Kind::Blob, b"only in A\n").as_bytes());
+    let id = hash(gix::objs::Kind::Tree, &tree).to_string();
+    std::fs::remove_file(r.dir.join(".git/objects").join(&id[..2]).join(&id[2..])).unwrap();
+    r.j(&["describe \"C\""]).ok();
+    // a snapshot loads the history afresh
+    r.write("c.txt", "C\n");
+    r.j(&["describe \"C2\""]).ok();
+    r.j(&["new"]).ok();
+    // reading A's files still fails
+    let out = r.j(&[PATHS_BY_COMMIT]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+}
+
+#[test]
 fn undo_and_redo() {
     let r = setup();
     r.write("a.txt", "x\n");

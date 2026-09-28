@@ -1430,11 +1430,13 @@ impl JjBackend {
                 .get(&parent_change)
                 .cloned()
                 .ok_or_else(|| Crash::new("persistence: internal: parent not yet written"))?;
-            let files_v = commit_v.field("files")?;
+            // not read unless compared or written: most commits keep the
+            // stored tree they were loaded with
+            let files_v = crate::repo::files_of(&commit_v)?;
             let message = commit_v.field("message")?.as_text()?.to_string();
             let new_id = match old_stored.commits.get(&id) {
                 None => {
-                    let tree = block_on(build_tree(&store, &files_v))?;
+                    let tree = block_on(build_tree(&store, &files_v.forced()?))?;
                     let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
                         Crash::new(format!("persistence: `{}` is not a valid change id", id))
                     })?;
@@ -1453,16 +1455,22 @@ impl JjBackend {
                 Some(stored) => {
                     let stored_commit = &stored.commit;
                     let parent_changed = hex_of(stored_commit.parent_ids().first()) != parent_jj.hex();
-                    let files_changed = {
-                        let stored_files =
-                            block_on(tree_to_files(&store, &stored_commit.tree(), &cache, &entries))?;
-                        // a tree has no order: entries listed differently
-                        // are not a change to rewrite (§7.3)
-                        !crate::repo::snapshot_eq(&Value::list(stored_files), &files_v)?
-                    };
+                    let stored_tree = stored_commit.tree();
+                    // loaded from the stored tree, the files are unchanged:
+                    // reading every commit's to compare them made each
+                    // persist read the files of the whole history
+                    let files_changed = crate::repo::stored_tree(&files_v)
+                        != Some(tree_name(&stored_tree).as_str())
+                        && {
+                            let stored_files =
+                                block_on(tree_to_files(&store, &stored_tree, &cache, &entries))?;
+                            // a tree has no order: entries listed differently
+                            // are not a change to rewrite (§7.3)
+                            !crate::repo::snapshot_eq(&Value::list(stored_files), &files_v)?
+                        };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {
-                        let tree = block_on(build_tree(&store, &files_v))?;
+                        let tree = block_on(build_tree(&store, &files_v.forced()?))?;
                         let c = block_on(
                             tx.repo_mut()
                                 .rewrite_commit(stored_commit)
@@ -3681,6 +3689,15 @@ async fn tree_to_files(
 // value helpers
 // ----------------------------------------------------------------------
 
+/// The name of a stored tree that a commit's lazy `files` carry
+/// (`ThunkVal::tree`): its tree ids, one per term of a conflicted tree. The
+/// list `tree_to_files` makes depends on nothing else, so two trees of one
+/// name list the same entries.
+fn tree_name(tree: &MergedTree) -> String {
+    let ids: Vec<String> = tree.tree_ids().iter().map(|id| id.hex()).collect();
+    ids.join(",")
+}
+
 fn commit_id_of(commit: &Value) -> Result<String, Crash> {
     match commit.field("id")? {
         Value::Id(i) => Ok(i.to_string()),
@@ -3739,13 +3756,15 @@ fn build_subtree(
     // the files list is lazy (§7.2): most commits are never inspected, so
     // their file entries are materialized only on first `field("files")`.
     // Tagged with the change id, it tells the renderer when the O(1)
-    // `has_conflict`/`is_empty` answers still describe the commit's files.
+    // `has_conflict`/`is_empty` answers still describe the commit's files;
+    // named by its tree, it lets persistence compare it unread (§7.5)
     let files_thunk = {
         let store = store.clone();
         let tree = rec.commit.tree();
+        let name = Some(tree_name(&tree));
         let cache = cache.clone();
         let entries = entries.clone();
-        Value::Thunk(Rc::new(crate::value::ThunkVal::stored(rec.change_id.clone(), move || {
+        Value::Thunk(Rc::new(crate::value::ThunkVal::stored(rec.change_id.clone(), name, move || {
             let files = block_on(tree_to_files(&store, &tree, &cache, &entries))?;
             Ok(Value::list(files))
         })))

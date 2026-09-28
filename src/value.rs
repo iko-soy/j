@@ -70,6 +70,12 @@ pub struct ThunkVal {
     /// own id holds exactly the stored tree — the only case in which the
     /// backend's answers about that tree describe the value (§7.2).
     origin: Option<String>,
+    /// for a commit's `files` as the backend built them: a name for the
+    /// stored tree this loads. Two lists loaded under the same name are
+    /// equal, and a list the backend loads from a tree is a snapshot (§7.3),
+    /// so persisting compares and validates a commit the program left as
+    /// loaded without reading its files (§7.5).
+    tree: Option<String>,
 }
 
 enum ThunkState {
@@ -99,13 +105,20 @@ impl ThunkVal {
         ThunkVal {
             state: std::cell::RefCell::new(ThunkState::Pending(Box::new(f))),
             origin: None,
+            tree: None,
         }
     }
 
-    /// the lazy `files` of the stored commit with change id `origin`
-    pub fn stored(origin: String, f: impl FnOnce() -> Result<Value, Crash> + 'static) -> Self {
+    /// the lazy `files` of the stored commit with change id `origin`, which
+    /// load the stored tree named `tree`, if the backend names its trees
+    pub fn stored(
+        origin: String,
+        tree: Option<String>,
+        f: impl FnOnce() -> Result<Value, Crash> + 'static,
+    ) -> Self {
         ThunkVal {
             origin: Some(origin),
+            tree,
             ..ThunkVal::new(f)
         }
     }
@@ -113,6 +126,11 @@ impl ThunkVal {
     /// the change id of the stored commit whose tree this loads, if any
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
+    }
+
+    /// the name of the stored tree this loads, if the backend gave one
+    pub fn tree(&self) -> Option<&str> {
+        self.tree.as_deref()
     }
 
     /// the value, computing it on first call and memoizing the outcome, a
