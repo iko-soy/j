@@ -388,6 +388,12 @@ struct Footprint {
     /// the directories the checkout may create: each parent of a path the
     /// focus adds that is not a directory yet
     new_dirs: BTreeSet<RepoPathBuf>,
+    /// where the filesystem folds case, each parent of a path the focus
+    /// adds that is a directory listed under another spelling (its own
+    /// name, or one above it): the checkout may remove that directory, as
+    /// the focus removes what it holds, and create it again under the
+    /// focus's spelling
+    respelled: BTreeSet<RepoPathBuf>,
     /// each path the focus adds that already holds something other than a
     /// directory (an ignored file), by device and inode: the checkout
     /// leaves that alone. Where the filesystem folds case, a path whose
@@ -409,7 +415,8 @@ fn file_identity(root: &std::path::Path, path: &RepoPath) -> Option<(u64, u64)> 
 impl Footprint {
     /// Look on disk along the paths `focus` adds to `on_disk`: one `lstat`
     /// per directory they pass through, and one per path added to a
-    /// directory that exists. The diff is the checkout's own.
+    /// directory that exists; where case folds, also one listing of each
+    /// directory above one that exists. The diff is the checkout's own.
     async fn of(
         root: &std::path::Path,
         on_disk: &MergedTree,
@@ -421,6 +428,8 @@ impl Footprint {
                 .is_ok_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
         };
         let mut new_dirs = BTreeSet::new();
+        let mut respelled = BTreeSet::new();
+        let mut listed = HashMap::new();
         let mut occupied = HashMap::new();
         // the paths the focus removes, in lower case, where case folds
         let mut removed = HashSet::new();
@@ -449,6 +458,8 @@ impl Footprint {
                 is_dir = is_dir && is_dir_now(d);
                 if !is_dir {
                     new_dirs.insert(d.to_owned());
+                } else if folds_case && !d.to_fs_path(root).is_ok_and(|p| spelled(root, &p, &mut listed)) {
+                    respelled.insert(d.to_owned());
                 }
                 dirs.insert(d.to_owned(), is_dir);
             }
@@ -459,21 +470,25 @@ impl Footprint {
             }
         }
         occupied.retain(|path, _| !removed.contains(&path.as_internal_file_string().to_lowercase()));
-        Ok(Footprint { new_dirs, occupied, folds_case })
+        Ok(Footprint { new_dirs, respelled, occupied, folds_case })
     }
 }
 
 /// Put back what a checkout from `on_disk` to `focus` that failed part way
-/// wrote (§7.5 step 7): remove the directories it created while they are
-/// empty, and give each path of its footprint that holds what the checkout
-/// writes there, or nothing, what `on_disk` holds there. Anything else a
+/// wrote (§7.5 step 7): give each path of its footprint that holds what the
+/// checkout writes there, or nothing, what `on_disk` holds there, and
+/// remove the directories it created while they are empty. Anything else a
 /// path holds is left alone and not read into the store: a file saved
 /// meanwhile, however it was saved, an ignored file that was there before
 /// (`Footprint::occupied`, still the same file), or, where case folds, the
-/// file of the path's other spelling. The paths the focus adds that the
-/// checkout wrote are removed first, so that such another spelling is out
-/// of the way when the paths it replaced are written back. A path
-/// something is in the way of fails the put-back.
+/// file of the path's other spelling. Before anything is written, the
+/// files the checkout wrote where `on_disk` holds none are removed, and
+/// then the directories it created: on a full disk that frees what writing
+/// the rest back takes, and where case folds a name the focus changes only
+/// in case is out of the way of the file it replaced. Each is removed on
+/// its own rather than by a checkout, which also removes every directory
+/// above that it leaves empty, one that was there before the run too. A
+/// path something is in the way of fails the put-back.
 async fn put_back(
     wc: &mut dyn LockedWorkingCopy,
     root: &std::path::Path,
@@ -482,7 +497,6 @@ async fn put_back(
     footprint: &Footprint,
     settings: &UserSettings,
 ) -> Result<(), String> {
-    remove_new_dirs(root, &footprint.new_dirs);
     // how the working copy writes a conflict
     let marker_style = TreeStateSettings::try_from_user_settings(settings)
         .map_err(|e| e.to_string())?
@@ -506,12 +520,14 @@ async fn put_back(
         twins.extend(folded.into_values().filter(|p| p.len() > 1).flatten().map(|p| p.to_owned()));
     }
     let mut listed: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
+    let mut real_dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
     // the tree the working-copy state is to record: `on_disk`, with each
-    // path to put back present where it holds what the checkout wrote
-    // (`stand_in`), and absent where it holds nothing; and that tree once
-    // the paths the focus adds are removed from it
+    // path to write back present where it holds what the checkout wrote
+    // (`stand_in`), and absent where it holds nothing
     let mut state = MergedTreeBuilder::new(on_disk.tree());
-    let mut removed = MergedTreeBuilder::new(on_disk.tree());
+    let mut write_back = false;
+    let mut in_the_way = 0;
+    let mut problems = Vec::new();
     let labels = focus.tree().labels().clone();
     for (path, before, after) in paths {
         if let Some(&id) = footprint.occupied.get(&path) {
@@ -524,39 +540,84 @@ async fn put_back(
         if meta.is_some() && twins.contains(&path) && !spelled(root, &disk, &mut listed) {
             meta = None;
         }
-        match meta {
-            None if before.is_present() => {
-                state.set_or_remove(path.clone(), Merge::absent());
-                removed.set_or_remove(path, Merge::absent());
+        let Some(meta) = meta else {
+            if before.is_present() {
+                state.set_or_remove(path, Merge::absent());
+                write_back = true;
             }
-            None => {}
-            Some(meta) => {
-                // a write cut short leaves the start of the focus's file,
-                // but none is taken for one where an ignored file was
-                let partly = !footprint.occupied.contains_key(&path);
-                let store = focus.store();
-                let value = after.clone();
-                if holds_written(store, &path, value, &labels, marker_style, &disk, &meta, partly).await? {
-                    let written = stand_in(&before, &after);
-                    state.set_or_remove(path.clone(), written.clone());
-                    removed.set_or_remove(path, if before.is_absent() { Merge::absent() } else { written });
-                }
+            continue;
+        };
+        // a write cut short leaves the start of the focus's file, but none
+        // is taken for one where an ignored file was
+        let partly = !footprint.occupied.contains_key(&path);
+        let store = focus.store();
+        let value = after.clone();
+        if !holds_written(store, &path, value, &labels, marker_style, &disk, &meta, partly).await? {
+            // left alone, and recorded by the next run
+            continue;
+        }
+        if before.is_present() {
+            state.set_or_remove(path, stand_in(&before, &after));
+            write_back = true;
+        } else if !below_real_dirs(root, &path, &mut real_dirs) {
+            // a symlink above it, which the checkout writes no file through
+            in_the_way += 1;
+        } else {
+            match std::fs::remove_file(&disk) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => problems.push(format!("cannot remove `{}`: {}", path.as_internal_file_string(), e)),
             }
         }
     }
-    let state = with_tree(on_disk, state.write_tree().await.map_err(|e| e.to_string())?);
-    let removed = with_tree(on_disk, removed.write_tree().await.map_err(|e| e.to_string())?);
-    // a reset writes nothing, and reads no file. The paths the focus adds
-    // are removed before the paths it replaced are written back, so that,
-    // where case folds, a name the focus changes only in case is free.
-    wc.reset(&state).await.map_err(|e| e.to_string())?;
-    let first = wc.check_out(&removed).await.map_err(|e| e.to_string())?;
-    let second = wc.check_out(on_disk).await.map_err(|e| e.to_string())?;
-    match first.skipped_files + second.skipped_files {
-        0 => Ok(()),
-        1 => Err("something is in the way of 1 path".to_string()),
-        n => Err(format!("something is in the way of {} paths", n)),
+    // the directories the checkout created, and, where case folds, those it
+    // created again under the focus's spelling
+    if footprint.respelled.is_empty() {
+        remove_new_dirs(root, &footprint.new_dirs);
+    } else {
+        let mut made = footprint.new_dirs.clone();
+        let again = footprint.respelled.iter().filter(|d| d.to_fs_path(root).is_ok_and(|p| spelled(root, &p, &mut listed)));
+        made.extend(again.cloned());
+        remove_new_dirs(root, &made);
     }
+    if write_back {
+        // a reset writes nothing, and reads no file
+        let written = async {
+            let tree = state.write_tree().await.map_err(|e| e.to_string())?;
+            wc.reset(&with_tree(on_disk, tree)).await.map_err(|e| e.to_string())?;
+            wc.check_out(on_disk).await.map_err(|e| e.to_string())
+        };
+        match written.await {
+            Ok(stats) => in_the_way += stats.skipped_files,
+            Err(e) => problems.insert(0, e),
+        }
+    }
+    match in_the_way {
+        0 => {}
+        1 => problems.insert(0, "something is in the way of 1 path".to_string()),
+        n => problems.insert(0, format!("something is in the way of {} paths", n)),
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Whether each directory above `path` below `root` is one on disk, not a
+/// symlink to one, so that what is done at `path` is done there. Each is
+/// looked at once, into `dirs`.
+fn below_real_dirs(root: &std::path::Path, path: &RepoPath, dirs: &mut HashMap<RepoPathBuf, bool>) -> bool {
+    let parent = path.parent().expect("a file path has a parent");
+    parent.ancestors().take_while(|d| !d.is_root()).all(|d| match dirs.get(d) {
+        Some(&is_dir) => is_dir,
+        None => {
+            let meta = d.to_fs_path(root).ok().and_then(|p| p.symlink_metadata().ok());
+            let is_dir = meta.is_some_and(|m| m.is_dir());
+            dirs.insert(d.to_owned(), is_dir);
+            is_dir
+        }
+    })
 }
 
 /// Whether each name along `disk` below `root` is listed by its directory

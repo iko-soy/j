@@ -1006,18 +1006,21 @@ Within it:
    that fails (a path the filesystem cannot hold, a full disk), or an
    operation that then cannot be committed, crashes without committing
    it, so nothing is recorded. Unless the working directory changed while
-   the program ran, what the checkout wrote is then put back: each path
-   at which the focus differs from the working directory gets back what
-   the directory held there if it now holds nothing or what the checkout
-   writes there (the focus's content, all of it or, except where an
-   ignored file was, the start of it that a write cut short leaves), and
-   each directory the checkout created is removed while empty. The paths
-   the focus adds are cleared before the paths it replaced are written
-   back, so that a name the focus changes only in case is put back where
-   the filesystem folds case, and no file is read into the repository.
-   Anything else is left alone: a file created or edited meanwhile keeps
-   its content, at such a path too and however it was saved (even by
-   renaming a new file over the old); an ignored file stays, even where a
+   the program ran, what the checkout wrote is then put back. The put-back
+   changes only a path at which the focus differs from the working
+   directory and that now holds exactly what the checkout writes there
+   (the focus's content, all of it or, except where an ignored file was,
+   the start of it that a write cut short leaves), or nothing, and gives
+   it back what the directory held there; and a directory the checkout
+   created, which it removes while empty. The files the checkout added
+   are removed first, each on its own, and then the directories it
+   created, before anything is written: the space they took is then free
+   for the rest (a full disk), a name the focus changes only in case is
+   put back where the filesystem folds case, and no directory that was
+   there before is removed. No file is read into the repository. Anything
+   else is left alone: a file created or edited meanwhile keeps its
+   content, at such a path too and however it was saved (even by renaming
+   a new file over the old); an ignored file stays, even where a
    `.gitignore` the checkout wrote no longer ignores it, and where the
    focus adds a file of that name (the checkout does not write over it)
    even if it holds the focus's content; and so does, where the

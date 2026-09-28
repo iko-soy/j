@@ -792,21 +792,69 @@ fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
     assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
+#[test]
+fn a_failed_checkout_keeps_the_directories_that_were_there() {
+    // §7.5 step 7: the put-back removed what the checkout had written at the
+    // paths the focus adds with a checkout, which also removes each
+    // directory it leaves empty, so the empty directories the user had made
+    // before the run under such a path went too
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    std::fs::create_dir(r.dir.join("logs")).unwrap();
+    std::fs::create_dir_all(r.dir.join("uploads/tmp")).unwrap();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // `logs/x` and `uploads/tmp/y` are written, then the deep path fails
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = c.files ++ [\
+         ({{ path = [\"logs\" \"x\"], content = blob \"x\\n\" }}) \
+         ({{ path = [\"uploads\" \"tmp\" \"y\"], content = blob \"y\\n\" }}) \
+         ({{ path = [{}], content = blob \"deep\" }})] }})",
+        too_deep("zz")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(!r.dir.join("logs/x").exists());
+    assert!(!r.dir.join("uploads/tmp/y").exists());
+    assert!(!r.dir.join("zz").exists());
+    assert!(r.dir.join("logs").is_dir());
+    assert!(r.dir.join("uploads/tmp").is_dir());
+}
+
 /// Run `edit`, whose checkout writes `m/0` … `m/<n-1>` and then fails (or
 /// whose operation then fails to publish), and call `meanwhile` with the
 /// process stopped while it writes them, after the scan it starts from and
 /// before its put-back looks at what is there
 #[cfg(target_os = "linux")]
 fn stopped_mid_checkout(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce()) -> Out {
-    let mut child = Command::new(j_bin())
+    stopped_mid_checkout_as(r, edit, n, |_| meanwhile())
+}
+
+/// `stopped_mid_checkout`, calling `meanwhile` with the stopped process's
+/// id. The process ignores SIGXFSZ, so that a write past a file size limit
+/// set on it fails (EFBIG) rather than killing it.
+#[cfg(target_os = "linux")]
+fn stopped_mid_checkout_as(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce(libc::pid_t)) -> Out {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(j_bin());
+    command
         .arg(edit)
         .current_dir(&r.dir)
         .env("XDG_CONFIG_HOME", &r.cfg)
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    // an ignored signal stays ignored across exec
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
     let pid = child.id() as libc::pid_t;
     // `m` is written in path order, `0` then `1`, each file created empty
     // and removed once before it is written
@@ -826,7 +874,7 @@ fn stopped_mid_checkout(r: &Repo, edit: &str, n: usize, meanwhile: impl FnOnce()
     let written = std::fs::read_dir(r.dir.join("m")).unwrap().count();
     let in_time = first.exists() && written < n;
     let done = if in_time {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(meanwhile))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| meanwhile(pid)))
     } else {
         Ok(())
     };
@@ -853,6 +901,15 @@ fn slow_failing_edit(files: &str, n: usize) -> String {
         n,
         too_deep("zz")
     )
+}
+
+/// Leave the stopped process `pid` no room to write: from here on each
+/// write that would make a file longer than nothing fails, as on a full
+/// disk, while it can still create, empty and remove files
+#[cfg(target_os = "linux")]
+fn fill_disk(pid: libc::pid_t) {
+    let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    assert_eq!(unsafe { libc::prlimit(pid, libc::RLIMIT_FSIZE, &none, std::ptr::null_mut()) }, 0);
 }
 
 #[test]
@@ -1038,6 +1095,33 @@ fn a_failed_publish_reads_no_ignored_file_into_the_store() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_checkout_that_fills_the_disk_is_put_back() {
+    // §7.5 step 7: the put-back wrote the trees its checkouts read to the
+    // store before it removed anything, so a checkout that had used up the
+    // disk could not be put back at all: the files it had added stayed, and
+    // the next run recorded them. What the checkout added is removed first,
+    // and where it replaced nothing, nothing is written.
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("keep.txt", "my uncommitted edit\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    let out = stopped_mid_checkout_as(&r, &slow_failing_edit("c.files", n), n, fill_disk);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(!out.stderr.contains("put back"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.read("keep.txt"), "my uncommitted edit\n");
+    // the next run records the edit into the commit it was made on
+    r.j(&["id"]).ok();
+    let texts = r.j(&["\\r -> show (map (\\e -> [e.path (text e.content)]) (files r))"]).ok().stdout;
+    assert_eq!(texts.trim(), r#"[[["keep.txt"] "my uncommitted edit\n"]]"#);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn a_put_back_that_something_blocks_says_so() {
     // §7.5 step 7: jj's checkout skips a path something is in the way of
     // without failing, and the put-back did not look, so where it could not
@@ -1064,6 +1148,40 @@ fn a_put_back_that_something_blocks_says_so() {
     assert!(!r.dir.join("m").exists());
     assert!(!r.dir.join("zz").exists());
     assert_eq!(r.read("a/mine"), "mine\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_put_back_removes_nothing_through_a_symlink() {
+    // §7.5 step 7: the put-back removes the files the checkout added one by
+    // one, and the checkout writes none through a symlink, so none is
+    // removed through one: a directory the checkout made, replaced
+    // meanwhile by a symlink to another holding the same file, is in the
+    // way of that path
+    let r = setup();
+    // where the filesystem holds no symlink, none is followed
+    if std::os::unix::fs::symlink("x", r.dir.join("probe")).is_err() {
+        return;
+    }
+    std::fs::remove_file(r.dir.join("probe")).unwrap();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `d/f` is written before `m`
+    let files = "c.files ++ [{ path = [\"d\" \"f\"], content = blob \"f\\n\" }]";
+    // outside the working directory, and removed with the repository
+    let elsewhere = r.cfg.join("elsewhere");
+    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
+        std::fs::rename(r.dir.join("d"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.dir.join("d")).unwrap();
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(std::fs::read_to_string(elsewhere.join("f")).unwrap(), "f\n");
+    assert!(r.dir.join("d").symlink_metadata().unwrap().is_symlink());
+    assert!(!r.dir.join("m").exists());
 }
 
 #[test]
