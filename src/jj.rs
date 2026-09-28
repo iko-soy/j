@@ -838,6 +838,32 @@ fn first_not_a_dir(
     None
 }
 
+/// The first path where the working directory, scanned again as
+/// `rescanned`, no longer holds what it held as `on_disk`, the run's
+/// snapshot of it, and a checkout from `on_disk` to `to` writes or removes
+/// a file: a change made while the program ran, which no snapshot holds and
+/// jj's checkout would write over without looking (§7.5 step 7). Paths are
+/// compared file by file, as a directory is by what it holds; one lookup
+/// in `to` per path the directory changed at.
+async fn written_over(
+    on_disk: &MergedTree,
+    rescanned: &MergedTree,
+    to: &MergedTree,
+) -> Result<Option<RepoPathBuf>, String> {
+    let err = |e: jj_lib::backend::BackendError| e.to_string();
+    let mut diff = on_disk.diff_stream(rescanned, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let Diff { before, .. } = entry.values.map_err(err)?;
+        // a diff has no tree on either side
+        let focus = to.path_value(&entry.path).await.map_err(err)?;
+        let focus = if focus.is_tree() { Merge::absent() } else { focus };
+        if focus != before {
+            return Ok(Some(entry.path));
+        }
+    }
+    Ok(None)
+}
+
 /// What stands in the way of a path a checkout adds: `holder`, in the
 /// working directory, which does not track it, at `path`, above it, or in
 /// a directory at it
@@ -1683,13 +1709,16 @@ impl JjBackend {
     /// `on_disk` is the tree the directory holds, which the checkout starts
     /// from: what a persisting run's snapshot scanned, or the tree the
     /// working-copy state records where it scanned nothing to record, or
-    /// what `undo`'s look found; with none, the state as it is. Where the
-    /// commit adds a file, something `on_disk` does not track standing
-    /// there, but for empty directories and what the checkout writes,
-    /// refuses the checkout before `op` is published (`look_where_added`),
-    /// and one put there since fails it after, as it makes jj skip the
-    /// path. A checkout that fails, or is cut short, after `op` is
-    /// published leaves `op` recorded and the state stale, recording
+    /// what `undo`'s look found; with none, the state as it is. A change
+    /// made to the directory since `on_disk` was scanned, where the
+    /// checkout writes, refuses the checkout before `op` is published
+    /// (`written_over`); one made once it has begun is written over, as by
+    /// jj. Where the commit adds a file, something `on_disk` does not track
+    /// standing there, but for empty directories and what the checkout
+    /// writes, refuses the checkout before `op` is published
+    /// (`look_where_added`), and one put there since fails it after, as it
+    /// makes jj skip the path. A checkout that fails, or is cut short, after
+    /// `op` is published leaves `op` recorded and the state stale, recording
     /// `on_disk`: the next run takes what the checkout wrote for the
     /// commit's own and carries on (`snapshot_tree`), as the crash says,
     /// with `back` naming the way back; with no `back` it says nothing of
@@ -1723,18 +1752,37 @@ impl JjBackend {
         // conflict as resolved text, markers and all (§7.4).
         if let Some(on_disk) = on_disk {
             let old_tree = locked_ws.locked_wc().old_tree().clone();
-            match scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()).await {
-                Ok(scanned) if scanned.tree_ids() == on_disk.tree_ids() => {}
-                // the directory changed while the program ran, or can no
-                // longer be scanned (an entry appeared, vanished or cannot
-                // be read; a failed scan leaves the state as it was):
-                // describe `on_disk` instead. A reset writes no file; the
-                // paths it changes are re-read by the next run.
-                _ => locked_ws
+            let reset = match scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()).await {
+                Ok(scanned) if scanned.tree_ids() == on_disk.tree_ids() => false,
+                // the directory changed while the program ran: where the
+                // checkout would write the focus over such a change, which
+                // no snapshot holds and jj's checkout does not look for,
+                // the run crashes before anything is recorded or written
+                // (§7.5 step 7)
+                Ok(scanned) => match written_over(on_disk, &scanned, &commit.tree()).await {
+                    Ok(None) => true,
+                    Ok(Some(path)) => {
+                        return Err(Crash::new(format!(
+                            "cannot check out the focus: `{}` changed in the working directory while the program ran, and the checkout would write over it; nothing was recorded, so run the command again",
+                            path.as_internal_file_string()
+                        )));
+                    }
+                    Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}", e))),
+                },
+                // or it can no longer be scanned (an entry appeared,
+                // vanished or cannot be read; a failed scan leaves the state
+                // as it was)
+                Err(_) => true,
+            };
+            // Otherwise the state describes `on_disk` instead. A reset
+            // writes no file; the paths it changes are re-read by the next
+            // run.
+            if reset {
+                locked_ws
                     .locked_wc()
                     .reset(&with_tree(commit, on_disk.clone()))
                     .await
-                    .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?,
+                    .map_err(|e| Crash::new(format!("cannot reset the working copy: {}", e)))?;
             }
         }
         // Where the focus adds a file and something the directory does not

@@ -1342,13 +1342,14 @@ fn a_failed_checkout_keeps_what_changed_meanwhile() {
 #[cfg(target_os = "linux")]
 fn a_failed_checkout_keeps_what_was_saved_meanwhile_where_it_wrote() {
     // §7.5 step 7: the put-back gave each path the focus changes back what
-    // the directory held there, so a file saved meanwhile at such a path,
-    // after the checkout wrote it or before it got there, was lost unless
-    // the put-back recognised what the checkout had written. Nothing is put
-    // back now: the next run takes the directory for a change to what it
-    // held when the checkout began, and what was saved meanwhile where the
-    // checkout writes is a conflict with the focus's content, neither lost.
-    // So is the file the full disk cut short.
+    // the directory held there, so a file saved meanwhile at such a path
+    // after the checkout wrote it, or at a path the focus adds before the
+    // checkout got there, was lost unless the put-back recognised what the
+    // checkout had written. Nothing is put back now: the next run takes the
+    // directory for a change to what it held when the checkout began, and
+    // each such file is a conflict with the focus's content, neither lost.
+    // So is the file the full disk cut short. (A file the focus changes,
+    // saved before the checkout reaches it, is written over, as in jj.)
     let r = setup();
     r.write("a.txt", "a\n");
     r.write("b.txt", "b\n");
@@ -1356,8 +1357,9 @@ fn a_failed_checkout_keeps_what_was_saved_meanwhile_where_it_wrote() {
     r.write("b.txt", "b edited\n");
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     let n = 2000;
-    // `a.txt` and `b.txt` are written before `m`, `n.txt` after it, and
-    // then `zz` fails on the full disk
+    // `a.txt` and `b.txt` are written before `m` and saved over after;
+    // `n.txt`, which the focus adds after `m`, is saved before the
+    // checkout gets there; then `zz` fails on the full disk
     let files = "[({ path = [\"a.txt\"], content = blob \"focus a\\n\" }) \
                  ({ path = [\"b.txt\"], content = blob \"focus b\\n\" }) \
                  ({ path = [\"n.txt\"], content = blob \"focus n\\n\" })]";
@@ -1654,6 +1656,60 @@ fn a_run_that_fails_to_publish_writes_nothing() {
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
     let text = r.j(&["\\r -> text (contentAt [\"keep.txt\"] (files r))"]).ok().stdout;
     assert_eq!(text, "my uncommitted edit\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_file_saved_while_the_program_runs_is_not_written_over() {
+    // §7.5 step 7: the checkout's scan found a file saved after the run's
+    // snapshot, while the program ran, and took the directory to hold the
+    // snapshot there all the same; where the focus has that file otherwise,
+    // the checkout wrote the focus's over the edit, which no snapshot or
+    // operation held. Such a run now crashes before its operation is
+    // recorded, naming the path, and writes nothing, and the next run
+    // records the edit. One saved where the focus has what the snapshot
+    // read is left, as before, for the next run to record.
+    let r = setup();
+    r.write("a", "base\n");
+    r.write("same.txt", "same\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "child\n");
+    r.j(&["describe \"C\""]).ok();
+    // a change for the run's snapshot to record, whose operation
+    // `stopped_before_publish` waits for
+    r.write("keep.txt", "uncommitted\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // back to P, which has `a` otherwise, after a slow evaluation
+    let edit = "prev . mapRoot (\\c -> c { message = show (foldl (+) 0 (range 0 300000)) })";
+    let out = stopped_before_publish(&r, edit, || r.write("a", "saved meanwhile\n"));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("`a` changed in the working directory"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("a"), "saved meanwhile\n");
+    assert_eq!(r.read("keep.txt"), "uncommitted\n");
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    let texts = r.j(&[&texts_by_message(&["[\"a\"]", "[\"keep.txt\"]"], &["C"])]).ok().stdout;
+    assert_eq!(
+        texts.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[["saved meanwhile\n" "uncommitted\n"]]"#
+    );
+    // `same.txt`, which P has as the snapshot read it
+    r.write("keep.txt", "uncommitted, again\n");
+    let out = stopped_before_publish(&r, edit, || r.write("same.txt", "saved meanwhile\n"));
+    out.ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+    assert_eq!(r.read("same.txt"), "saved meanwhile\n");
+    assert_eq!(r.read("a"), "base\n");
+    assert!(!r.dir.join("keep.txt").exists());
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 3);
+    let texts = r.j(&[&texts_by_message(&["[\"a\"]", "[\"same.txt\"]"], &["P"])]).ok().stdout;
+    assert_eq!(
+        texts.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[["base\n" "saved meanwhile\n"]]"#
+    );
 }
 
 #[test]

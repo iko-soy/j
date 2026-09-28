@@ -1066,27 +1066,33 @@ Within it:
    is written `new . goto trunk`.)
 7. Record the operation, then perform the checkout of §7.4, as jj does. A
    signal to stop that comes meanwhile waits until the checkout and its
-   record are saved (§1.3). An operation that cannot be recorded, or a
-   checkout that would write over something untracked (§7.4), crashes
-   before the checkout, so nothing is recorded or written. A checkout that
-   fails (a path the filesystem cannot hold, a full disk) crashes with the
-   operation recorded and the working directory partly updated, and says
-   so; so does one that completes but whose record of what it wrote cannot
-   be saved. Nothing is put back: the working copy is left stale (§7.4),
-   recording the files the directory held when the checkout began, so the
-   next run takes what the checkout wrote for the focus's own and what else
-   has changed since for a change to the focus, the next program that
-   persists writes the rest of the focus, and `j undo` goes back. A file
-   saved meanwhile at a path the checkout writes, before or after it wrote
-   there, and a file a full disk cut short, are conflicts with the focus's
-   content there, so neither is lost. The checkout reads no file into the
-   repository and removes none it does not replace: an ignored file saved
-   meanwhile where the focus adds one, before the checkout reached it,
-   stays, holding what it held, and the checkout fails, naming it, so that
-   no run reads it; anything inside a nested repository stays too. No
-   uncommitted edit the checkout writes over is lost, as the operation
-   holds the run's snapshot of the directory (§7.4). This is the one crash
-   that records anything.
+   record are saved (§1.3). An operation that cannot be recorded, a
+   checkout that would write over something untracked (§7.4), and one that
+   would write over a change made to the working directory while the
+   program ran (a file saved, created or removed after the run's snapshot,
+   at a path where the focus differs from what that snapshot read), which
+   it names, crash before the checkout, so nothing is recorded or written.
+   A checkout that fails (a path the filesystem cannot hold, a full disk)
+   crashes with the operation recorded and the working directory partly
+   updated, and says so; so does one that completes but whose record of
+   what it wrote cannot be saved. Nothing is put back: the working copy is
+   left stale (§7.4), recording the files the directory held when the
+   checkout began, so the next run takes what the checkout wrote for the
+   focus's own and what else has changed since for a change to the focus,
+   the next program that persists writes the rest of the focus, and
+   `j undo` goes back. A file saved meanwhile at a path after the checkout
+   wrote there, or at a path the focus adds before the checkout got there,
+   and a file a full disk cut short, are conflicts with the focus's content
+   there, so neither is lost; a file the focus changes or removes, saved
+   while the checkout runs but before it reaches that path, is written
+   over, as in jj. The checkout reads no file into the repository and
+   removes none it does not replace: an ignored file saved meanwhile where
+   the focus adds one, before the checkout reached it, stays, holding what
+   it held, and the checkout fails, naming it, so that no run reads it;
+   anything inside a nested repository stays too. No uncommitted edit
+   present at the run's snapshot is lost where the checkout writes over it,
+   as the operation holds that snapshot (§7.4). This is the one crash that
+   records anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
