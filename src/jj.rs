@@ -2937,10 +2937,27 @@ fn check_push_records(
                 if nests(deleted, set) || nests(set, deleted) {
                     let keep = if waiting.contains(&deleted.as_str()) { deleted.as_str() } else { waiting[0] };
                     let literal = crate::show::text_literal(keep);
+                    // the temporary label: the first of `tmp`, `tmp-1`, ...
+                    // that is no bookmark, here or on origin, no record
+                    // names, and nests with none of those, so pushing and
+                    // deleting it moves none of the user's bookmarks, and
+                    // this push, which names nothing nesting with it, no
+                    // longer waits on `keep`'s commit
+                    let taken: Vec<&str> = repo
+                        .view()
+                        .bookmarks()
+                        .map(|(n, _)| n.as_str())
+                        .chain(records.iter().map(|(n, _)| n.as_str()))
+                        .collect();
+                    let tmp = std::iter::once("tmp".to_string())
+                        .chain((1..).map(|i| format!("tmp-{i}")))
+                        .find(|t| !taken.iter().any(|n| n == t || nests(n, t) || nests(t, n)))
+                        .expect("finitely many names are taken");
+                    let tmp = crate::show::text_literal(&tmp);
                     return Err((
                         1,
                         format!(
-                            "push: `{deleted}` must stay on origin until `{set}` is accepted, and git cannot create `{set}` while `{deleted}` is there; first push a temporary label on `{keep}`'s commit, `push (label \"tmp\" (labelled {literal}))`, then this push, then `push (unlabel \"tmp\")`"
+                            "push: `{deleted}` must stay on origin until `{set}` is accepted, and git cannot create `{set}` while `{deleted}` is there; first push a temporary label on `{keep}`'s commit, `push (label {tmp} (labelled {literal}))`, then this push, then `push (unlabel {tmp})`"
                         ),
                     ));
                 }

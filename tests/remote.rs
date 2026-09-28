@@ -1012,10 +1012,11 @@ fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
     use std::os::unix::fs::PermissionsExt;
     let env = setup();
     let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
-    // every git push that reaches the remote is logged
+    // every git push that reaches the remote is logged, each followed by an
+    // empty line
     let log = env.dir.join("pushes.log");
     let hook = env.remote.join("hooks/pre-receive");
-    std::fs::write(&hook, format!("#!/bin/sh\ncat >> '{}'\n", log.display())).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\n{{ cat; echo; }} >> '{}'\n", log.display())).unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let sent = || {
         let pushes = std::fs::read_to_string(&log).unwrap_or_default();
@@ -1025,6 +1026,7 @@ fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
     let dest = env.dir.join("clone");
     env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
     let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    let zero = "0".repeat(one.len());
     let ops = || env.j(&dest, &["ops"]).ok().stdout.lines().count();
     // a bookmark that does not reach trunk's commit
     env.j(&dest, &["new . top"]).ok();
@@ -1056,6 +1058,21 @@ fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
     assert_eq!(refs(), before_refs);
     assert_eq!(ops(), before);
 
+    // a name nests only with the names under it, past a `/`: `master2`
+    // shares a prefix with master and is created, and master deleted in a
+    // second git push once it is accepted
+    let out = env.j(&dest, &["push (rename \"master\" \"master2\")"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let pushes = sent();
+    let pushes: Vec<&str> = pushes.split_terminator("\n\n").collect();
+    assert_eq!(pushes, [format!("{zero} {one} refs/heads/master2"), format!("{one} {zero} refs/heads/master")]);
+    assert_eq!(refs(), format!("refs/heads/feature/x {feat}\nrefs/heads/master2 {one}\n"));
+    // with no trunk left nothing is immutable, and the rename back is one
+    // git push
+    env.j(&dest, &["push (rename \"master2\" \"master\")"]).ok();
+    assert_eq!(refs(), before_refs);
+    assert_eq!(sent().split_terminator("\n\n").count(), 1);
+
     // the way round it: with the temporary label on origin the delete does
     // not wait, and the rename is one git push
     env.j(&dest, &["push (label \"tmp\" (labelled \"master\"))"]).ok();
@@ -1064,6 +1081,62 @@ fn push_refuses_a_waiting_delete_whose_name_nests_with_a_set_one() {
     assert_eq!(refs(), format!("refs/heads/feature/x {feat}\nrefs/heads/master/legacy {one}\n"));
     let tree = env.j(&dest, &["tree"]).ok().stdout;
     assert!(tree.lines().any(|l| l.contains("one") && l.contains("master/legacy")), "{}", tree);
+}
+
+#[test]
+fn push_refusing_a_nesting_delete_advises_a_label_no_bookmark_has() {
+    // §7.6: the refusal above advised `push (label "tmp" (labelled
+    // "master"))` whatever the remote held. Followed as written, it moved a
+    // `tmp` the user had on origin to trunk's commit and then deleted it; it
+    // was rejected with `tmp/wip` there; and when the refused push itself
+    // deleted `tmp` it changed nothing and the refusal came back. The label
+    // it advises is on no bookmark, no record names it, and it nests with
+    // none of those
+    let env = setup();
+    let refs = || git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let one = git(&env.remote, &["rev-parse", "master"]).trim().to_string();
+    // the user's own `tmp` and `tmp-1/wip`, which do not reach trunk's commit
+    env.j(&dest, &["new . top"]).ok();
+    std::fs::write(dest.join("f.txt"), "work\n").unwrap();
+    env.j(&dest, &["describe \"my work\""]).ok();
+    env.j(&dest, &["push (\\r -> label \"tmp\" here r ++ label \"tmp-1/wip\" here r)"]).ok();
+    let work = git(&env.remote, &["rev-parse", "tmp"]).trim().to_string();
+    // the remote's default branch is elsewhere, so git lets master be deleted
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+    // `expr` is refused; the steps its message gives are run around it as
+    // written, and the first is returned
+    let follow = |expr: &str| {
+        let out = env.j(&dest, &[expr]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        let steps: Vec<&str> = out.stderr.split('`').filter(|s| s.starts_with("push (")).collect();
+        assert_eq!(steps.len(), 2, "{}", out.stderr);
+        env.j(&dest, &[steps[0]]).ok();
+        env.j(&dest, &[expr]).ok();
+        env.j(&dest, &[steps[1]]).ok();
+        steps[0].to_string()
+    };
+
+    // `tmp` is on origin, and `tmp-1` nests with `tmp-1/wip` there
+    let step = follow("push (rename \"master\" \"master/legacy\")");
+    assert_eq!(step, "push (label \"tmp-2\" (labelled \"master\"))");
+    assert_eq!(
+        refs(),
+        format!("refs/heads/master/legacy {one}\nrefs/heads/tmp {work}\nrefs/heads/tmp-1/wip {work}\n")
+    );
+
+    // with no trunk left nothing is immutable, and the rename back goes
+    env.j(&dest, &["push (rename \"master/legacy\" \"master\")"]).ok();
+    // the push deletes `tmp` and `tmp-1/wip`, and creates `tmp-3` and a name
+    // under `tmp-2`
+    let expr = "push (\\r -> rename \"master\" \"master/legacy\" r ++ rename \"tmp\" \"tmp-2/x\" r ++ rename \"tmp-1/wip\" \"tmp-3\" r)";
+    let step = follow(expr);
+    assert_eq!(step, "push (label \"tmp-4\" (labelled \"master\"))");
+    assert_eq!(
+        refs(),
+        format!("refs/heads/master/legacy {one}\nrefs/heads/tmp-2/x {work}\nrefs/heads/tmp-3 {work}\n")
+    );
 }
 
 #[test]
