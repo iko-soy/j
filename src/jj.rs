@@ -14,7 +14,7 @@ use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::{FileState, FileStates, FileType, LocalWorkingCopy, TreeState, TreeStateSettings};
 use jj_lib::matchers::{DifferenceMatcher, EverythingMatcher, FilesMatcher, NothingMatcher};
 use jj_lib::merge::{Diff, Merge};
 use jj_lib::merged_tree::MergedTree;
@@ -310,16 +310,16 @@ fn snapshot_options() -> SnapshotOptions<'static> {
 }
 
 /// Scan the working directory with `options`, as `wc.snapshot` does, where
-/// `base` is the tree the working copy's state records; return the tree
-/// scanned. jj's scan loses a regular file found where `base` has a
-/// conflict it cannot write a file into, one with a side that is no file,
-/// and keeps the conflict, so the file reaches no tree (§7.4):
+/// `base` is the tree the working copy's state records, as `saved` holds
+/// it; return the tree scanned. jj's scan loses a regular file found where
+/// `base` has a conflict it cannot write a file into, one with a side that
+/// is no file, and keeps the conflict, so the file reaches no tree (§7.4):
 ///
 /// - at a conflicted path, where a checkout wrote jj's description of the
-///   sides and the file now holds something else (`FilesOnConflicts::at`).
-///   The state is first reset to a resolved file there, so that the scan
-///   reads the file whole, as it reads any tracked file; the path stays
-///   tracked where a `.gitignore` has come to match it.
+///   sides and a file written since holds something else
+///   (`FilesOnConflicts::at`). The state is first reset to a resolved file
+///   there, so that the scan reads the file whole, as it reads any tracked
+///   file; the path stays tracked where a `.gitignore` has come to match it.
 /// - above one, where `base` has a directory holding a conflict, whose
 ///   differing sides the scan keeps at the path while it removes the
 ///   entries below (and a debug build fails an assertion). Such a file is
@@ -330,9 +330,10 @@ async fn scan(
     wc: &mut dyn LockedWorkingCopy,
     root: &std::path::Path,
     base: &MergedTree,
+    saved: &SavedState,
     options: &SnapshotOptions<'_>,
 ) -> Result<MergedTree, String> {
-    let files = files_on_conflicts(root, base)?;
+    let files = files_on_conflicts(root, base, Some(saved))?;
     let mut state = base.clone();
     if !files.at.is_empty() {
         // the empty file: a reset records the file at each path it changes
@@ -352,7 +353,7 @@ async fn scan(
         // a state that agrees with its tree tracks every entry below the
         // directory, so none is left; were a conflict left below, the
         // second scan would lose the file after all
-        if let Some(path) = files_on_conflicts(root, &state)?.over.first() {
+        if let Some(path) = files_on_conflicts(root, &state, None)?.over.first() {
             return Err(format!(
                 "cannot record the file `{}` in place of a directory holding a conflict",
                 path.as_internal_file_string()
@@ -432,7 +433,8 @@ async fn reset_paths(
 struct FilesOnConflicts {
     /// the conflicted paths with a side that is no file (a directory, a
     /// symlink, a submodule), which a checkout writes as jj's description of
-    /// the sides, whose file holds something else
+    /// the sides, whose file was written since and describes no such
+    /// conflict
     at: Vec<RepoPathBuf>,
     /// the directories holding a conflict, that is those above a conflicted
     /// path: a directory's sides differ exactly when a conflict is below
@@ -440,15 +442,119 @@ struct FilesOnConflicts {
     over: Vec<RepoPathBuf>,
 }
 
-/// Look on disk at `tree`'s conflicts for `FilesOnConflicts`. Nothing is
-/// looked at when `tree` is resolved; each directory above a conflict at
-/// most once, with one `lstat`; and a conflict with a side that is no file
-/// below directories, with one more, and a read where its file is as long
-/// as its description.
-fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<FilesOnConflicts, String> {
+/// Where the working copy saves its state, to read back what the state a
+/// scan's lock loaded records of a file (`files_on_conflicts`). Nothing is
+/// read until a scan asks.
+struct SavedState {
+    store: Arc<Store>,
+    root: PathBuf,
+    path: PathBuf,
+    settings: UserSettings,
+}
+
+impl SavedState {
+    /// Where `ws` saves its working copy's state; taken before the lock,
+    /// which borrows `ws`
+    fn of(ws: &Workspace) -> SavedState {
+        let root = ws.workspace_root().to_owned();
+        let path = match ws.working_copy().downcast_ref::<LocalWorkingCopy>() {
+            Some(wc) => wc.state_path().to_owned(),
+            None => root.join(".jj").join("working_copy"),
+        };
+        SavedState { store: ws.repo_loader().store().clone(), root, path, settings: ws.settings().clone() }
+    }
+
+    /// The state as saved, where it records `tree`, with the time it was
+    /// saved; None where it cannot be read or records another tree. A state
+    /// file that is not there is not read, as jj would write one to read.
+    fn load(&self, tree: &MergedTree) -> Option<(TreeState, i64)> {
+        let meta = self.path.join("tree_state").symlink_metadata().ok()?;
+        let saved_at = millis(meta.modified().ok()?)?;
+        let settings = TreeStateSettings::try_from_user_settings(&self.settings).ok()?;
+        let state = TreeState::load(self.store.clone(), self.root.clone(), self.path.clone(), &settings).ok()?;
+        (state.current_tree().tree_ids() == tree.tree_ids()).then_some((state, saved_at))
+    }
+}
+
+/// A modification time in milliseconds since the epoch, as jj's working
+/// copy records one
+fn millis(time: std::time::SystemTime) -> Option<i64> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).ok(),
+        Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|m| -m),
+    }
+}
+
+/// Whether the working copy's state, saved at `saved_at`, records `state`
+/// for the regular file `meta` describes as it is now: jj's own test of a
+/// file left as it was (`FileState::is_clean`, the executable bit aside),
+/// under which it reads nothing. A file modified in the millisecond the
+/// state was saved, or later, may have been written after it was.
+fn left_as_recorded(state: &FileState, meta: &std::fs::Metadata, saved_at: i64) -> bool {
+    matches!(state.file_type, FileType::Normal { .. })
+        && state.size == meta.len()
+        && meta.modified().ok().and_then(millis) == Some(state.mtime.0)
+        && state.mtime.0 < saved_at
+}
+
+/// The terms of a conflict that `text`, jj's description of one, names:
+/// those removed and those added, each without the label a checkout may
+/// write after it, with each removed that is also added cancelled against
+/// it, as simplifying the conflict does, sorted; None for text that is no
+/// description. Two descriptions naming the same terms describe one
+/// conflict, whatever its labels or the sides it has lost since.
+fn described_terms(text: &[u8]) -> Option<(Vec<&str>, Vec<&str>)> {
+    let lines = std::str::from_utf8(text).ok()?.strip_prefix("Conflict:\n")?;
+    if !lines.is_empty() && !lines.ends_with('\n') {
+        return None;
+    }
+    let (mut removes, mut adds) = (Vec::new(), Vec::new());
+    for line in lines.split_terminator('\n') {
+        let (terms, term) = match (line.strip_prefix("  Removing "), line.strip_prefix("  Adding ")) {
+            (Some(term), _) => (&mut removes, term),
+            (_, Some(term)) => (&mut adds, term),
+            _ => return None,
+        };
+        // a term ends with its object's id, which holds no space
+        let id = term.find(" with id ")? + " with id ".len();
+        let end = term[id..].find(' ').map_or(term.len(), |n| id + n);
+        let (term, label) = term.split_at(end);
+        if !label.is_empty() && !(label.starts_with(" (") && label.ends_with(')')) {
+            return None;
+        }
+        terms.push(term);
+    }
+    removes.retain(|term| match adds.iter().position(|t| t == term) {
+        Some(n) => {
+            adds.swap_remove(n);
+            false
+        }
+        None => true,
+    });
+    removes.sort_unstable();
+    adds.sort_unstable();
+    Some((removes, adds))
+}
+
+/// Look on disk at `tree`'s conflicts for `FilesOnConflicts`; with no
+/// `saved`, for `over` only. Nothing is looked at when `tree` is resolved;
+/// each directory above a conflict at most once, with one `lstat`; and a
+/// conflict with a side that is no file below directories, with one more,
+/// and a read where its file is as long as its description. Only a file
+/// that holds something else is looked up in the saved state, which is read
+/// once, and read itself where the state records it otherwise.
+fn files_on_conflicts(
+    root: &std::path::Path,
+    tree: &MergedTree,
+    saved: Option<&SavedState>,
+) -> Result<FilesOnConflicts, String> {
     let mut files = FilesOnConflicts { at: Vec::new(), over: Vec::new() };
     // whether each directory looked at so far is one on disk
     let mut dirs: HashMap<RepoPathBuf, bool> = HashMap::new();
+    // the state as saved, read once a file differs from its description,
+    // and what it records of the files, taken once
+    let loaded: std::cell::OnceCell<Option<(TreeState, i64)>> = std::cell::OnceCell::new();
+    let recorded: std::cell::OnceCell<Option<(FileStates<'_>, i64)>> = std::cell::OnceCell::new();
     for (path, value) in tree.conflicts() {
         let value = value.map_err(|e| e.to_string())?;
         let parent = path.parent().expect("a conflicted path has a parent");
@@ -466,20 +572,46 @@ fn files_on_conflicts(root: &std::path::Path, tree: &MergedTree) -> Result<Files
                 is_dir
             }
         });
-        if !below_dirs || value.to_file_merge().is_some() {
-            continue;
-        }
-        // what jj's checkout writes for it (§7.4)
-        let written = value.describe(tree.labels());
-        let Ok(disk) = path.to_fs_path(root) else {
+        let Some(saved) = saved.filter(|_| below_dirs && value.to_file_merge().is_none()) else {
             continue;
         };
-        let changed = disk.symlink_metadata().is_ok_and(|m| {
-            m.is_file()
-                && (m.len() != written.len() as u64
-                    || std::fs::read(&disk).is_ok_and(|bytes| bytes != written.as_bytes()))
+        let Some((disk, meta)) = path.to_fs_path(root).ok().and_then(|disk| {
+            let meta = disk.symlink_metadata().ok()?;
+            meta.is_file().then_some((disk, meta))
+        }) else {
+            continue;
+        };
+        // what jj's checkout writes for it (§7.4)
+        let written = value.describe(tree.labels());
+        let mut bytes = None;
+        if meta.len() == written.len() as u64 {
+            match std::fs::read(&disk) {
+                Ok(read) if read == written.as_bytes() => continue,
+                Ok(read) => bytes = Some(read),
+                Err(_) => continue,
+            }
+        }
+        // the file a checkout wrote, left as it was: it describes the
+        // conflict as it was then, which a scan has since written with
+        // sides that cancel dropped, and a checkout of the same conflict
+        // relabelled writes no file for
+        let states = recorded.get_or_init(|| {
+            let (state, saved_at) = loaded.get_or_init(|| saved.load(tree)).as_ref()?;
+            Some((state.file_states(), *saved_at))
         });
-        if changed {
+        if states.as_ref().is_some_and(|(file_states, saved_at)| {
+            file_states.get(&path).is_some_and(|state| left_as_recorded(&state, &meta, *saved_at))
+        }) {
+            continue;
+        }
+        // written since, or not known to be left: the conflict is kept
+        // while the file describes it, as when an editor saves it unchanged
+        let Some(bytes) = bytes.or_else(|| std::fs::read(&disk).ok()) else {
+            continue;
+        };
+        let unlabelled = value.describe(&jj_lib::conflict_labels::ConflictLabels::unlabeled());
+        let terms = described_terms(unlabelled.as_bytes());
+        if terms.is_none() || described_terms(&bytes) != terms {
             files.at.push(path);
         }
     }
@@ -992,11 +1124,12 @@ impl JjBackend {
     ) -> Result<(Arc<ReadonlyRepo>, Option<PendingSnapshot>), OpenError> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
         let old_tree = locked_ws.locked_wc().old_tree().clone();
-        let scanned = scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options())
+        let scanned = scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options())
             .await
             .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
         // the repo build_interp loaded at head from the workspace's own
@@ -1314,6 +1447,7 @@ impl JjBackend {
     ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = ws_guard.start_working_copy_mutation()
             .await
             .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
@@ -1342,7 +1476,7 @@ impl JjBackend {
         // conflict as resolved text, markers and all (§7.4).
         if let Some(on_disk) = on_disk {
             let old_tree = locked_ws.locked_wc().old_tree().clone();
-            match scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()).await {
+            match scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()).await {
                 Ok(scanned) if scanned.tree_ids() == on_disk.tree_ids() => {}
                 // the directory changed while the program ran, or can no
                 // longer be scanned (an entry appeared, vanished or cannot
@@ -1864,10 +1998,11 @@ impl JjBackend {
         let wc_tree = block_on(self.wc_commit(base))?.tree();
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
+        let saved = SavedState::of(&ws_guard);
         let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
             .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
         let old_tree = locked_ws.locked_wc().old_tree().clone();
-        let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &snapshot_options()))
+        let scanned = block_on(scan(locked_ws.locked_wc(), &root, &old_tree, &saved, &snapshot_options()))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
         let recorded = match marker_style(base.settings()) {
             Ok(markers) => block_on(snapshot_tree(&root, markers, &wc_tree, &old_tree, &scanned)),
@@ -3439,4 +3574,45 @@ fn sort_subtree(subtree: &mut Value, vis: &VisibleRepo) {
     });
     let root = subtree.field("root").expect("subtree has a root");
     *subtree = Value::record(&[("children", Value::list(kids)), ("root", root)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jj_lib::backend::SymlinkId;
+    use jj_lib::conflict_labels::ConflictLabels;
+
+    #[test]
+    fn a_description_names_its_terms_whatever_their_labels_and_the_sides_that_cancel() {
+        // what a checkout writes for a symlink/file conflict of five terms,
+        // and for the three it simplifies to, which a snapshot may write
+        // without writing the file again (§7.4)
+        let link = Some(TreeValue::Symlink(SymlinkId::new(vec![1; 20])));
+        let file = |n: u8| {
+            let id = FileId::new(vec![n; 20]);
+            Some(TreeValue::File { id, executable: false, copy_id: CopyId::placeholder() })
+        };
+        let five = Merge::from_vec(vec![link.clone(), link.clone(), file(2), file(1), link.clone()]);
+        let three = five.simplify();
+        assert_eq!(three.num_sides(), 2);
+        let unlabeled = ConflictLabels::unlabeled();
+        let written = five.describe(&unlabeled);
+        let simpler = three.describe(&unlabeled);
+        assert_ne!(written, simpler);
+        let terms = described_terms(simpler.as_bytes());
+        assert!(terms.is_some());
+        assert_eq!(described_terms(written.as_bytes()), terms);
+        let names = ["left (one)", "base", "middle", "base 2", "right"];
+        let labels = ConflictLabels::from_vec(names.iter().map(|n| n.to_string()).collect());
+        let labelled = five.describe(&labels);
+        assert!(labelled.contains(" (left (one))\n"), "{}", labelled);
+        assert_eq!(described_terms(labelled.as_bytes()), terms);
+        // other sides, and text that is no description, are no such conflict
+        let other = Merge::from_vec(vec![link.clone(), file(1), file(3)]).describe(&unlabeled);
+        assert!(described_terms(other.as_bytes()).is_some_and(|t| Some(t) != terms));
+        assert_eq!(described_terms(b"resolved\n"), None);
+        assert_eq!(described_terms(written.replace("Conflict:", "CONFLICT:").as_bytes()), None);
+        assert_eq!(described_terms(written.trim_end().as_bytes()), None);
+        assert_eq!(described_terms(format!("{}  Adding file with id 0101 and more\n", written).as_bytes()), None);
+    }
 }

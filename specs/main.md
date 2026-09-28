@@ -978,8 +978,11 @@ directory.
   not, the file is resolved to its text. A conflict with a side that is no
   file (a directory, a symlink) has no markers: it is written as jj's
   description of its sides, and read back as that conflict while the file
-  holds the description; a file holding anything else is resolved to its
-  text.
+  is left as written (the working copy records each file's size and
+  modification time) or describes the same sides, whatever their labels
+  and less any side it both removes and adds (a snapshot may drop such a
+  pair from the conflict without writing the file again); a file written
+  with anything else is resolved to its text.
 
 Reserved commands never snapshot.
 

@@ -2236,6 +2236,84 @@ fn a_file_written_over_a_conflict_with_a_side_that_is_no_file_is_recorded() {
     assert_eq!(r.read("a"), "resolved\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_cancel() {
+    // a tree of five sides, with a file conflict at `a` and a symlink/file
+    // conflict at `b`, whose description names L's symlink as removed once
+    // and added twice. Resolving `a` lets the scan write a tree of three
+    // sides, where `b`'s conflict has the pair cancelled and describes
+    // itself in three lines, while the file, which nobody touched, still
+    // holds the five a checkout wrote. The scan took that file for one
+    // written over the conflict and recorded the description as `b`'s text:
+    // the run showed `b` resolved, `undo` refused a directory nobody had
+    // changed, and `describe` recorded the text in C (§7.4)
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let parent = "\\r -> show (conflicted (files (up r)))";
+    let content = "\\r -> show (contentAt [\"b\"] (files r))";
+    let goto = |m: &str| format!("goto (matching (\\c -> c.message == \"{}\") all)", m);
+    let r = setup();
+    r.write("a", "base\n");
+    r.write("b", "b0\n");
+    r.j(&["describe \"P\""]).ok();
+    r.j(&["new"]).ok();
+    std::fs::remove_file(r.dir.join("b")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", r.dir.join("b")).unwrap();
+    r.j(&["describe \"L\""]).ok();
+    r.j(&["new . goto parents"]).ok();
+    r.write("a", "right\n");
+    r.write("b", "b2\n");
+    r.j(&["describe \"R\""]).ok();
+    r.j(&["rebase (matching (\\c -> c.message == \"L\") all)"]).ok();
+    r.j(&[&goto("L")]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "other\n");
+    r.j(&["describe \"M\""]).ok();
+    r.j(&[&goto("R")]).ok();
+    r.j(&["rebase (matching (\\c -> c.message == \"M\") all)"]).ok();
+    r.j(&["new"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"] [\"b\"]]");
+    let description = r.read("b");
+    assert_eq!(description.lines().count(), 6, "{}", description);
+    let modified = || std::fs::symlink_metadata(r.dir.join("b")).unwrap().modified().unwrap();
+    let written = modified();
+
+    r.write("a", "resolved\n");
+    r.j(&["describe \"C\""]).ok();
+    r.j(&["new"]).ok();
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[[\"b\"]]");
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    assert_eq!(r.read("b"), description);
+    assert_eq!(modified(), written);
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    r.j(&["redo"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    assert_eq!(modified(), written);
+    // the scan reads no file the working copy's state records as it was
+    // written, as jj's reads none: one describing the conflict otherwise,
+    // as another version of jj may have, stays the conflict
+    let other = description.replace("Conflict:", "CONFLICT:");
+    r.write("b", &other);
+    let file = std::fs::File::options().write(true).open(r.dir.join("b")).unwrap();
+    file.set_modified(written).unwrap();
+    drop(file);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    assert_eq!(r.read("b"), other);
+    // the description written again, as an editor saving it unchanged
+    // does, is still the conflict
+    r.write("b", &description);
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"b\"]]");
+    // anything else written over it is recorded
+    r.write("b", "mine\n");
+    r.j(&["describe \"D\""]).ok();
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[]");
+    assert_eq!(r.j(&[content]).ok().stdout.trim(), "blob \"mine\\n\"");
+    assert_eq!(r.j(&[parent]).ok().stdout.trim(), "[[\"b\"]]");
+}
+
 #[test]
 fn edit_applied_to_an_edit_is_a_contract_crash() {
     // `new new` gives `new` a function where its signature wants a Repo: a
