@@ -1115,50 +1115,67 @@ fn documented_results(md: &str) -> Vec<(usize, String, String)> {
     out
 }
 
+/// The documented examples whose result is prose, not an expression, by
+/// file and expression. They are not checked; every other example is.
+const PROSE_RESULTS: &[(&str, &str)] = &[
+    ("docs/language.md", "(\\x -> x.missing) or (\\x -> 0)"),
+    ("docs/base.md", "[({ path = ./a.txt, content = blob \"hello\" })]"),
+];
+
 #[test]
 fn documented_examples_evaluate_to_their_results() {
     // docs/language.md listed two records side by side, `[{ id = 1 } { id = 2 }]`,
     // as a list of two; it is one record updated by the other (§3.4), and
     // `map (.id)` of it gave `[2]`, not the `[1 2]` documented. Each example
     // that documents a value must evaluate to it. One whose result is prose
-    // (starting with a word that is no expression) or that names a commit
-    // by its id is not checked here.
+    // (PROSE_RESULTS) or that names a commit by its id is not checked here;
+    // any other that crashes, or whose result does not evaluate or compare,
+    // is wrong, so a misspelled result or a crash documented as a result
+    // fails too.
     let (mut i, cfg) = make_interp();
     let mut checked = 0;
+    let mut prose = Vec::new();
     let mut wrong = Vec::new();
     for (name, md) in [
         ("docs/language.md", include_str!("../docs/language.md")),
         ("docs/base.md", include_str!("../docs/base.md")),
     ] {
         for (line, expr, result) in documented_results(md) {
-            let got = ev(&mut i, &cfg, &expr);
-            let want = ev(&mut i, &cfg, &result);
-            let prose = result.starts_with(|c: char| c.is_alphabetic());
-            match (got, want) {
-                (Err(_), Err(_)) => {}
+            if PROSE_RESULTS.contains(&(name, expr.as_str())) {
+                prose.push((name, expr));
+                continue;
+            }
+            let at = format!("{}:{}: {}", name, line, expr);
+            match (ev(&mut i, &cfg, &expr), ev(&mut i, &cfg, &result)) {
                 // an id names no commit here
                 (Err(e), _) if e == "id resolution" => {}
-                (Ok(_), Err(_)) if prose => {}
-                (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
-                    wrong.push(format!("{}:{}: {} => {}: {}", name, line, expr, result, e))
-                }
+                (Err(e), _) => wrong.push(format!("{} => {}: {}", at, result, e)),
+                (Ok(_), Err(e)) => wrong.push(format!("{} => {}: the result: {}", at, result, e)),
                 (Ok(got), Ok(want)) => match value_eq(&got, &want) {
                     Ok(true) => checked += 1,
                     Ok(false) => wrong.push(format!(
-                        "{}:{}: {} => {}, not {}",
-                        name,
-                        line,
-                        expr,
+                        "{} => {}, not {}",
+                        at,
                         j::show::show(&i, &got).unwrap(),
                         result
                     )),
-                    // functions do not compare
-                    Err(_) => {}
+                    // a function does not compare: say what it does in
+                    // prose, and list it in PROSE_RESULTS
+                    Err(e) => wrong.push(format!("{} => {}: {}", at, result, e.msg)),
                 },
             }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // each prose example is still where the list says
+    for (name, expr) in PROSE_RESULTS {
+        assert!(
+            prose.iter().any(|(n, e)| n == name && e == expr),
+            "{}: no example `{}`",
+            name,
+            expr
+        );
+    }
     // the extraction still finds the examples
     assert!(checked >= 150, "only {} examples checked", checked);
 }
