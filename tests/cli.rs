@@ -964,6 +964,101 @@ fn undoing_a_failed_checkout_keeps_the_ignored_files_where_it_wrote() {
     assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
+/// The entries of `.jj` a checkout moved files aside into (`clear_the_way`)
+fn aside_in_jj(r: &Repo) -> Vec<String> {
+    std::fs::read_dir(r.dir.join(".jj"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("aside"))
+        .collect()
+}
+
+#[test]
+fn a_failed_checkout_puts_back_the_ignored_file_it_was_to_write_again() {
+    // §7.4, §7.5 step 7: an untracked file holding just what the checkout
+    // writes at a path the focus adds was removed before the checkout, to
+    // be written again; a checkout that failed before it got there left it
+    // removed, and `j undo` did not bring it back. It is moved aside now,
+    // and put back where the checkout did not write.
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("local.env", "A=1\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    // the deep path under `a` fails, before `local.env`
+    let edit = format!(
+        "mapRoot (\\c -> c {{ files = c.files ++ [\
+         ({{ path = [{}], content = blob \"deep\" }}) \
+         ({{ path = [\"local.env\"], content = blob \"A=1\\n\" }})] }})",
+        too_deep("a")
+    );
+    let out = r.j(&[&edit]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("local.env"), "A=1\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("local.env"), "A=1\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+    // a checkout that completes writes it
+    let edit = "mapRoot (\\c -> c { files = c.files ++ [{ path = [\"local.env\"], content = blob \"A=1\\n\" }] })";
+    r.j(&[edit]).ok();
+    assert_eq!(r.read("local.env"), "A=1\n");
+    assert_eq!(r.j(&["\\r -> text (contentAt [\"local.env\"] (files r))"]).ok().stdout, "A=1\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_checkout_names_the_file_it_cannot_move_out_of_its_way() {
+    // §7.4: an untracked file holding just what the checkout writes at a
+    // path the focus adds, which could not be removed for it, made jj skip
+    // the path, and the checkout failed saying only that files were not
+    // written, naming none, on every run that persisted. It names the file
+    // now, and why it could not be moved. (A directory the user cannot
+    // write to holds it here; root can.)
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"A\""]).ok();
+    let adds = "mapRoot (\\c -> c { files = c.files ++ [{ path = [\"etc\" \"local.env\"], content = blob \"A=1\\n\" }] })";
+    r.j(&[&format!("describe \"B\" . {} . new", adds)]).ok();
+    r.j(&[&new_above("A")]).ok();
+    std::fs::create_dir(r.dir.join("etc")).unwrap();
+    r.write("etc/local.env", "A=1\n");
+    let mode = |m| std::fs::set_permissions(r.dir.join("etc"), std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o555);
+    let out = r.j(&[&new_above("B")]);
+    let again = r.j(&["describe \"again\""]);
+    mode(0o755);
+    for out in [out, again] {
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("`etc/local.env` was not written"), "{}", out.stderr);
+        assert!(out.stderr.contains("could not be moved"), "{}", out.stderr);
+        assert!(out.stderr.contains("Permission denied"), "{}", out.stderr);
+    }
+    assert_eq!(r.read("etc/local.env"), "A=1\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    // once the directory lets it be moved, the run completes the checkout
+    r.j(&["describe \"done\""]).ok();
+    assert_eq!(r.read("etc/local.env"), "A=1\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    r.j(&["id"]).ok();
+    let text = "\\r -> text (contentAt [\"etc\" \"local.env\"] (files r))";
+    assert_eq!(r.j(&[text]).ok().stdout, "A=1\n");
+}
+
 /// An expression that goes to a new commit above the one whose message is
 /// `message`
 fn new_above(message: &str) -> String {
@@ -1547,6 +1642,41 @@ fn an_ignored_file_put_where_a_checkout_cut_short_adds_one_is_not_read() {
     r.j(&["id"]).ok();
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
     assert!(!has_blob(&r, secret));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_file_a_checkout_cut_short_moved_aside_is_put_back_by_the_next_run() {
+    // §7.4, §7.5 step 7: an untracked file holding just what the checkout
+    // writes at a path the focus adds is moved aside into `.jj` for the
+    // checkout, and put back where it does not get to write; a run killed
+    // meanwhile leaves it there, which the next run puts back, and `j undo`
+    // leaves it where it was
+    let r = setup();
+    r.write(".gitignore", "*.env\n");
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("o.env", "committed\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `o.env` is written after `m`
+    let files = "c.files ++ [{ path = [\"o.env\"], content = blob \"committed\\n\" }]";
+    let out = stopped_mid_checkout_as(&r, &slow_edit(files, n), n, |pid| {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    });
+    assert_eq!(out.code, -libc::SIGKILL, "{}", out.stderr);
+    assert!(in_m(&r) < n);
+    assert!(!r.dir.join("o.env").exists());
+    assert_eq!(aside_in_jj(&r).len(), 1);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("o.env"), "committed\n");
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("o.env"), "committed\n");
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(aside_in_jj(&r), Vec::<String>::new());
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
 }
 
 #[test]

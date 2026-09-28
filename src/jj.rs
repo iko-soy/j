@@ -991,14 +991,20 @@ fn untracked_below(disk: &std::path::Path, path: &RepoPath, from: &MergedTree) -
 
 /// Clear each of `paths`, where a checkout from the tree the working
 /// directory holds to `to` adds a file (`look_where_added`): a file there
-/// is removed while it holds what the checkout writes (`holds_written`),
-/// and in a directory there every directory holding no file, deepest
-/// first, and it too once empty. A path below anything that is no
-/// directory on disk, a symlink included, is left alone, and no symlink in
-/// one is followed; a directory is removed only while empty, so a file put
-/// there meanwhile stays, as does one changed meanwhile, and the checkout
-/// skips the path (§7.5 step 7).
-async fn clear_the_way(root: &std::path::Path, markers: ConflictMarkerStyle, to: &MergedTree, paths: &[RepoPathBuf]) {
+/// is moved aside while it holds what the checkout writes
+/// (`holds_written`), and in a directory there every directory holding no
+/// file is removed, deepest first, and it too once empty. A path below
+/// anything that is no directory on disk, a symlink included, is left
+/// alone, and no symlink in one is followed; a directory is removed only
+/// while empty, so a file put there meanwhile stays, as does one changed
+/// meanwhile, and the checkout skips the path (§7.5 step 7). So does one
+/// that cannot be moved, which the result names.
+async fn clear_the_way(
+    root: &std::path::Path,
+    markers: ConflictMarkerStyle,
+    to: &MergedTree,
+    paths: &[RepoPathBuf],
+) -> Aside {
     fn clear(dir: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -1009,6 +1015,7 @@ async fn clear_the_way(root: &std::path::Path, markers: ConflictMarkerStyle, to:
         }
         let _ = std::fs::remove_dir(dir);
     }
+    let mut aside = Aside { root: root.to_owned(), dir: None, stuck: None };
     let mut dirs = HashMap::new();
     for path in paths {
         if first_not_a_dir(root, path, &mut dirs).is_some() {
@@ -1028,7 +1035,110 @@ async fn clear_the_way(root: &std::path::Path, markers: ConflictMarkerStyle, to:
             continue;
         };
         if holds_written(to.store(), path, value, to.labels(), markers, &disk).await.unwrap_or(false) {
-            let _ = std::fs::remove_file(&disk);
+            if let Err(e) = aside.take(path, &disk) {
+                aside.stuck.get_or_insert((path.clone(), e));
+            }
+        }
+    }
+    aside
+}
+
+/// The start of the name of each directory in `.jj` that `Aside` moves
+/// files into
+const ASIDE: &str = "aside";
+
+/// The files `clear_the_way` moved out of a checkout's way, each holding
+/// what the checkout writes where it stood, in a directory in `.jj` that
+/// holds each at its path in the working directory `root`, which no scan
+/// reads; and the first file it could not move, with why. Dropped, once
+/// the checkout has written what it could, it puts each back where nothing
+/// stands now (`put_back`), as where a checkout that failed or skipped
+/// paths did not get to write, and removes the directory with what is
+/// left, each holding what the checkout wrote in its place (§7.5 step 7).
+/// One a run killed meanwhile left, the next puts back (`put_back_left`).
+struct Aside {
+    root: std::path::PathBuf,
+    dir: Option<tempfile::TempDir>,
+    stuck: Option<(RepoPathBuf, std::io::Error)>,
+}
+
+impl Aside {
+    /// Move `disk`, the file at `path`, into the directory, made on first
+    /// use; renamed, it is neither copied nor followed if a symlink
+    fn take(&mut self, path: &RepoPath, disk: &std::path::Path) -> std::io::Result<()> {
+        let dir = match &mut self.dir {
+            Some(dir) => dir,
+            none => none.insert(tempfile::Builder::new().prefix(ASIDE).tempdir_in(self.root.join(".jj"))?),
+        };
+        let to = path.to_fs_path(dir.path()).map_err(std::io::Error::other)?;
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(disk, to)
+    }
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            put_back(&self.root, dir.path());
+        }
+    }
+}
+
+/// Put each file in `aside`, where `Aside` moved it, back at its path in
+/// the working directory `root` where nothing stands, making the
+/// directories above it that are missing; one that cannot be put back, as
+/// something stands there or in place of a directory above it, stays in
+/// `aside`. No symlink is followed.
+fn put_back(root: &std::path::Path, aside: &std::path::Path) {
+    let missing = |p: &std::path::Path| {
+        matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    };
+    // whether each directory above `path` in `root` is one, or is made
+    let dirs_above = |path: &std::path::Path| {
+        let mut at = root.to_owned();
+        for name in path.parent().into_iter().flat_map(|p| p.components()) {
+            at.push(name);
+            let made = match at.symlink_metadata() {
+                Ok(meta) => meta.is_dir(),
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound && std::fs::create_dir(&at).is_ok(),
+            };
+            if !made {
+                return false;
+            }
+        }
+        true
+    };
+    let mut dirs = vec![std::path::PathBuf::new()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(aside.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = dir.join(entry.file_name());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+            } else if missing(&root.join(&path)) && dirs_above(&path) {
+                let _ = std::fs::rename(entry.path(), root.join(&path));
+            }
+        }
+    }
+}
+
+/// Put back what a run killed while its checkout ran left moved aside in
+/// `.jj` (`Aside`), and remove the directory it left there. A run does
+/// this once it holds the repository's lock, before it looks at the
+/// working directory, so no other run is using such a directory.
+fn put_back_left(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(".jj")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let named = entry.file_name().to_str().is_some_and(|n| n.starts_with(ASIDE));
+        if named && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            put_back(root, &entry.path());
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -1269,6 +1379,7 @@ impl JjBackend {
             std::process::exit(2);
         }
         *self.inner.lock_guard.lock().unwrap() = Some(FileLock(file));
+        put_back_left(&self.inner.workspace_root);
     }
 
     pub fn build_interp(
@@ -1894,7 +2005,9 @@ impl JjBackend {
                 }
             };
         }
-        clear_the_way(&root, markers, &commit.tree(), &clear).await;
+        // what is moved aside is put back where the checkout does not write
+        // once it returns, however it returns
+        let aside = clear_the_way(&root, markers, &commit.tree(), &clear).await;
         let from = locked_ws.locked_wc().old_tree().clone();
         let what = "the working directory was only partly updated";
         let stats = match locked_ws.locked_wc().check_out(commit).await {
@@ -1902,17 +2015,24 @@ impl JjBackend {
             Err(e) => return Err(Crash::new(format!("cannot check out the focus: {}{}", e, carry_on(what)))),
         };
         // Something the directory does not track, put where the focus adds a
-        // file since it was looked at, made jj skip the path, which it
-        // records as written. The state is left stale, as by a checkout
-        // that fails, so that no run reads what stands there (§7.5 step 7).
+        // file since it was looked at, or a file holding what the checkout
+        // writes there that could not be moved aside, made jj skip the
+        // path, which it records as written. The state is left stale, as by
+        // a checkout that fails, so that no run reads what stands there
+        // (§7.5 step 7).
         if stats.skipped_files > 0 {
             let skipped = first_skipped(&root, markers, &from, &commit.tree()).await.ok().flatten();
-            let why = match skipped {
-                Some(path) => format!(
+            let why = match (skipped, &aside.stuck) {
+                (Some(path), _) => format!(
                     "`{}` was not written, as something untracked in the working directory was in its way (move it aside)",
                     path.as_internal_file_string()
                 ),
-                None => format!(
+                (None, Some((path, e))) => format!(
+                    "`{}` was not written, as the untracked file there, holding what it writes, could not be moved out of its way: {}",
+                    path.as_internal_file_string(),
+                    e
+                ),
+                (None, None) => format!(
                     "{} of its files were not written, as something untracked in the working directory was in their way",
                     stats.skipped_files
                 ),

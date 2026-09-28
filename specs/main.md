@@ -1007,9 +1007,15 @@ directory.
   a symlink, or a conflict) and the directory has no tracked one. It first
   removes each tree of empty directories there, which no snapshot sees (a
   tool may leave one, and a failed checkout does, for a path it did not
-  reach), and an untracked file holding just what it writes there (as a
-  checkout cut short leaves at an ignored path), looking through no
-  symlink, so nothing outside the working directory is removed. Anything
+  reach), and moves an untracked file holding just what it writes there
+  (as a checkout cut short leaves at an ignored path) aside into `.jj`,
+  which no snapshot reads, looking through no symlink, so nothing outside
+  the working directory is touched. Once the checkout returns, each file
+  moved aside is put back where nothing stands, as where a failed checkout
+  did not get to write, and the rest are removed, the checkout having
+  written the same there; what a run killed meanwhile leaves in `.jj`, the
+  next run puts back. A file that cannot be moved stays, and the checkout,
+  which skips its path, fails, naming it and why (§7.5 step 7). Anything
   else untracked there, or in place of a directory above the path (an
   ignored file, a symlink, a directory holding one), crashes the program
   before its operation is recorded, naming it, as git refuses to write over
@@ -1096,24 +1102,25 @@ Within it:
    A checkout that fails (a path the filesystem cannot hold, a full disk)
    crashes with the operation recorded and the working directory partly
    updated, and says so; so does one that completes but whose record of
-   what it wrote cannot be saved. Nothing is put back: the working copy is
-   left stale (§7.4), recording the files the directory held when the
-   checkout began, so the next run takes what the checkout wrote for the
-   focus's own and what else has changed since for a change to the focus,
-   the next program that persists writes the rest of the focus, and
-   `j undo` goes back. A file saved meanwhile at a path after the checkout
-   wrote there, or at a path the focus adds before the checkout got there,
-   and a file a full disk cut short, are conflicts with the focus's content
-   there, so neither is lost; a file the focus changes or removes, saved
-   while the checkout runs but before it reaches that path, is written
-   over, as in jj. The checkout reads no file into the repository and
-   removes none it does not replace: an ignored file saved meanwhile where
-   the focus adds one, before the checkout reached it, stays, holding what
-   it held, and the checkout fails, naming it, so that no run reads it;
-   anything inside a nested repository stays too. No uncommitted edit
-   present at the run's snapshot is lost where the checkout writes over it,
-   as the operation holds that snapshot (§7.4). This is the one crash that
-   records anything.
+   what it wrote cannot be saved. Nothing it wrote is taken back: the
+   working copy is left stale (§7.4), recording the files the directory
+   held when the checkout began, so the next run takes what the checkout
+   wrote for the focus's own and what else has changed since for a change
+   to the focus, the next program that persists writes the rest of the
+   focus, and `j undo` goes back. A file saved meanwhile at a path after
+   the checkout wrote there, or at a path the focus adds before the
+   checkout got there, and a file a full disk cut short, are conflicts with
+   the focus's content there, so neither is lost; a file the focus changes
+   or removes, saved while the checkout runs but before it reaches that
+   path, is written over, as in jj. The checkout reads no file into the
+   repository and removes none it does not replace: a file it moved aside
+   to write again (§7.4) is put back where it did not get to; an ignored
+   file saved meanwhile where the focus adds one, before the checkout
+   reached it, stays, holding what it held, and the checkout fails, naming
+   it, so that no run reads it; anything inside a nested repository stays
+   too. No uncommitted edit present at the run's snapshot is lost where the
+   checkout writes over it, as the operation holds that snapshot (§7.4).
+   This is the one crash that records anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
