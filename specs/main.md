@@ -130,6 +130,15 @@ a power loss) leaves the operation recorded and the working directory
 partly updated, as a checkout that fails does: the next run carries on from
 there (§7.4), and `j undo` goes back.
 
+`clone` (§7.8) writes its directory from the start, so it holds the four
+signals off from creating it. One that comes while it creates the
+repository, fetches and imports lets the step in progress end (the git it
+runs, which a Ctrl-C at the terminal stops too), then fails the clone, which
+removes what it made, and then takes effect; one that comes later, once it
+makes the working-copy commit, waits for the clone to complete. A signal `j`
+was started ignoring (`nohup`, a background job) stays ignored, by the git
+it runs too.
+
 ### 1.4 Exit status
 
 | status | meaning |
@@ -1235,12 +1244,13 @@ that state, §7.2 applies.
   default bookmark target (or of the root commit if the remote has none),
   holding that target's files (see below), and checks it out. The default
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
-  checkout included, records nothing and removes the `DIR` it created and each
-  parent it created that is then empty, or empties the `DIR` it found empty,
-  and nothing else. It removes or empties each only while its path still
-  leads to that directory, so a symlink put in its place, or in place of a
-  directory above it, is not followed: a path that leads elsewhere is left,
-  and the error names it. It requires `user`.
+  checkout included, or that is interrupted while it fetches (§1.3), records
+  nothing and removes the `DIR` it created and each parent it created that is
+  then empty, or empties the `DIR` it found empty, and nothing else. It
+  removes or empties each only while its path still leads to that directory,
+  so a symlink put in its place, or in place of a directory above it, is not
+  followed: a path that leads elsewhere is left, and the error names it. It
+  requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 

@@ -550,6 +550,126 @@ fn failed_clone_does_not_follow_a_symlink_put_in_place_of_its_directories() {
     std::fs::remove_dir_all(&work).unwrap();
 }
 
+/// Whether the signal `sig` sent to the process `pid` as a whole is still
+/// waiting for one of its threads to take it
+#[cfg(target_os = "linux")]
+fn signal_pending(pid: libc::pid_t, sig: libc::c_int) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("ShdPnd:"))
+        .is_some_and(|mask| u64::from_str_radix(mask.trim(), 16).unwrap() & (1 << (sig - 1)) != 0)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_interrupted_clone_leaves_nothing_behind() {
+    // §1.3, §7.8: a clone removed what it made only when it failed. Ctrl-C
+    // (SIGINT), SIGTERM, SIGHUP or SIGQUIT while it fetched killed it at
+    // once, leaving DIR holding `.git` and `.jj`, with no remote and no
+    // working-copy commit, and a retry was refused: "already contains a jj
+    // repository". A signal sent to `j` alone also left its `git fetch`
+    // writing there. Such a signal now waits for the step in progress, the
+    // git it runs included, then fails the clone, which removes what it
+    // made, and then takes effect. One the clone was started ignoring, as
+    // `nohup` starts it, is still ignored, by the git it runs too.
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let env = setup();
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(work.join("e")).unwrap();
+    let (started, go) = (env.dir.join("started"), env.dir.join("go"));
+    let wrapper = env.dir.join("git-waits");
+    let names = |dir: &PathBuf| {
+        let mut all: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        all.sort();
+        all
+    };
+    let remote = env.remote.to_str().unwrap();
+    // `j clone remote dest`, whose `git` running `step` says it has started
+    // and waits to be let go, sent `sig` meanwhile, to its process group
+    // (as a Ctrl-C at the terminal is) when `group`, else to it alone; it
+    // starts ignoring `sig` when `ignored`
+    let clone = |step: &str, sig: libc::c_int, group: bool, ignored: bool, dest: &str| {
+        let _ = std::fs::remove_file(&started);
+        let _ = std::fs::remove_file(&go);
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in *\" {} \"*) : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done;; esac\nexec git \"$@\"\n",
+            step,
+            started.display(),
+            go.display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new(j_bin());
+        command
+            .args(["clone", remote, dest])
+            .current_dir(&work)
+            .env("XDG_CONFIG_HOME", &env.cfg)
+            .env("NO_COLOR", "1")
+            .env("J_GIT", &wrapper)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        // an ignored signal stays ignored across exec; SIGQUIT dumps no core
+        unsafe {
+            command.pre_exec(move || {
+                if ignored {
+                    libc::signal(sig, libc::SIG_IGN);
+                }
+                libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        while !started.exists() {
+            assert!(child.try_wait().unwrap().is_none(), "ended before {} started", step);
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { libc::kill(if group { -pid } else { pid }, sig) }, 0);
+        // `j` takes the signal before its git can go on
+        while signal_pending(pid, sig) && child.try_wait().unwrap().is_none() {
+            std::thread::yield_now();
+        }
+        std::fs::write(&go, "").unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out.status, String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    for (step, sig, group, dest) in [
+        ("fetch", libc::SIGINT, true, "a/b/c"),
+        ("fetch", libc::SIGTERM, false, "e"),
+        ("fetch", libc::SIGQUIT, false, "c"),
+        ("ls-remote", libc::SIGHUP, false, "c"),
+    ] {
+        let (status, stderr) = clone(step, sig, group, false, dest);
+        // the DIR it created is gone, its parents too; the one it found
+        // empty is empty
+        assert_eq!(names(&work), ["e"], "{} during {} into {}", sig, step, dest);
+        assert_eq!(names(&work.join("e")), [] as [String; 0], "{} during {}", sig, step);
+        assert_eq!(status.signal(), Some(sig), "{} during {}: {}", sig, step, stderr);
+        // a Ctrl-C stops the git too (here the shell that runs it), and `j`
+        // may take it only once the fetch has failed
+        assert!(
+            stderr.contains("clone interrupted") || group && stderr.contains("fetch failed: git was stopped"),
+            "{}",
+            stderr
+        );
+        // and a retry clones there
+        env.j(&work, &["clone", remote, dest]).ok();
+        assert_eq!(std::fs::read_to_string(work.join(dest).join("a.txt")).unwrap(), "one\n");
+        std::fs::remove_dir_all(work.join(dest.split('/').next().unwrap())).unwrap();
+        std::fs::create_dir_all(work.join("e")).unwrap();
+    }
+    let (status, stderr) = clone("fetch", libc::SIGHUP, true, true, "c");
+    assert!(status.success(), "{}", stderr);
+    assert_eq!(std::fs::read_to_string(work.join("c/a.txt")).unwrap(), "one\n");
+    env.j(&work.join("c"), &["fetch"]).ok();
+}
+
 #[test]
 fn init_over_git_takes_a_directory_it_cannot_scan() {
     // §7.4, §7.8: init over an existing git working tree scans it before

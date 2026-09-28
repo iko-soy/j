@@ -830,9 +830,13 @@ extern "C" fn defer(sig: libc::c_int) {
 /// While it lives, SIGINT, SIGTERM, SIGHUP and SIGQUIT, whichever thread
 /// gets them, only note that they came: it lives from the operation's
 /// publishing until the working copy's state is saved, so that a checkout
-/// the user interrupts completes, leaving the working copy current (§1.3).
-/// Dropping it gives each signal back what it did before, and
-/// `raise_deferred` then acts on one that came.
+/// the user interrupts completes, leaving the working copy current, and
+/// through a clone, which one that comes before the working-copy commit is
+/// made fails (`unless_interrupted`), so that it removes what it made
+/// (§1.3). A signal the process ignores stays ignored, as it does for the
+/// git a clone runs (`nohup j clone`, a background job). Dropping it gives
+/// each signal back what it did before, and `raise_deferred` then acts on
+/// one that came.
 struct Deferral {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
@@ -844,12 +848,17 @@ impl Deferral {
             // SAFETY: the handler only stores to an atomic, which is
             // async-signal-safe; both actions are initialised before use
             unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                    || old.sa_sigaction == libc::SIG_IGN
+                {
+                    continue;
+                }
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = defer as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 action.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&mut action.sa_mask);
-                let mut old: libc::sigaction = std::mem::zeroed();
-                if libc::sigaction(sig, &action, &mut old) == 0 {
+                if libc::sigaction(sig, &action, std::ptr::null_mut()) == 0 {
                     previous.push((sig, old));
                 }
             }
@@ -867,9 +876,10 @@ impl Drop for Deferral {
     }
 }
 
-/// Act on a signal a checkout deferred (§1.3) as it would have acted then:
-/// with its default action, stopping the process, unless it was ignored.
-/// Called once the run has reported what it did.
+/// Act on a signal a checkout or a clone deferred (§1.3) as it would have
+/// acted then: with its default action, stopping the process (`Deferral`
+/// defers no signal the process ignores). Called once the run has reported
+/// what it did.
 pub fn raise_deferred() {
     let sig = DEFERRED.swap(0, std::sync::atomic::Ordering::SeqCst);
     if sig != 0 {
@@ -878,6 +888,20 @@ pub fn raise_deferred() {
         let _ = std::io::stdout().flush();
         // SAFETY: raising a signal whose action `Deferral` gave back
         unsafe { libc::raise(sig) };
+    }
+}
+
+/// `done`, the outcome of a step of a clone, unless a signal to stop came
+/// while `cmd_clone`'s `Deferral` held it off: the clone then fails, before
+/// it records anything, so that it removes what it made (§1.3, §7.8). A
+/// Ctrl-C at the terminal stops the git the step runs too, which fails the
+/// step itself: `j` may take the signal only after that, and then reports
+/// the step's failure.
+fn unless_interrupted<T>(done: Result<T, OpenError>) -> Result<T, OpenError> {
+    if DEFERRED.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        Err((1, "clone interrupted".to_string()))
+    } else {
+        done
     }
 }
 
@@ -2189,6 +2213,10 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
     // those of them a failed clone leaves, as their paths no longer lead
     // to them
     let mut left: Vec<&std::path::Path> = Vec::new();
+    // from here until the clone has removed what it made or completed, a
+    // signal to stop waits, and fails a clone that has not yet made its
+    // working-copy commit (`unless_interrupted`, §1.3)
+    let _held = Deferral::start();
     if !existed {
         // DIR and its missing parents, DIR first ("" is the current
         // directory, which exists)
@@ -2360,16 +2388,26 @@ fn clone_into(
     };
     let origin = RemoteName::new("origin");
     let mut tx = backend.current_repo().start_transaction();
-    jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
-        .map_err(|e| (1, format!("cannot set the remote: {}", e)))?;
-    backend.git_fetch_refs(tx.repo_mut(), origin)?;
-    let default_branch =
-        git_default_branch(git_backend(tx.repo().store())?.git_repo_path(), origin)?;
+    // a signal to stop fails each step before the working-copy commit's
+    // (§1.3)
+    unless_interrupted(
+        jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
+            .map_err(|e| (1, format!("cannot set the remote: {}", e))),
+    )?;
+    unless_interrupted(backend.git_fetch_refs(tx.repo_mut(), origin))?;
+    let default_branch = unless_interrupted(git_default_branch(
+        git_backend(tx.repo().store())?.git_repo_path(),
+        origin,
+    ))?;
     let import_options = backend.git_import_options()?;
-    block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
-        .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
-    block_on(tx.repo_mut().rebase_descendants())
-        .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
+    unless_interrupted(
+        block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+            .map_err(|e| (1, format!("cannot import the fetched refs: {}", e))),
+    )?;
+    unless_interrupted(
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| (1, format!("cannot rebase descendants: {}", e))),
+    )?;
     // §7.8: the default bookmark's target (none when the remote's HEAD names
     // no branch, or a branch it does not have)
     let head = default_branch.and_then(|name| {
@@ -2580,13 +2618,19 @@ fn git_fetch_subprocess(git_dir: &std::path::Path, remote: &RemoteName) -> Resul
     if out.status.success() {
         Ok(())
     } else {
-        Err((
-            1,
-            format!(
-                "fetch failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ))
+        Err((1, format!("fetch failed: {}", git_failure(&out))))
+    }
+}
+
+/// What a git that failed said, or how it ended when it said nothing (a
+/// Ctrl-C stops it silently)
+fn git_failure(out: &std::process::Output) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match (said.is_empty(), out.status.signal()) {
+        (false, _) => said,
+        (true, Some(sig)) => format!("git was stopped by signal {}", sig),
+        (true, None) => format!("git exited with status {}", out.status.code().unwrap_or(-1)),
     }
 }
 
@@ -2606,13 +2650,7 @@ fn git_default_branch(
         .output()
         .map_err(|e| (1, format!("cannot run git ls-remote: {}", e)))?;
     if !out.status.success() {
-        return Err((
-            1,
-            format!(
-                "cannot read the remote's default branch: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ));
+        return Err((1, format!("cannot read the remote's default branch: {}", git_failure(&out))));
     }
     // `ref: refs/heads/<branch>\tHEAD`
     Ok(String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
