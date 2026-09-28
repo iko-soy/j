@@ -200,12 +200,18 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             if words.len() != 2 && words.len() != 3 {
                 return err(2, "usage: j clone URL [DIR]");
             }
-            let (cfg, _) = or_exit(load_config_file());
             let dir = if words.len() == 3 {
                 words[2].to_string()
             } else {
-                default_clone_dir(words[1])
+                match default_clone_dir(words[1]) {
+                    Some(dir) => dir,
+                    None => {
+                        let msg = format!("`{}` names no directory to clone into; give one: j clone URL DIR", words[1]);
+                        return err(2, msg);
+                    }
+                }
             };
+            let (cfg, _) = or_exit(load_config_file());
             match j::jj::cmd_clone(&cfg, words[1], &dir) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => err(e.0, e.1),
@@ -279,9 +285,24 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
     }
 }
 
-fn default_clone_dir(url: &str) -> String {
-    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo");
-    last.strip_suffix(".git").unwrap_or(last).to_string()
+/// `clone`'s default DIR (§1.1): the last component of `url`'s path, a
+/// final `.git` component skipped, minus `.git`, as `git clone` names it;
+/// in an scp-style `host:repo.git`, what follows the `:`. None when that
+/// leaves no name.
+fn default_clone_dir(url: &str) -> Option<String> {
+    let mut path = url.trim_end_matches('/');
+    if let Some(repo) = path.strip_suffix("/.git") {
+        path = repo.trim_end_matches('/');
+    }
+    let last = match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path.rsplit(':').next().unwrap_or(path),
+    };
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    match name {
+        "" | "." | ".." => None,
+        name => Some(name.to_string()),
+    }
 }
 
 fn or_exit<T>(r: Result<T, u8>) -> T {

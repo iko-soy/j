@@ -1984,6 +1984,43 @@ fn clone_default_dir_name() {
     assert!(dest.join(".jj").exists(), "no clone at {}", dest.display());
 }
 
+#[test]
+fn clone_names_its_directory_after_the_repository() {
+    // §7.8: the default DIR was what followed the URL's last `/`, minus
+    // `.git`: empty for `<repo>/.git`, so the clone failed with "cannot
+    // create : …" (" already contains a jj repository" inside one), and
+    // `host:repo` for an scp-style `host:repo.git`
+    let env = setup();
+    let proj = env.dir.join("proj");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), proj.to_str().unwrap()]);
+    for (i, url) in [format!("{}/.git", proj.display()), format!("{}/.git/", proj.display())].iter().enumerate() {
+        let work = env.dir.join(format!("work{}", i));
+        std::fs::create_dir(&work).unwrap();
+        env.j(&work, &["clone", url]).ok();
+        assert_eq!(std::fs::read_to_string(work.join("proj/a.txt")).unwrap(), "one\n");
+    }
+    // `host:repo.git`, through an ssh that runs the command here
+    let work = env.dir.join("scp");
+    std::fs::create_dir(&work).unwrap();
+    git(&env.dir, &["clone", "-q", "--bare", env.remote.to_str().unwrap(), work.join("r.git").to_str().unwrap()]);
+    let ssh = env.dir.join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nshift\nexec sh -c \"git ${1#git-}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let vars = [("GIT_SSH_COMMAND", ssh.as_path()), ("GIT_SSH_VARIANT", std::path::Path::new("simple"))];
+    env.j_env(&work, &["clone", "MyHost:r.git"], &vars).ok();
+    assert_eq!(std::fs::read_to_string(work.join("r/a.txt")).unwrap(), "one\n");
+    // a URL that names no directory needs DIR
+    let work = env.dir.join("none");
+    std::fs::create_dir(&work).unwrap();
+    for url in ["/", "..", "MyHost:"] {
+        let out = env.j(&work, &["clone", url]);
+        assert_eq!(out.code, 2, "{}: {}", url, out.stderr);
+        assert!(out.stderr.contains("j clone URL DIR"), "{}: {}", url, out.stderr);
+    }
+    assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+}
+
 /// The reference config.j as a user copied it before `commits` became the
 /// builtin `subtreeCommits`, as it was then byte for byte: it declares no
 /// such builtin, and defines `commits` and `ancestors` recursively.

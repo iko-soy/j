@@ -57,7 +57,7 @@ eight reserved words below, the whole text is a reserved command.
 | command | operation |
 |---|---|
 | `init` | create a repository in the current directory; §7.8 |
-| `clone URL [DIR]` | clone `URL` into `DIR` (default: last path component of `URL`, minus `.git`); §7.8 |
+| `clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name in `URL`); §7.8 |
 | `remote URL` | set the URL of the remote `origin`, creating it if absent; §7.8 |
 | `fetch` | fetch from `origin`; §7.6 |
 | `push EXPR` | set or delete the remote bookmarks that `EXPR` selects; §7.6 |
@@ -1285,8 +1285,12 @@ that state, §7.2 applies.
   then empty, or empties the `DIR` it found empty, and nothing else. It
   removes or empties each only while its path still leads to that directory,
   so a symlink put in its place, or in place of a directory above it, is not
-  followed: a path that leads elsewhere is left, and the error names it. It
-  requires `user`.
+  followed: a path that leads elsewhere is left, and the error names it.
+  Without `DIR`, it is the repository's name in `URL`, as `git clone` names
+  it: the last component of `URL`'s path, a final `.git` component skipped,
+  minus `.git` (`repo` for `/srv/repo/.git`, `host:repo.git` and
+  `https://host/team/repo`); a `URL` that leaves no name, such as `/` or
+  `..`, is a usage error asking for `DIR`. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
