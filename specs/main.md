@@ -44,6 +44,9 @@ echo EXPRESSION | j
 4. If neither is present, print a one-line usage message to stderr and exit 2.
 5. `j` accepts no flags. Any argument, including ones beginning with `-`, is
    part of the expression.
+6. The expression is text: an argument that is not valid UTF-8 is a usage
+   error (exit 2) naming it, and so is an expression on standard input that
+   is not.
 
 ### 1.1 Reserved commands
 
@@ -54,7 +57,7 @@ eight reserved words below, the whole text is a reserved command.
 | command | operation |
 |---|---|
 | `init` | create a repository in the current directory; §7.8 |
-| `clone URL [DIR]` | clone `URL` into `DIR` (default: last path component of `URL`, minus `.git`); §7.8 |
+| `clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name in `URL`); §7.8 |
 | `remote URL` | set the URL of the remote `origin`, creating it if absent; §7.8 |
 | `fetch` | fetch from `origin`; §7.6 |
 | `push EXPR` | set or delete the remote bookmarks that `EXPR` selects; §7.6 |
@@ -1134,9 +1137,14 @@ loaded from a stored tree, its own or another's (`new` gives the child its
 parent's), with that tree as jj stored it, pairs of sides that cancel and
 conflict labels included (§7.3), as jj's own `new` and `describe` keep a
 tree: one built from the files could be another tree for the same files.
-A persisting run then reads the files of the focus, of the commits it
-writes with other files, and of those whose files it compares with a tree
-they were not loaded from, but not those of the rest of the history.
+For the same reason a commit step 4 writes whose files are its parent's,
+as `squash`, `rebase` or `abandon` can leave a commit whose files they
+build anew, is written with the parent's tree, labels included, as jj's
+own `squash` or `rebase` leaves a commit it empties: jj takes a commit for
+empty only where its tree is its parent's. A persisting run then reads the
+files of the focus, of the commits it writes with other files, and of
+those whose files it compares with a tree they were not loaded from, but
+not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 
@@ -1289,8 +1297,12 @@ that state, §7.2 applies.
   then empty, or empties the `DIR` it found empty, and nothing else. It
   removes or empties each only while its path still leads to that directory,
   so a symlink put in its place, or in place of a directory above it, is not
-  followed: a path that leads elsewhere is left, and the error names it. It
-  requires `user`.
+  followed: a path that leads elsewhere is left, and the error names it.
+  Without `DIR`, it is the repository's name in `URL`, as `git clone` names
+  it: the last component of `URL`'s path, a final `.git` component skipped,
+  minus `.git` (`repo` for `/srv/repo/.git`, `host:repo.git` and
+  `https://host/team/repo`); a `URL` that leaves no name, such as `/` or
+  `..`, is a usage error asking for `DIR`. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
@@ -1298,16 +1310,22 @@ that state, §7.2 applies.
 and no `host:` before its first `/`) as the absolute path it names from the
 current directory, symlinks resolved, as `jj git clone` does (`git clone`
 stores it absolute too), so that `fetch` and `push` reach it from wherever
-they run; any other `URL` is stored unresolved. A `URL` that cannot be
-parsed, or a path that cannot be resolved, is a usage error (exit 2) that
-changes nothing.
+they run. A local path that begins with `~` (`~/x.git`, `~user/x.git`) is
+stored as given, since git expands it to that home directory on every
+`fetch` and `push`; `./~/x.git` names a directory called `~`. Any other
+`URL` is stored unresolved. A `URL` that cannot be parsed, or a path that
+cannot be resolved or whose absolute path is not UTF-8, is a usage error
+(exit 2) that changes nothing. `fetch` and `push` run git from the top of
+the workspace, as git runs from the top of its working tree, so a relative
+local path stored some other way (by `git remote add`, say) is resolved
+from there, whichever directory they run in.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
-at most one operation, described `init` and `clone URL` (`URL` as stored),
-holding what they imported and the working-copy commit; `undo` never undoes
-it (§7.7). That commit holds its parent's files less any at a path a
-checkout cannot create (§7.5 step 1), such as a committed `.jj` directory:
-their removal is its change.
+at most one operation, described `init` and `clone URL` (`URL` as given, a
+local path as stored), holding what they imported and the working-copy
+commit; `undo` never undoes it (§7.7). That commit holds its parent's files
+less any at a path a checkout cannot create (§7.5 step 1), such as a
+committed `.jj` directory: their removal is its change.
 
 ### 7.9 Identity
 
@@ -1329,9 +1347,11 @@ program.
    inherited unchanged, except: if `DFT_COLOR` is unset and `j`'s stdout is a
    terminal, set `DFT_COLOR=always`; if `DFT_WIDTH` is unset and `j`'s stdout
    is a terminal, set it to the terminal width.
-3. Capture stdout. Delete the temporary directory.
+3. Capture stdout; the program's stderr is `j`'s own, so what it says there
+   reaches the user. Delete the temporary directory.
 4. Return stdout as `Text`. A non-zero exit status is not an error (difftastic
-   uses it to signal "differences found" under some options); a failure to
+   uses it to signal "differences found" under some options), so what a
+   `difft` that fails printed, even nothing, is the result; a failure to
    execute the program is a crash naming it.
 
 All rendering options are difftastic's own, set through its `DFT_*`
@@ -2059,7 +2079,8 @@ diffs = \repo ->
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
 -- readable in the terminal. A focus that changes nothing reads "no changes";
--- a diff that cannot be rendered (no difft on PATH) is a crash saying so.
+-- a difft that cannot be run (not on PATH) is a crash saying so, and
+-- otherwise whatever difft prints, even nothing, is the page.
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo

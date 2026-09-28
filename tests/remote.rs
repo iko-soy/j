@@ -120,11 +120,17 @@ fn setup() -> Env {
 
 impl Env {
     fn j(&self, workdir: &PathBuf, args: &[&str]) -> Out {
+        self.j_env(workdir, args, &[])
+    }
+
+    /// `j` with `vars` added to its environment
+    fn j_env(&self, workdir: &PathBuf, args: &[&str], vars: &[(&str, &std::path::Path)]) -> Out {
         let out = Command::new(j_bin())
             .args(args)
             .current_dir(workdir)
             .env("XDG_CONFIG_HOME", &self.cfg)
             .env("NO_COLOR", "1")
+            .envs(vars.iter().copied())
             .output()
             .unwrap();
         Out {
@@ -1713,6 +1719,12 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
     env.j(&work, &["clone", &format!("../../{}", name), "c"]).ok();
     let c = work.join("c");
     same_dir(&stored(&c), &env.remote);
+    // the clone's operation is described with the path as stored
+    let described = |dir: &PathBuf, url: &str| {
+        let ops = env.j(dir, &["ops"]).ok().stdout;
+        assert!(ops.lines().any(|l| l.ends_with(&format!("  clone {}", url))), "{}", ops);
+    };
+    described(&c, &stored(&c));
     env.j(&c, &["fetch"]).ok();
     std::fs::write(c.join("b.txt"), "b\n").unwrap();
     env.j(&c, &["describe \"b\""]).ok();
@@ -1736,6 +1748,16 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
         env.j(&c, &["remote", url]).ok();
         assert_eq!(stored(&c), url);
     }
+    // any other URL is described as given, which git may store otherwise
+    // (it lowercases a host): an ssh that runs the command here
+    let ssh = env.dir.join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nshift\nexec sh -c \"git ${1#git-}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let url = format!("MyHost:{}", env.remote.display());
+    let vars = [("GIT_SSH_COMMAND", ssh.as_path()), ("GIT_SSH_VARIANT", std::path::Path::new("simple"))];
+    env.j_env(&work, &["clone", &url, "s"], &vars).ok();
+    described(&work.join("s"), &url);
     // a URL that cannot be parsed is a usage error, which changes nothing
     let bad = "ssh://example.com:port/project.git";
     let out = env.j(&c, &["remote", bad]);
@@ -1744,6 +1766,100 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
     let out = env.j(&work, &["clone", bad, "d"]);
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert!(!work.join("d").exists());
+}
+
+#[test]
+fn a_relative_remote_is_reached_from_a_subdirectory() {
+    // §7.8: an origin stored relative (by git, or by j before it resolved
+    // local paths) was resolved against the directory j ran in, so fetch
+    // and push failed from a subdirectory with "Could not find
+    // repository"; git resolves it from the top of the working tree
+    let env = setup();
+    let g = env.dir.join("g");
+    std::fs::create_dir(&g).unwrap();
+    git(&g, &["init", "-q", "."]);
+    let name = env.remote.file_name().unwrap().to_str().unwrap();
+    git(&g, &["remote", "add", "origin", &format!("../../{}", name)]);
+    env.j(&g, &["init"]).ok();
+    let sub = g.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    env.j(&sub, &["fetch"]).ok();
+    assert!(env.j(&g, &["tree"]).ok().stdout.contains("master"));
+    std::fs::write(g.join("b.txt"), "b\n").unwrap();
+    env.j(&sub, &["describe \"b\""]).ok();
+    env.j(&sub, &["push (label \"feature\" here)"]).ok();
+    git(&env.remote, &["rev-parse", "--verify", "-q", "refs/heads/feature"]);
+    // the push records where the bookmark went
+    let out = env.j(&sub, &["\\r -> (focus r).labels"]).ok();
+    assert!(out.stdout.contains("feature"), "{}", out.stdout);
+}
+
+#[test]
+fn a_local_remote_under_home_is_stored_as_given() {
+    // §7.8: a `~` the shell did not expand (`j 'remote ~/r.git'`, or any
+    // URL on stdin) was resolved as a directory named `~` in the current
+    // one, so every later fetch and push failed with "Could not find
+    // repository"; git expands it to the home directory on each fetch and
+    // push, wherever it runs, so it is stored as given
+    let env = setup();
+    let home = env.dir.join("home");
+    std::fs::create_dir(&home).unwrap();
+    git(&env.dir, &["clone", "-q", "--bare", env.remote.to_str().unwrap(), home.join("r.git").to_str().unwrap()]);
+    let vars = [("HOME", home.as_path())];
+    let stored = |dir: &PathBuf| git(dir, &["config", "--get", "remote.origin.url"]).trim().to_string();
+    let work = env.dir.join("work");
+    std::fs::create_dir(&work).unwrap();
+    env.j_env(&work, &["clone", "~/r.git", "c"], &vars).ok();
+    let c = work.join("c");
+    assert_eq!(stored(&c), "~/r.git");
+    assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "one\n");
+    // set from the top, used from a subdirectory
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), "d"]).ok();
+    let d = env.dir.join("d");
+    env.j_env(&d, &["remote ~/r.git"], &vars).ok();
+    assert_eq!(stored(&d), "~/r.git");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("b.txt"), "b\n").unwrap();
+    env.j(&d, &["describe \"b\""]).ok();
+    env.j_env(&d.join("sub"), &["push (label \"feature\" here)"], &vars).ok();
+    git(&home.join("r.git"), &["rev-parse", "--verify", "-q", "refs/heads/feature"]);
+    env.j_env(&d.join("sub"), &["fetch"], &vars).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_local_remote_whose_path_is_not_utf8_is_refused() {
+    // §7.8: a relative local path resolved into a directory whose name is
+    // not UTF-8 was stored as typed, as jj-lib's add_remote takes UTF-8,
+    // and then every fetch and push from anywhere else failed with "Could
+    // not find repository"; it is a usage error that changes nothing
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let env = setup();
+    let nu = env.dir.join(OsStr::from_bytes(b"nu\xff"));
+    if std::fs::create_dir(&nu).is_err() {
+        // a filesystem that takes only UTF-8 names (APFS) cannot hold one
+        return;
+    }
+    let status = Command::new("git")
+        .args(["clone", "-q", "--bare"])
+        .arg(&env.remote)
+        .arg(nu.join("r.git"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = env.j(&nu, &["clone", "r.git", "c"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("not UTF-8"), "{}", out.stderr);
+    assert!(!nu.join("c").exists());
+    // `remote` from a clone in that directory
+    env.j(&nu, &["clone", env.remote.to_str().unwrap(), "d"]).ok();
+    let d = nu.join("d");
+    let before = git(&d, &["config", "--get", "remote.origin.url"]);
+    let out = env.j(&d, &["remote", "../r.git"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(git(&d, &["config", "--get", "remote.origin.url"]), before);
+    env.j(&d, &["fetch"]).ok();
 }
 
 #[test]
@@ -1919,6 +2035,43 @@ fn clone_default_dir_name() {
         .to_string();
     let dest = workdir.join(&name);
     assert!(dest.join(".jj").exists(), "no clone at {}", dest.display());
+}
+
+#[test]
+fn clone_names_its_directory_after_the_repository() {
+    // §7.8: the default DIR was what followed the URL's last `/`, minus
+    // `.git`: empty for `<repo>/.git`, so the clone failed with "cannot
+    // create : …" (" already contains a jj repository" inside one), and
+    // `host:repo` for an scp-style `host:repo.git`
+    let env = setup();
+    let proj = env.dir.join("proj");
+    git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), proj.to_str().unwrap()]);
+    for (i, url) in [format!("{}/.git", proj.display()), format!("{}/.git/", proj.display())].iter().enumerate() {
+        let work = env.dir.join(format!("work{}", i));
+        std::fs::create_dir(&work).unwrap();
+        env.j(&work, &["clone", url]).ok();
+        assert_eq!(std::fs::read_to_string(work.join("proj/a.txt")).unwrap(), "one\n");
+    }
+    // `host:repo.git`, through an ssh that runs the command here
+    let work = env.dir.join("scp");
+    std::fs::create_dir(&work).unwrap();
+    git(&env.dir, &["clone", "-q", "--bare", env.remote.to_str().unwrap(), work.join("r.git").to_str().unwrap()]);
+    let ssh = env.dir.join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nshift\nexec sh -c \"git ${1#git-}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let vars = [("GIT_SSH_COMMAND", ssh.as_path()), ("GIT_SSH_VARIANT", std::path::Path::new("simple"))];
+    env.j_env(&work, &["clone", "MyHost:r.git"], &vars).ok();
+    assert_eq!(std::fs::read_to_string(work.join("r/a.txt")).unwrap(), "one\n");
+    // a URL that names no directory needs DIR
+    let work = env.dir.join("none");
+    std::fs::create_dir(&work).unwrap();
+    for url in ["/", "..", "MyHost:"] {
+        let out = env.j(&work, &["clone", url]);
+        assert_eq!(out.code, 2, "{}: {}", url, out.stderr);
+        assert!(out.stderr.contains("j clone URL DIR"), "{}: {}", url, out.stderr);
+    }
+    assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
 }
 
 /// The reference config.j as a user copied it before `commits` became the

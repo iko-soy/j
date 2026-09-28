@@ -534,7 +534,9 @@ diff (blob "a\nb\n") (blob "a\nc\n")
 `difft p a b` renders the comparison with **difftastic**, treating the input
 as the file `p` (its last component guides language detection). Needs `difft`
 on `PATH` (the Nix package provides it); options via `DFT_*` environment
-variables. Crashes naming the tool if absent.
+variables. Crashes naming the tool if absent. A `difft` that runs and fails
+is not an error: what it printed, even nothing, is the result, and what it
+says on stderr reaches the terminal.
 
 ### `treeWith` — the history tree
 
@@ -1061,8 +1063,9 @@ rendered by difftastic, one record per changed path. (Replace `difft` with
 
 **`review : Repo -> Text`** — the same, as one page of text, or
 `"no changes\n"` when the focus changes nothing. A `Text` result prints raw,
-so `j review` is readable in the terminal. Like `diffs`, it crashes when a
-change cannot be rendered, as when `difft` is not on `PATH`.
+so `j review` is readable in the terminal. Like `diffs`, it crashes when
+`difft` cannot be run (not on `PATH`); otherwise whatever `difft` prints,
+even nothing, is the page, and what it says on stderr reaches the terminal.
 
 ```
 j 'review'              -- the focus's changes, as difftastic renders them

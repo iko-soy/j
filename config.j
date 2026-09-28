@@ -554,7 +554,8 @@ diffs = \repo ->
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
 -- readable in the terminal. A focus that changes nothing reads "no changes";
--- a diff that cannot be rendered (no difft on PATH) is a crash saying so.
+-- a difft that cannot be run (not on PATH) is a crash saying so, and
+-- otherwise whatever difft prints, even nothing, is the page.
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo

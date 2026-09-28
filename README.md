@@ -430,7 +430,7 @@ repositories, move refs, and walk the operation log. None take flags.
 | command | what it does |
 |---|---|
 | `j init` | create a colocated `.jj`/`.git` repository here (adopting an existing `.git`) |
-| `j clone URL [DIR]` | clone `URL` into `DIR` (default: last path component, minus `.git`) |
+| `j clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name, as `git clone` picks it) |
 | `j remote URL` | set `origin`'s URL |
 | `j fetch` | fetch from `origin` |
 | `j push EXPR` | evaluate `EXPR` to push/drop records and push them |

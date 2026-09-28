@@ -132,18 +132,25 @@ fn stdin_is_ready(ms: i32) -> bool {
 }
 
 fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // §1: an expression is text, so an argument that is not UTF-8 is a
+    // usage error (`std::env::args` would panic on it)
+    let args: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+        Ok(args) => args,
+        Err(a) => return err(2, format!("argument is not valid UTF-8: {:?}", a)),
+    };
     // §1: stdin vs arguments. With no arguments the expression comes from
     // stdin, so reading to end-of-input is the whole point. With arguments,
     // stdin is only read to report the "both" error — and reading it blindly
     // hangs whenever the process inherited a pipe nobody is writing to (a
     // shell loop, a CI step), so wait only briefly for input to appear.
-    let mut stdin_content = String::new();
+    // Bytes that are not UTF-8 are input too, and an error only once they
+    // are the expression.
+    let mut stdin_content = Vec::new();
     let stdin_has_data = {
         if std::io::stdin().is_terminal() {
             false
         } else if args.is_empty() || stdin_is_ready(50) {
-            match std::io::stdin().read_to_string(&mut stdin_content) {
+            match std::io::stdin().read_to_end(&mut stdin_content) {
                 Ok(n) => n > 0,
                 Err(_) => false,
             }
@@ -155,7 +162,10 @@ fn run() -> ExitCode {
         return err(2, "expression given both as arguments and on stdin");
     }
     let text = if stdin_has_data {
-        stdin_content
+        match String::from_utf8(stdin_content) {
+            Ok(text) => text,
+            Err(_) => return err(2, "the expression on stdin is not valid UTF-8"),
+        }
     } else if !args.is_empty() {
         args.join(" ")
     } else {
@@ -190,12 +200,18 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             if words.len() != 2 && words.len() != 3 {
                 return err(2, "usage: j clone URL [DIR]");
             }
-            let (cfg, _) = or_exit(load_config_file());
             let dir = if words.len() == 3 {
                 words[2].to_string()
             } else {
-                default_clone_dir(words[1])
+                match default_clone_dir(words[1]) {
+                    Some(dir) => dir,
+                    None => {
+                        let msg = format!("`{}` names no directory to clone into; give one: j clone URL DIR", words[1]);
+                        return err(2, msg);
+                    }
+                }
             };
+            let (cfg, _) = or_exit(load_config_file());
             match j::jj::cmd_clone(&cfg, words[1], &dir) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => err(e.0, e.1),
@@ -269,9 +285,24 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
     }
 }
 
-fn default_clone_dir(url: &str) -> String {
-    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo");
-    last.strip_suffix(".git").unwrap_or(last).to_string()
+/// `clone`'s default DIR (§1.1): the last component of `url`'s path, a
+/// final `.git` component skipped, minus `.git`, as `git clone` names it;
+/// in an scp-style `host:repo.git`, what follows the `:`. None when that
+/// leaves no name.
+fn default_clone_dir(url: &str) -> Option<String> {
+    let mut path = url.trim_end_matches('/');
+    if let Some(repo) = path.strip_suffix("/.git") {
+        path = repo.trim_end_matches('/');
+    }
+    let last = match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path.rsplit(':').next().unwrap_or(path),
+    };
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    match name {
+        "" | "." | ".." => None,
+        name => Some(name.to_string()),
+    }
 }
 
 fn or_exit<T>(r: Result<T, u8>) -> T {
