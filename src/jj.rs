@@ -2313,15 +2313,21 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
         return Err((2, format!("{} already exists and is not empty", dir)));
     }
     let existed = dir_path.is_dir();
-    // the directories this run creates, in order: a clone that fails
-    // removes DIR and those of its parents left empty, or an existing DIR's
-    // entries, and nothing else (§7.8).
+    // the directory an existing DIR leads to, through a symlink DIR may be:
+    // a clone that fails empties it only while DIR still leads there (§7.8)
+    let found = if existed { dir_identity(&dir_path, true) } else { None };
+    // the directories this run creates, in order, each with its device and
+    // inode: a clone that fails removes DIR and those of its parents left
+    // empty, or an existing DIR's entries, and nothing else (§7.8).
     // Each is made by `create_dir`, whose success proves it new. The checks
     // above read DIR as written, before its missing parents exist; once
     // they do, `new/..` or `new/../keep` names a directory that was there,
     // so DIR's own `create_dir` failing, AlreadyExists included, refuses it
     // as `git clone` does
-    let mut created: Vec<&std::path::Path> = Vec::new();
+    let mut created: Vec<(&std::path::Path, Option<(u64, u64)>)> = Vec::new();
+    // those of them a failed clone leaves, as their paths no longer lead
+    // to them
+    let mut left: Vec<&std::path::Path> = Vec::new();
     if !existed {
         // DIR and its missing parents, DIR first ("" is the current
         // directory, which exists)
@@ -2333,38 +2339,43 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
             .collect();
         for p in missing.into_iter().rev() {
             match std::fs::create_dir(p) {
-                Ok(()) => created.push(p),
+                Ok(()) => created.push((p, dir_identity(p, false))),
                 // a parent reached again through `..`
                 Err(e)
                     if e.kind() == std::io::ErrorKind::AlreadyExists
                         && p != dir_path
                         && p.is_dir() => {}
                 Err(e) => {
-                    for p in created.iter().rev() {
-                        let _ = std::fs::remove_dir(p);
+                    for &(p, id) in created.iter().rev() {
+                        if !remove_created_dir(p, id, false) {
+                            left.push(p);
+                        }
                     }
-                    return Err((2, format!("cannot create {}: {}", dir, e)));
+                    let msg = format!("cannot create {}: {}", dir, e);
+                    return Err((2, msg + &left_note(&left)));
                 }
             }
         }
     }
     let cloned = clone_into(cfg, &settings, url, &dir_path);
-    if cloned.is_err() {
-        // like `git clone`, a clone that fails leaves nothing behind: its
-        // working-copy commit would claim files the checkout never wrote,
-        // and a later clone would refuse the directory (§7.8)
-        if !existed {
-            // DIR, the last one created, goes whole; a parent holds nothing
-            // of the clone's but DIR, so it goes only if left empty: what
-            // else was put there meanwhile, a sibling clone say, stays
-            for (i, p) in created.iter().enumerate().rev() {
-                let _ = if i + 1 == created.len() {
-                    std::fs::remove_dir_all(p)
-                } else {
-                    std::fs::remove_dir(p)
-                };
+    let Err((code, msg)) = cloned else {
+        return Ok(());
+    };
+    // like `git clone`, a clone that fails leaves nothing behind: its
+    // working-copy commit would claim files the checkout never wrote, and a
+    // later clone would refuse the directory (§7.8)
+    if !existed {
+        // DIR, the last one created, goes whole; a parent holds nothing of
+        // the clone's but DIR, so it goes only if left empty: what else was
+        // put there meanwhile, a sibling clone say, stays
+        for (i, &(p, id)) in created.iter().enumerate().rev() {
+            if !remove_created_dir(p, id, i + 1 == created.len()) {
+                left.push(p);
             }
-        } else if let Ok(entries) = std::fs::read_dir(&dir_path) {
+        }
+        Err((code, msg + &left_note(&left)))
+    } else if found.is_some() && dir_identity(&dir_path, true) == found {
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
             for entry in entries.flatten() {
                 let _ = match entry.file_type() {
                     Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()),
@@ -2372,8 +2383,71 @@ pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
                 };
             }
         }
+        Err((code, msg))
+    } else if dir_path.symlink_metadata().is_ok() {
+        // a symlink put in place of DIR, or of a directory above it, would
+        // have `read_dir` list what that names
+        Err((
+            code,
+            format!(
+                "{}; left what `{}` holds, as it is no longer the directory this clone found empty",
+                msg, dir
+            ),
+        ))
+    } else {
+        Err((code, msg))
     }
-    cloned
+}
+
+/// The device and inode of the directory at `path`, following a symlink
+/// there only when `follow` says so; `None` when `path` holds no directory
+fn dir_identity(path: &std::path::Path, follow: bool) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    };
+    meta.ok().filter(|m| m.is_dir()).map(|m| (m.dev(), m.ino()))
+}
+
+/// Remove the directory a failed clone created at `path`, `whole` or only
+/// if empty, while `path` still leads to it: the directory whose device and
+/// inode `id` were read on creating it (§7.8). A symlink put in its place,
+/// or in place of a directory above it, would have the removal follow it
+/// and delete what that names, so a path leading anywhere else is left, and
+/// the result is false. One leading nowhere holds nothing to remove.
+fn remove_created_dir(path: &std::path::Path, id: Option<(u64, u64)>, whole: bool) -> bool {
+    if id.is_some() && dir_identity(path, false) == id {
+        let _ = if whole {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_dir(path)
+        };
+        true
+    } else {
+        path.symlink_metadata().is_err()
+    }
+}
+
+/// What a failed clone's error adds for the directories it created and
+/// `left` (§7.8): nothing when it left none
+fn left_note(left: &[&std::path::Path]) -> String {
+    let named = |ps: &[&std::path::Path]| {
+        ps.iter().map(|p| format!("`{}`", p.display())).collect::<Vec<_>>().join(", ")
+    };
+    match left {
+        [] => String::new(),
+        [one] => format!(
+            "; left {}, as it is no longer the directory this clone created",
+            named(&[one])
+        ),
+        [init @ .., last] => format!(
+            "; left {} and {}, as they are no longer the directories this clone created",
+            named(init),
+            named(&[last])
+        ),
+    }
 }
 
 /// `clone`'s work once `dir_path` exists and is empty (§7.8)

@@ -486,6 +486,71 @@ fn failed_clone_removes_only_the_directories_it_created() {
 }
 
 #[test]
+fn failed_clone_does_not_follow_a_symlink_put_in_place_of_its_directories() {
+    // §7.8: a failed clone removed DIR with `remove_dir_all` and emptied a
+    // DIR it had found empty through `read_dir`, each by its path. A symlink
+    // put in place of a parent it created, or of the DIR it found empty,
+    // while the clone ran had that cleanup follow it and delete what the
+    // symlink names: `outside/c` and `outside/keep.txt` here. One put in
+    // place of the DIR it created was removed. A path that no longer holds
+    // the directory the clone created or found is now left, and the error
+    // names it.
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup();
+    let work = env.dir.join("work");
+    let outside = env.dir.join("outside");
+    let moved = env.dir.join("moved");
+    let wrapper = env.dir.join("git-fetch-swaps");
+    for (dest, swap, named) in [
+        // a parent it created, through which DIR now leads elsewhere too
+        ("a/b/c", "a/b", "left `a/b/c` and `a/b`, as they are no longer the directories this clone created"),
+        // the DIR it created
+        ("a/b/c", "a/b/c", "left `a/b/c`, as it is no longer the directory this clone created"),
+        // the DIR it found empty
+        ("e", "e", "left what `e` holds, as it is no longer the directory this clone found empty"),
+    ] {
+        for d in [&work, &outside, &moved] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir(outside.join("c")).unwrap();
+        std::fs::write(outside.join("keep.txt"), "k\n").unwrap();
+        std::fs::write(outside.join("c/keep.txt"), "k\n").unwrap();
+        if dest == "e" {
+            std::fs::create_dir(work.join("e")).unwrap();
+        }
+        // the `git` that fetches puts the symlink in place, then fails
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in *\" fetch \"*) mv '{}' '{}' && ln -s '{}' '{}'; exit 1;; esac\nexec git \"$@\"\n",
+            work.join(swap).display(),
+            moved.join("was").display(),
+            outside.display(),
+            work.join(swap).display(),
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new(j_bin())
+            .args(["clone", env.remote.to_str().unwrap(), dest])
+            .current_dir(&work)
+            .env("XDG_CONFIG_HOME", &env.cfg)
+            .env("NO_COLOR", "1")
+            .env("J_GIT", &wrapper)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr);
+        assert!(stderr.contains("fetch failed"), "{}", stderr);
+        assert!(stderr.contains(named), "{} in place of {}: {}", swap, dest, stderr);
+        assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "k\n", "{}", swap);
+        assert_eq!(std::fs::read_to_string(outside.join("c/keep.txt")).unwrap(), "k\n", "{}", swap);
+        assert!(work.join(swap).symlink_metadata().unwrap().is_symlink(), "{}", swap);
+        // what the clone had made is where the symlink moved it to
+        assert!(moved.join("was").is_dir(), "{}", swap);
+    }
+    std::fs::remove_dir_all(&work).unwrap();
+}
+
+#[test]
 fn init_over_git_takes_a_directory_it_cannot_scan() {
     // §7.4, §7.8: init over an existing git working tree scans it before
     // checking out, and a directory that scan cannot read (one deeper than

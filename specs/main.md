@@ -1210,7 +1210,10 @@ that state, §7.2 applies.
   bookmark is the branch the remote's `HEAD` names. A clone that fails, its
   checkout included, records nothing and removes the `DIR` it created and each
   parent it created that is then empty, or empties the `DIR` it found empty,
-  and nothing else. It requires `user`.
+  and nothing else. It removes or empties each only while its path still
+  leads to that directory, so a symlink put in its place, or in place of a
+  directory above it, is not followed: a path that leads elsewhere is left,
+  and the error names it. It requires `user`.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
