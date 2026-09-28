@@ -592,9 +592,9 @@ fn files_on_conflicts(
             }
         }
         // the file a checkout wrote, left as it was: it describes the
-        // conflict as it was then, which a scan has since written with
-        // sides that cancel dropped, and a checkout of the same conflict
-        // relabelled writes no file for
+        // conflict as the checkout had it, which the state may since
+        // record otherwise with no file written, as a scan that drops a
+        // pair of sides that cancel, or a reset that only relabels, does
         let states = recorded.get_or_init(|| {
             let (state, saved_at) = loaded.get_or_init(|| saved.load(tree)).as_ref()?;
             Some((state.file_states(), *saved_at))
