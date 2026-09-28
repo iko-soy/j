@@ -1124,19 +1124,20 @@ Within it:
    the checkout wrote there, or at a path the focus adds before the
    checkout got there, and a file a full disk cut short where no file was
    moved aside for it, are conflicts with the focus's content there, so
-   neither is lost; a file the focus changes or removes, saved while the
-   checkout runs but before it reaches that path, is written over, as in
-   jj. The checkout reads no file into the repository and removes none it
-   does not replace: a file it moved aside to write again (§7.4) is put
-   back where it did not get to, and over the start of it that it wrote
-   where it was cut short, and where anything else stands is removed,
-   holding just the focus's content there; an ignored file saved meanwhile
-   where the focus adds one, before the checkout reached it, stays,
-   holding what it held, and the checkout fails, naming it, so that no run
-   reads it; anything inside a nested repository stays too. No uncommitted
-   edit present at the run's snapshot is lost where the checkout writes
-   over it, as the operation holds that snapshot (§7.4). This is the one
-   crash that records anything.
+   neither is lost (at an ignored path, a file a full disk cut short is not
+   read: the next checkout names it as in its way, and `j undo` leaves it);
+   a file the focus changes or removes, saved while the checkout runs but
+   before it reaches that path, is written over, as in jj. The checkout
+   reads no file into the repository and removes none it does not replace:
+   a file it moved aside to write again (§7.4) is put back where it did not
+   get to, and over the start of it that it wrote where it was cut short,
+   and where anything else stands is removed, holding just the focus's
+   content there; an ignored file saved meanwhile where the focus adds one,
+   before the checkout reached it, stays, holding what it held, and the
+   checkout fails, naming it, so that no run reads it; anything inside a
+   nested repository stays too. No uncommitted edit present at the run's
+   snapshot is lost where the checkout writes over it, as the operation
+   holds that snapshot (§7.4). This is the one crash that records anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
