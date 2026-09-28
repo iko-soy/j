@@ -1787,7 +1787,10 @@ fn a_local_remote_whose_path_is_not_utf8_is_refused() {
     use std::os::unix::ffi::OsStrExt;
     let env = setup();
     let nu = env.dir.join(OsStr::from_bytes(b"nu\xff"));
-    std::fs::create_dir(&nu).unwrap();
+    if std::fs::create_dir(&nu).is_err() {
+        // a filesystem that takes only UTF-8 names (APFS) cannot hold one
+        return;
+    }
     let status = Command::new("git")
         .args(["clone", "-q", "--bare"])
         .arg(&env.remote)
