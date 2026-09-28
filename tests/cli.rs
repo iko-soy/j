@@ -1002,6 +1002,19 @@ fn a_checkout_writes_nothing_over_what_the_directory_does_not_track() {
     );
     assert_eq!(std::fs::read_to_string(&aside).unwrap(), secret);
     assert!(!has_blob(&r, secret));
+    // `undo` checks out as persistence does (§7.7)
+    r.j(&[&new_above("A")]).ok();
+    std::fs::rename(&aside, r.dir.join("local.env")).unwrap();
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let out = r.j(&["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("untracked `local.env`"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.read("local.env"), secret);
+    std::fs::rename(r.dir.join("local.env"), &aside).unwrap();
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("local.env"), "COMMITTED=1\n");
+    assert!(!has_blob(&r, secret));
 }
 
 #[test]
