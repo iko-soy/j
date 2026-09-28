@@ -1122,6 +1122,41 @@ fn a_checkout_that_fills_the_disk_is_put_back() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_failed_checkout_that_cannot_be_put_back_records_the_edits_it_overwrote() {
+    // §7.5 step 7: a checkout records nothing until it has completed, so
+    // when one that had written over an uncommitted edit could not be put
+    // back, the edit was in no file and no commit. Here the disk is full:
+    // what the checkout added is removed, but the file it replaced cannot
+    // be written back. The snapshot the run started from is recorded
+    // instead, as `j id` records it.
+    let r = setup();
+    r.write("a.txt", "a\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("a.txt", "my uncommitted edit\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `a.txt` is written before `m`
+    let files = "[{ path = [\"a.txt\"], content = blob \"focus a\\n\" }]";
+    let out = stopped_mid_checkout_as(&r, &slow_failing_edit(files, n), n, fill_disk);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
+    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
+    assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    // what it added is gone, what it replaced is still there
+    assert!(!r.dir.join("m").exists());
+    assert_eq!(r.read("a.txt"), "focus a\n");
+    // the next run records what the directory holds; undoing that gives
+    // the edit back
+    r.j(&["id"]).ok();
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("a.txt"), "my uncommitted edit\n");
+    let texts = r.j(&["\\r -> show (map (\\c -> [c.message (contentAt [\"a.txt\"] c.files)]) (commits (top r)))"]).ok().stdout;
+    assert_eq!(texts.trim(), r#"[["" (blob "")] ["base" (blob "my uncommitted edit\n")]]"#);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn a_put_back_that_something_blocks_says_so() {
     // §7.5 step 7: jj's checkout skips a path something is in the way of
     // without failing, and the put-back did not look, so where it could not
@@ -1148,6 +1183,48 @@ fn a_put_back_that_something_blocks_says_so() {
     assert!(!r.dir.join("m").exists());
     assert!(!r.dir.join("zz").exists());
     assert_eq!(r.read("a/mine"), "mine\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failed_put_back_records_the_edits_of_an_immutable_focus_in_a_child() {
+    // §7.5 step 7, §7.2: when a failed checkout cannot be put back, the
+    // snapshot the run started from is recorded as `j id` records it. An
+    // immutable working-copy commit is not rewritten: a new child of it
+    // holds the snapshot.
+    let r = setup();
+    let cfg = r.cfg.join("j/config.j");
+    let config = std::fs::read_to_string(&cfg).unwrap();
+    let immutable = "immutable = ancestorsOf trunk\n";
+    assert!(config.contains(immutable));
+    let config = config.replace(immutable, "immutable = matching (\\c -> c.message == \"base\") all\n");
+    std::fs::write(&cfg, config).unwrap();
+    r.write("a", "precious\n");
+    r.j(&["describe \"base\""]).ok();
+    r.write("a", "precious, my uncommitted edit\n");
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `a` becomes a directory holding `a/x`, and a file made in it
+    // meanwhile is in the way of writing `a` back
+    let files = "filter (\\e -> e.path /= [\"a\"]) c.files ++ [{ path = [\"a\" \"x\"], content = blob \"x\\n\" }]";
+    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
+        r.write("a/mine", "mine\n");
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("in the way of 1 path"), "{}", out.stderr);
+    assert!(out.stderr.contains("uncommitted edits are recorded"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 1);
+    assert_eq!(r.read("a/mine"), "mine\n");
+    // the next run records what the directory holds; undoing that gives
+    // the edit back, in a child of `base`, which is as it was
+    r.j(&["id"]).ok();
+    r.j(&["undo"]).ok();
+    assert_eq!(r.read("a"), "precious, my uncommitted edit\n");
+    let texts = r.j(&[CONTENT_OF_A]).ok().stdout;
+    assert_eq!(
+        texts.split_whitespace().collect::<Vec<_>>().join(" "),
+        r#"[["" (blob "")] ["base" (blob "precious\n")] ["" (blob "precious, my uncommitted edit\n")]]"#
+    );
 }
 
 #[test]

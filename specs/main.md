@@ -937,8 +937,8 @@ directory.
   changed the commit, that change is part of the operation persisted
   afterwards, or discarded with the rest if nothing is persisted. A crashed
   or printing program leaves the working copy and the repository exactly as
-  before; `j id` is the way to record the working directory and nothing
-  else (§1.2).
+  before (but see §7.5 step 7); `j id` is the way to record the working
+  directory and nothing else (§1.2).
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
@@ -1031,7 +1031,14 @@ Within it:
    directory could not be put back, and the next run records what it
    holds. A path the focus adds inside a nested repository (§7.4) is put
    back the same way, but as no run records what is left there, the crash
-   names such a path when something is left at it.
+   names such a path when something is left at it. Whenever the directory
+   is not put back in full (it changed while the program ran, something
+   is in the way, the put-back itself fails), the changes the run
+   snapshotted from it (§7.4), if any, are recorded alone, as `j id`
+   records them (§7.2), in an operation described
+   `snapshot working copy`, and the crash says so: no uncommitted edit the
+   checkout wrote over is lost. This is the one crash that records
+   anything.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
@@ -1107,7 +1114,7 @@ Bringing work up to date is a separate expression, e.g. `rebase trunk`.
 
 Every persisting `j` program, and each of `fetch` and `push`, records exactly
 one jj operation, described by the expression or command text. Crashes record
-nothing.
+nothing, except as §7.5 step 7 says.
 
 **Kinds.** `j` marks each operation it records, in the operation's metadata,
 as *normal*, *undo* (naming the operation it undid), or *redo* (naming the

@@ -289,6 +289,10 @@ struct PendingSnapshot {
     /// false when the wc commit is immutable: the snapshot then belongs to
     /// the focus's new child (§7.2), and the wc commit is kept as stored
     fold_into_wc: bool,
+    /// the repo at the snapshot's own operation, written but not published:
+    /// a failed checkout that cannot be put back publishes it alone (§7.5
+    /// step 7, `JjBackend::record_snapshot`)
+    repo: Arc<ReadonlyRepo>,
 }
 
 /// How every scan of the working directory reads it (§7.4): each file
@@ -1100,6 +1104,7 @@ impl JjBackend {
             new_wc_id: new_wc.id().clone(),
             tree: new_wc.tree().clone(),
             fold_into_wc: true,
+            repo: new_repo.clone(),
         };
         Ok((new_repo, Some(pending)))
     }
@@ -1343,7 +1348,7 @@ impl JjBackend {
                 }
             }
         };
-        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished)))?;
+        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), pending.as_ref()))?;
 
         Ok(())
     }
@@ -1357,12 +1362,15 @@ impl JjBackend {
     /// leaves the saved state as it was, so the next run snapshots the
     /// directory into the commit it came from; what the checkout had
     /// already written is put back first (`put_back`), when the directory
-    /// held exactly `on_disk`.
+    /// held exactly `on_disk`. When it cannot be, `snapshot`, the one the
+    /// run took, is recorded alone, as the directory may no longer hold
+    /// the uncommitted edits the checkout wrote over.
     async fn checkout(
         &self,
         commit: &Commit,
         on_disk: Option<&Commit>,
         op: Option<UnpublishedOperation>,
+        snapshot: Option<&PendingSnapshot>,
     ) -> Result<(), Crash> {
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
@@ -1441,6 +1449,17 @@ impl JjBackend {
                             "; the working directory may hold part of it and could not be put back: {}",
                             e
                         ));
+                        if let Some(p) = snapshot {
+                            match self.record_snapshot(p).await {
+                                Ok(()) => msg.push_str(
+                                    "; the working directory's uncommitted edits are recorded, as `j id` records them",
+                                ),
+                                Err(e) => msg.push_str(&format!(
+                                    "; nor could the working directory's uncommitted edits be recorded: {}",
+                                    e
+                                )),
+                            }
+                        }
                     }
                 }
                 return Err(Crash::new(msg));
@@ -1453,6 +1472,37 @@ impl JjBackend {
             .await
             .map_err(|e| Crash::new(format!("cannot finish the checkout: {}", e)))?;
         Ok(())
+    }
+
+    /// Record the snapshot `p` alone, as `j id` does (§7.2, §7.4): in the
+    /// working-copy commit, the operation the snapshot already wrote, or,
+    /// where that commit is immutable, in a new child of it. For a failed
+    /// checkout that could not be put back (§7.5 step 7), so that no
+    /// uncommitted edit it wrote over is lost; the working-copy state is
+    /// left as it was, and the next run records what the directory holds.
+    async fn record_snapshot(&self, p: &PendingSnapshot) -> Result<(), String> {
+        let repo = if p.fold_into_wc {
+            p.repo.clone()
+        } else {
+            let mut tx = p.pre_repo.start_transaction();
+            tx.set_is_snapshot(true);
+            let wc = self.wc_commit(&p.pre_repo).await.map_err(|e| e.1)?;
+            let child = tx
+                .repo_mut()
+                .new_commit(vec![wc.id().clone()], p.tree.clone())
+                .write()
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.repo_mut()
+                .set_wc_commit(self.inner.workspace_name.clone(), child.id().clone())
+                .map_err(|e| e.to_string())?;
+            tx.write("snapshot working copy").await.map_err(|e| e.to_string())?.leave_unpublished()
+        };
+        // as `UnpublishedOperation::publish` does
+        let heads = repo.op_heads_store();
+        let _lock = heads.lock().await.map_err(|e| e.to_string())?;
+        let op = repo.operation();
+        heads.update_op_heads(op.parent_ids(), op.id()).await.map_err(|e| e.to_string())
     }
 
     fn user_signature(&self, cfg: &Config) -> Result<Signature, Crash> {
@@ -1878,7 +1928,7 @@ impl JjBackend {
         let wc_commit = block_on(base.store().get_commit_async(wc_id))
             .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
         let on_disk = block_on(self.wc_commit(&base))?;
-        block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished)))
+        block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished), None))
             .map_err(|c| (1, c.msg))?;
         Ok(())
     }
@@ -2205,7 +2255,7 @@ fn create_initial_wc_commit(
             } else {
                 None
             };
-            block_on(backend.checkout(&existing, None, op)).map_err(|c| (1, c.msg))?;
+            block_on(backend.checkout(&existing, None, op, None)).map_err(|c| (1, c.msg))?;
             return Ok(());
         }
         if existing.id() != store.root_commit_id() {
@@ -2245,7 +2295,7 @@ fn create_initial_wc_commit(
     // the files the user deleted there. Anything else is written, and the
     // operation published only once it is (§7.7).
     let on_disk = if adopt { Some(&wc) } else { None };
-    block_on(backend.checkout(&wc, on_disk, Some(unpublished))).map_err(|c| (1, c.msg))?;
+    block_on(backend.checkout(&wc, on_disk, Some(unpublished), None)).map_err(|c| (1, c.msg))?;
     Ok(())
 }
 
