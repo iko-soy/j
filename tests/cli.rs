@@ -557,6 +557,45 @@ fn text_result_prints_raw() {
 }
 
 #[test]
+fn review_says_no_changes_only_when_nothing_changed() {
+    // `review` caught every crash of `diffs` with `or`, so without difft on
+    // PATH it printed "no changes" over a change it could not render
+    let r = setup();
+    // a PATH holding nothing but what the test puts there (the config
+    // directory is removed with the repository)
+    let bin = r.cfg.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let review = |path: &std::path::Path| {
+        let out = Command::new(j_bin())
+            .arg("review")
+            .current_dir(&r.dir)
+            .env("XDG_CONFIG_HOME", &r.cfg)
+            .env("NO_COLOR", "1")
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    };
+    // nothing to render: difft is never run
+    assert_eq!(review(&bin).ok().stdout, "no changes\n");
+    r.write("f", "hello\n");
+    let out = review(&bin);
+    assert_eq!(out.code, 1, "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("cannot execute `difft`"), "{}", out.stderr);
+    // with a difft, each changed path's rendering, in order
+    let stub = bin.join("difft");
+    std::fs::write(&stub, "#!/bin/sh\nprintf '%s -> %s\\n' \"${1##*/}\" \"${2##*/}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    r.write("g", "world\n");
+    assert_eq!(review(&bin).ok().stdout, "old-f -> new-f\nold-g -> new-g\n");
+}
+
+#[test]
 fn closed_stdout_ends_the_display_quietly() {
     // §1.4: a reader that stops early (`j tree | head`) is not a failure;
     // writing into its closed pipe used to panic and exit 101

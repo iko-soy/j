@@ -553,9 +553,12 @@ diffs = \repo ->
   in map (\p -> { path = p, diff = difft p (contentAt p ch.from) (contentAt p ch.to) }) (touched ch)
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
--- readable in the terminal.
+-- readable in the terminal. A focus that changes nothing reads "no changes";
+-- a diff that cannot be rendered (no difft on PATH) is a crash saying so.
 review : Repo -> Text
-review = \repo -> concat (map (\d -> d.diff) (diffs repo)) or "no changes\n"
+review = \repo ->
+  let ds = diffs repo
+  in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
 -- A summary of the focus.
 status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }
