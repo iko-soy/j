@@ -1669,6 +1669,12 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
     env.j(&work, &["clone", &format!("../../{}", name), "c"]).ok();
     let c = work.join("c");
     same_dir(&stored(&c), &env.remote);
+    // the clone's operation is described with the path as stored
+    let described = |dir: &PathBuf, url: &str| {
+        let ops = env.j(dir, &["ops"]).ok().stdout;
+        assert!(ops.lines().any(|l| l.ends_with(&format!("  clone {}", url))), "{}", ops);
+    };
+    described(&c, &stored(&c));
     env.j(&c, &["fetch"]).ok();
     std::fs::write(c.join("b.txt"), "b\n").unwrap();
     env.j(&c, &["describe \"b\""]).ok();
@@ -1692,6 +1698,16 @@ fn a_local_remote_is_stored_resolved_against_the_current_directory() {
         env.j(&c, &["remote", url]).ok();
         assert_eq!(stored(&c), url);
     }
+    // any other URL is described as given, which git may store otherwise
+    // (it lowercases a host): an ssh that runs the command here
+    let ssh = env.dir.join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nshift\nexec sh -c \"git ${1#git-}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let url = format!("MyHost:{}", env.remote.display());
+    let vars = [("GIT_SSH_COMMAND", ssh.as_path()), ("GIT_SSH_VARIANT", std::path::Path::new("simple"))];
+    env.j_env(&work, &["clone", &url, "s"], &vars).ok();
+    described(&work.join("s"), &url);
     // a URL that cannot be parsed is a usage error, which changes nothing
     let bad = "ssh://example.com:port/project.git";
     let out = env.j(&c, &["remote", bad]);

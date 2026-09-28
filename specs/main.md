@@ -1302,11 +1302,11 @@ cannot be resolved or whose absolute path is not UTF-8, is a usage error
 (exit 2) that changes nothing.
 
 Besides jj's own record of the new workspace, `init` and `clone` each record
-at most one operation, described `init` and `clone URL` (`URL` as stored),
-holding what they imported and the working-copy commit; `undo` never undoes
-it (§7.7). That commit holds its parent's files less any at a path a
-checkout cannot create (§7.5 step 1), such as a committed `.jj` directory:
-their removal is its change.
+at most one operation, described `init` and `clone URL` (`URL` as given, a
+local path as stored), holding what they imported and the working-copy
+commit; `undo` never undoes it (§7.7). That commit holds its parent's files
+less any at a path a checkout cannot create (§7.5 step 1), such as a
+committed `.jj` directory: their removal is its change.
 
 ### 7.9 Identity
 
