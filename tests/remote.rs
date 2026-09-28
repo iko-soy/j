@@ -1579,6 +1579,56 @@ fn an_edit_to_a_file_a_fetch_abandoned_is_kept_as_a_conflict() {
 }
 
 #[test]
+fn a_conflict_a_fetch_makes_with_a_directory_side_is_kept_beside_other_edits() {
+    // §7.4, §7.6: `t` replaced the directory `p` of `dir` by a file, which
+    // the working-copy commit edits; the fetch abandons `t` and rebases the
+    // commit onto `dir`, with a conflict at `p` between the edit and
+    // `dir`'s directory, and leaves the working copy stale. The snapshot
+    // took what the directory held at every conflict of its merge that set
+    // a directory against a file, the commit's own included, where the
+    // directory held what the last checkout left: with any other edit
+    // there to record, the conflict was resolved to the local file and
+    // `p/x` dropped from the commit, and a push would have deleted it
+    // upstream. Only a path the directory changed takes what it holds.
+    for edit in [false, true] {
+        let env = setup();
+        let seed = env.dir.join("seed");
+        git(&env.dir, &["clone", "-q", env.remote.to_str().unwrap(), seed.to_str().unwrap()]);
+        std::fs::create_dir(seed.join("p")).unwrap();
+        std::fs::write(seed.join("p/x"), "x\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "dir"]);
+        git(&seed, &["rm", "-rq", "p"]);
+        std::fs::write(seed.join("p"), "p1\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "t"]);
+        git(&seed, &["push", "-q", "origin", "master"]);
+        let w = env.dir.join("w");
+        env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), w.to_str().unwrap()]).ok();
+        std::fs::write(w.join("p"), "mine\n").unwrap();
+        env.j(&w, &["describe \"mine\""]).ok();
+        force_push_dropping_t(&seed);
+        env.j(&w, &["fetch"]).ok();
+        assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "dir");
+        let conflicted = "\\r -> show (conflicted (files r))";
+        assert_eq!(env.j(&w, &[conflicted]).ok().stdout.trim(), r#"[["p"]]"#, "{}", edit);
+        if edit {
+            std::fs::write(w.join("a.txt"), "one\nedited\n").unwrap();
+        }
+        env.j(&w, &["describe \"mine, rebased\""]).ok();
+        assert_eq!(env.j(&w, &[conflicted]).ok().stdout.trim(), r#"[["p"]]"#, "{}", edit);
+        let a = env.j(&w, &["\\r -> text (contentAt [\"a.txt\"] (files r))"]).ok().stdout;
+        assert_eq!(a, if edit { "one\nedited\n" } else { "one\n" });
+        let description = std::fs::read_to_string(w.join("p")).unwrap();
+        assert!(description.starts_with("Conflict:\n") && description.contains("tree"), "{}", description);
+        // the directory holds the focus now, so there is nothing more to record
+        let ops = env.j(&w, &["ops"]).ok().stdout.lines().count();
+        env.j(&w, &["id"]).ok();
+        assert_eq!(env.j(&w, &["ops"]).ok().stdout.lines().count(), ops, "{}", edit);
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn a_fetch_that_replaces_a_symlink_by_a_directory_has_nothing_cleared_through_it() {
     // §7.4, §7.6: the fetch rebases the working-copy commit onto `dir`,

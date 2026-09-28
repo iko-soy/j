@@ -985,18 +985,21 @@ directory.
   and the commit both changed, differently, is a conflict (an edit to a
   file the commit deletes, say), and one where the directory holds what
   the commit does is the commit's (what a checkout cut short had written).
-  A path where that conflict would set a directory against a file, a
-  symlink or nothing (a file the commit changes that the user replaced by
-  a directory, say), which `replay` refuses as one entry cannot list the
-  directory's entries (§7.3), takes what the working directory holds there
-  instead, as over a working copy that is not stale: the commit's change
-  there is left in the operation before. Either way, where the record does not hold one of the commit's
-  conflicts, a file holding what a checkout writes for it is read back as
-  that conflict: exactly its markers, or a description of the same sides,
-  whatever their labels and less any side it both removes and adds. With
-  no change there is nothing to snapshot, and a program that persists
-  writes the focus over the files last checked out as usual. A stale
-  working copy refuses no program.
+  A path that both changed where that conflict would set a directory
+  against a file, a symlink or nothing (a file the commit changes that the
+  user replaced by a directory, say), which `replay` refuses as one entry
+  cannot list the directory's entries (§7.3), takes what the working
+  directory holds there instead, as over a working copy that is not stale:
+  the commit's change there is left in the operation before. A conflict of
+  that kind that the commit itself has (one made by a `fetch` that rebased
+  it, say) stays where the directory has not changed the path, which is
+  the commit's like any other. Either way, where the record does not hold
+  one of the commit's conflicts, a file holding what a checkout writes for
+  it is read back as that conflict: exactly its markers, or a description
+  of the same sides, whatever their labels and less any side it both
+  removes and adds. With no change there is nothing to snapshot, and a
+  program that persists writes the focus over the files last checked out
+  as usual. A stale working copy refuses no program.
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.

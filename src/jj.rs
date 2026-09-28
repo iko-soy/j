@@ -681,7 +681,7 @@ async fn snapshot_tree(
     }
     let base = if same { base.write_tree().await.map_err(err)? } else { state.clone() };
     let merged = MergedTree::merge(Merge::from_removes_adds(
-        vec![(base, "last checkout".to_string())],
+        vec![(base.clone(), "last checkout".to_string())],
         vec![
             (wc.clone(), "working-copy commit".to_string()),
             (scanned.clone(), "working directory".to_string()),
@@ -693,14 +693,20 @@ async fn snapshot_tree(
     // which jj keeps at the path itself, cannot be a blob that lists the
     // directory's entries (§7.3), and a checkout would write jj's
     // description of it in place of what the directory holds there,
-    // removing a directory's files: take what the directory holds, as a
-    // snapshot over a current state does. The commit's change there is
-    // left in the operation before. A tree with no conflict is not walked.
+    // removing a directory's files: where the directory changed the path,
+    // take what it holds, as a snapshot over a current state does. The
+    // commit's change there is left in the operation before. Where the
+    // directory holds what the base does, the merge took the commit's value
+    // as it is, so such a conflict is one the commit already has, and it
+    // stays. A tree with no conflict is not walked.
     let mut kept = MergedTreeBuilder::new(merged.clone());
     let mut mixed = false;
     for (path, value) in merged.conflicts() {
         if value.map_err(err)?.iter().any(|term| matches!(term, Some(TreeValue::Tree(_)))) {
             let held = scanned.path_value(&path).await.map_err(err)?;
+            if held == base.path_value(&path).await.map_err(err)? {
+                continue;
+            }
             kept.set_or_remove(path, held);
             mixed = true;
         }

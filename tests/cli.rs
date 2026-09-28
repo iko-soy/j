@@ -3644,6 +3644,75 @@ fn a_directory_swapped_with_a_file_after_a_failed_checkout_is_kept() {
 }
 
 #[test]
+fn a_conflict_with_a_directory_side_is_kept_where_a_failed_checkout_left_the_path() {
+    // §7.4, §7.7: R's `z` is a conflict between L's deletion of a file and
+    // R's directory in its place. A checkout from O, a child with its own
+    // file `z`, back to R wrote `a` and then failed before it reached `z`.
+    // The snapshot took what the directory held at every conflict of its
+    // merge that set a directory against a file, R's own included, although
+    // the directory held what the last checkout left at `z`: `j undo` was
+    // refused as holding changes not in @, and the next persisting run
+    // recorded O's file into R, its conflict and R's `z/x` gone. Only a
+    // path the directory changed takes what it holds there.
+    let conflicted = "\\r -> show (conflicted (files r))";
+    let goto = |m: &str| format!("goto (matching (\\c -> c.message == \"{}\") all)", m);
+    for undo in [true, false] {
+        let r = setup();
+        r.write("z", "base\n");
+        r.j(&["describe \"P\""]).ok();
+        r.j(&["new"]).ok();
+        std::fs::remove_file(r.dir.join("z")).unwrap();
+        r.j(&["describe \"L\""]).ok();
+        r.j(&["new . goto parents"]).ok();
+        std::fs::remove_file(r.dir.join("z")).unwrap();
+        std::fs::create_dir(r.dir.join("z")).unwrap();
+        r.write("z/x", "x\n");
+        r.j(&["describe \"R\""]).ok();
+        r.j(&["rebase (matching (\\c -> c.message == \"L\") all)"]).ok();
+        assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"z\"]]");
+        assert!(r.read("z").starts_with("Conflict:\n"), "{}", r.read("z"));
+        r.j(&["new"]).ok();
+        r.write("z", "other\n");
+        r.j(&["describe \"O\""]).ok();
+        let log = r.j(&["log"]).ok().stdout;
+        let ops = r.j(&["ops"]).ok().stdout.lines().count();
+        // written in path order: `a`, then the path under `m` fails, before
+        // `z` is reached
+        let edit = format!(
+            "mapRoot (\\c -> c {{ files = c.files ++ [({{ path = [\"a\"], content = blob \"a\\n\" }}) ({{ path = [{}], content = blob \"deep\" }})] }}) . {}",
+            too_deep("m"),
+            goto("R")
+        );
+        let out = r.j(&[&edit]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(out.stderr.contains("the operation is recorded"), "{}", out.stderr);
+        assert_eq!(r.read("a"), "a\n");
+        assert_eq!(r.read("z"), "other\n");
+        assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"z\"]]");
+        if undo {
+            r.j(&["undo"]).ok();
+            assert_eq!(r.j(&["log"]).ok().stdout, log);
+            assert!(!r.dir.join("a").exists());
+            assert_eq!(r.read("z"), "other\n");
+            r.j(&["id"]).ok();
+            assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+            continue;
+        }
+        // the path the checkout failed on is left out of the focus
+        r.j(&["mapRoot (\\c -> c { files = restrict (neg (under ./m)) c.files })"]).ok();
+        assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"z\"]]");
+        assert_eq!(r.j(&[FOCUS_PATHS]).ok().stdout.trim(), "[[\"a\"] [\"z\"]]");
+        let description = r.read("z");
+        assert!(description.starts_with("Conflict:\n") && description.contains("tree"), "{}", description);
+        r.j(&["id"]).ok();
+        assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops + 2);
+        // the child still holds its own file
+        r.j(&[&goto("O")]).ok();
+        assert_eq!(r.read("z"), "other\n");
+    }
+}
+
+#[test]
 fn a_stale_working_copy_without_changes_is_undone_and_redone() {
     // §7.4, §7.7: `undo` and `redo` refuse only a directory holding changes
     // no commit has, and a directory holding what the stale state records
