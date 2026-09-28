@@ -488,7 +488,9 @@ impl Footprint {
 /// in case is out of the way of the file it replaced. Each is removed on
 /// its own rather than by a checkout, which also removes every directory
 /// above that it leaves empty, one that was there before the run too. A
-/// path something is in the way of fails the put-back.
+/// path something is in the way of fails the put-back, and so does one the
+/// focus adds inside a nested repository that is left holding something,
+/// as no run records that.
 async fn put_back(
     wc: &mut dyn LockedWorkingCopy,
     root: &std::path::Path,
@@ -528,6 +530,9 @@ async fn put_back(
     let mut write_back = false;
     let mut in_the_way = 0;
     let mut problems = Vec::new();
+    // the paths the focus adds inside a nested repository that are left
+    // holding something
+    let mut nested = Vec::new();
     let labels = focus.tree().labels().clone();
     for (path, before, after) in paths {
         if let Some(&id) = footprint.occupied.get(&path) {
@@ -553,7 +558,10 @@ async fn put_back(
         let store = focus.store();
         let value = after.clone();
         if !holds_written(store, &path, value, &labels, marker_style, &disk, &meta, partly).await? {
-            // left alone, and recorded by the next run
+            // left alone, and recorded by the next run, unless none reads it
+            if before.is_absent() && in_nested_repo(root, &path) {
+                nested.push(path);
+            }
             continue;
         }
         if before.is_present() {
@@ -597,6 +605,20 @@ async fn put_back(
         1 => problems.insert(0, "something is in the way of 1 path".to_string()),
         n => problems.insert(0, format!("something is in the way of {} paths", n)),
     }
+    if let Some(first) = nested.first() {
+        let first = first.as_internal_file_string();
+        problems.push(match nested.len() {
+            1 => format!(
+                "something the checkout did not write is left at `{}`, in a nested repository, which no run records",
+                first
+            ),
+            n => format!(
+                "something the checkout did not write is left at `{}` and {} more paths in nested repositories, which no run records",
+                first,
+                n - 1
+            ),
+        });
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -617,6 +639,16 @@ fn below_real_dirs(root: &std::path::Path, path: &RepoPath, dirs: &mut HashMap<R
             dirs.insert(d.to_owned(), is_dir);
             is_dir
         }
+    })
+}
+
+/// Whether a directory above `path` below `root` holds `.git` or `.jj`: a
+/// nested repository, whose files no scan reads (§7.4)
+fn in_nested_repo(root: &std::path::Path, path: &RepoPath) -> bool {
+    let parent = path.parent().expect("a file path has a parent");
+    parent.ancestors().take_while(|d| !d.is_root()).any(|d| {
+        d.to_fs_path(root)
+            .is_ok_and(|dir| [".git", ".jj"].iter().any(|name| dir.join(name).symlink_metadata().is_ok()))
     })
 }
 

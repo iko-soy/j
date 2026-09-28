@@ -1152,6 +1152,46 @@ fn a_put_back_that_something_blocks_says_so() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_failed_checkout_says_what_it_leaves_in_a_nested_repository() {
+    // §7.5 step 7: no run reads a directory holding `.git` or `.jj`, so
+    // what a put-back leaves there is not recorded by the next run either.
+    // The put-back left a file saved there meanwhile without a word, and,
+    // while it scanned, every file the failed checkout wrote there. A file
+    // holding what the checkout wrote is removed; anything else left
+    // there, the crash names.
+    let r = setup();
+    r.write("keep.txt", "k\n");
+    r.j(&["describe \"base\""]).ok();
+    std::fs::create_dir(r.dir.join("lib")).unwrap();
+    std::fs::create_dir(r.dir.join("lib/.git")).unwrap();
+    r.write("lib/own.c", "own\n");
+    let log = r.j(&["log"]).ok().stdout;
+    let ops = r.j(&["ops"]).ok().stdout.lines().count();
+    let n = 2000;
+    // `lib/x.c` and `lib/y.c` are written before `m`; `lib/y.c` is saved
+    // over meanwhile
+    let files = "c.files ++ [({ path = [\"lib\" \"x.c\"], content = blob \"x\\n\" }) \
+                 ({ path = [\"lib\" \"y.c\"], content = blob \"y\\n\" })]";
+    let out = stopped_mid_checkout(&r, &slow_failing_edit(files, n), n, || {
+        r.write("lib/y.c", "mine\n");
+    });
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("could not be put back"), "{}", out.stderr);
+    assert!(out.stderr.contains("nested repository"), "{}", out.stderr);
+    assert!(out.stderr.contains("`lib/y.c`"), "{}", out.stderr);
+    assert!(!out.stderr.contains("lib/x.c"), "{}", out.stderr);
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert!(!r.dir.join("lib/x.c").exists());
+    assert_eq!(r.read("lib/y.c"), "mine\n");
+    assert_eq!(r.read("lib/own.c"), "own\n");
+    assert!(!r.dir.join("m").exists());
+    r.j(&["id"]).ok();
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), ops);
+    assert_eq!(r.j(&["log"]).ok().stdout, log);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn a_put_back_removes_nothing_through_a_symlink() {
     // §7.5 step 7: the put-back removes the files the checkout added one by
     // one, and the checkout writes none through a symlink, so none is

@@ -931,12 +931,14 @@ directory.
 - **Before evaluation**, the working directory is snapshotted into the
   working-copy commit, and that is the `files` of the focus in the `Repo`
   value. The snapshot tracks every file not matched by `.gitignore` files,
-  with no size limit, symlinks as symlinks; these rules are fixed, since `j`
-  reads no jj configuration. If the snapshot changed the commit, that change
-  is part of the operation persisted afterwards, or discarded with the rest if
-  nothing is persisted. A crashed or printing program leaves the working copy
-  and the repository exactly as before; `j id` is the way to record the
-  working directory and nothing else (§1.2).
+  with no size limit, symlinks as symlinks, and nothing inside a nested
+  repository (a directory below the root holding `.git` or `.jj`); these
+  rules are fixed, since `j` reads no jj configuration. If the snapshot
+  changed the commit, that change is part of the operation persisted
+  afterwards, or discarded with the rest if nothing is persisted. A crashed
+  or printing program leaves the working copy and the repository exactly as
+  before; `j id` is the way to record the working directory and nothing
+  else (§1.2).
 - **After persistence**, the focus of the result is checked out: its files are
   written to the working directory, unresolved blobs materialised with jj's
   conflict markers, and the workspace's working-copy commit set to the focus.
@@ -1027,7 +1029,9 @@ Within it:
    filesystem folds case, the file of a path's other spelling. When
    something left alone is in the way of a path, the crash says the
    directory could not be put back, and the next run records what it
-   holds.
+   holds. A path the focus adds inside a nested repository (§7.4) is put
+   back the same way, but as no run records what is left there, the crash
+   names such a path when something is left at it.
 
 Labels are not written by persistence at all; they are derived from remote
 refs, which only `fetch` and `push` change. The interpreter may run any part
