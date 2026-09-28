@@ -172,8 +172,15 @@ let r = { a = 1, b = 2 } in r { b = 99 }
 > (\r -> r.name) ({ name = "j" })   -- OK
 > ```
 >
-> The same applies inside lists: `[{ root = c, children = [] }]` — write the
-> braces as a parenthesised element `[(…)]` if it follows another element.
+> The same applies inside lists: a record literal that follows another
+> element is parenthesised. Written side by side, the second record updates
+> the first, so `[{ id = 1 } { id = 2 }]` is the one-element list
+> `[{ id = 2 }]`:
+>
+> ```
+> [({ id = 1 }) ({ id = 2 })]      -- OK: two records
+> [{ root = c, children = [] }]    -- OK: the only element
+> ```
 >
 > A line break stops this: a `.name` or `{` that starts a line never attaches
 > to what came before, so `r` with `.a` on the next (indented) line is
@@ -366,7 +373,7 @@ A bare `.name` is the accessor function `\x -> x.name`:
 ```
 .name ({ name = "j" })
     => "j"
-map (.id) ([{ id = 1 } { id = 2 }])
+map (.id) [({ id = 1 }) ({ id = 2 })]
     => [1 2]
 ```
 
@@ -708,7 +715,7 @@ Functions render readably:
 show (map)              => "map"
 show (+)                => "(+)"
 show (describe "wip")   => "describe \"wip\""
-show (\x -> x + 1)      => "\x -> (x + 1)"
+show (\x -> x + 1)      => "\\x -> x + 1"
 ```
 
 Output longer than 80 columns breaks across lines (one element per line,

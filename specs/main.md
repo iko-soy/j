@@ -316,7 +316,9 @@ Notes:
   a `postfix` (an atom with selectors and updates): `[1 2 3]`,
   `["src" "lexer.rs"]`, `[{ root = c, children = [] }]`. An application or
   operator expression as an element is parenthesised: `[(up repo).root.id]`.
-  Records keep commas.
+  So is a record literal after another element, `[({ a = 1 }) ({ a = 2 })]`:
+  `[{ a = 1 } { a = 2 }]` is the one-element list `[{ a = 2 }]`, the first
+  record updated by the second. Records keep commas.
 - Lambda, `if`, `let`, and `or` extend as far right as possible.
 - Patterns are variables and `_` only. No literal, list, or record patterns.
 - Nesting is bounded: an expression more than 40,000 levels deep is a parse
