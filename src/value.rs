@@ -53,6 +53,12 @@ impl ListVal {
     pub fn as_slice(&self) -> &[Value] {
         &self.items[self.start..]
     }
+    /// which list this is, while it is held: two lists of one identity
+    /// share their elements from the same first one, so are the same list
+    /// without either being compared
+    pub fn identity(&self) -> (*const Vec<Value>, usize) {
+        (Rc::as_ptr(&self.items), self.start)
+    }
 }
 
 impl std::ops::Deref for ListVal {
@@ -131,6 +137,14 @@ impl ThunkVal {
     /// the name of the stored tree this loads, if the backend gave one
     pub fn tree(&self) -> Option<&str> {
         self.tree.as_deref()
+    }
+
+    /// the value, where it has been computed; nothing is computed here
+    pub fn peek(&self) -> Option<Value> {
+        match &*self.state.borrow() {
+            ThunkState::Ready(v) => Some(v.clone()),
+            _ => None,
+        }
     }
 
     /// the value, computing it on first call and memoizing the outcome, a

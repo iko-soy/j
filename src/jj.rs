@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, ThunkVal, Value};
 use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
@@ -1211,7 +1211,7 @@ impl JjBackend {
         interp: &mut Interp,
         cfg: &Config,
         loaded: &Value,
-        _current: &Value,
+        current: &Value,
         new: &Value,
         text: &str,
     ) -> Result<(), Crash> {
@@ -1261,6 +1261,9 @@ impl JjBackend {
             old_stored = Arc::new(vis);
         }
         let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
+        // the stored trees the program's commits were loaded with
+        let visible = self.inner.visible.lock().unwrap().clone();
+        let loaded_trees = LoadedTrees::new(visible.as_deref(), &[current, new])?;
         // shared across the whole persist walk so unchanged blobs are inflated once
         let cache = BlobCache::default();
         let entries = EntryCache::default();
@@ -1311,7 +1314,7 @@ impl JjBackend {
             let message = commit_v.field("message")?.as_text()?.to_string();
             let new_id = match old_stored.commits.get(&id) {
                 None => {
-                    let tree = block_on(build_tree(&store, &files_v.forced()?))?;
+                    let tree = loaded_trees.tree_to_write(&store, &files_v)?;
                     let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
                         Crash::new(format!("persistence: `{}` is not a valid change id", id))
                     })?;
@@ -1345,7 +1348,12 @@ impl JjBackend {
                         };
                     let msg_changed = stored_commit.description() != message;
                     if parent_changed || files_changed || msg_changed {
-                        let tree = block_on(build_tree(&store, &files_v.forced()?))?;
+                        // files the stored tree lists are written as it is
+                        let tree = if files_changed {
+                            loaded_trees.tree_to_write(&store, &files_v)?
+                        } else {
+                            stored_tree
+                        };
                         let c = block_on(
                             tx.repo_mut()
                                 .rewrite_commit(stored_commit)
@@ -3185,6 +3193,58 @@ impl ConflictTreeValue {
     }
 }
 
+/// The stored trees a program's commits may still hold the files of, to
+/// write each such commit with the tree itself (§7.5 step 4). A list holds
+/// each conflict simplified (`merged_value_to_blob`), and the tree it was
+/// loaded from need not, so a tree built from the list could differ from
+/// the stored one where the files do not: a child `new` made would not be
+/// empty, as jj's own `new` leaves one.
+struct LoadedTrees<'a> {
+    /// the stored commits the program's repo was loaded from
+    visible: Option<&'a VisibleRepo>,
+    /// the lists the lazy `files` of the program's commits have loaded, by
+    /// identity: `c.files` takes the list out, so a commit given it, as
+    /// `new` gives its child its parent's, holds the list itself
+    lists: HashMap<(*const Vec<Value>, usize), Rc<ThunkVal>>,
+}
+
+impl<'a> LoadedTrees<'a> {
+    /// The trees `repos`' commits were loaded with; nothing is read
+    fn new(visible: Option<&'a VisibleRepo>, repos: &[&Value]) -> Result<LoadedTrees<'a>, Crash> {
+        let mut lists = HashMap::new();
+        for repo in repos {
+            for commit in crate::repo::all_commits(repo)? {
+                if let Value::Thunk(t) = crate::repo::files_of(&commit)? {
+                    if let (Some(_), Some(Value::List(list))) = (t.tree(), t.peek()) {
+                        lists.insert(list.identity(), t);
+                    }
+                }
+            }
+        }
+        Ok(LoadedTrees { visible, lists })
+    }
+
+    /// The tree to write for a commit whose files are `files`: where they
+    /// are still a list loaded from a stored tree, that tree as jj stored
+    /// it, and otherwise the one `build_tree` makes of them
+    fn tree_to_write(&self, store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
+        let loaded = match files {
+            Value::Thunk(t) => Some(t),
+            Value::List(list) => self.lists.get(&list.identity()),
+            _ => None,
+        };
+        if let Some(t) = loaded {
+            let stored = t.origin().zip(self.visible).and_then(|(id, vis)| vis.commits.get(id));
+            if let Some(tree) = stored.map(|rec| rec.commit.tree()) {
+                if t.tree() == Some(tree_name(&tree).as_str()) {
+                    return Ok(tree);
+                }
+            }
+        }
+        block_on(build_tree(store, &files.forced()?))
+    }
+}
+
 async fn build_tree(store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
     let entries = files
         .as_list()
@@ -3413,6 +3473,17 @@ async fn merged_value_to_blob(
     value: &jj_lib::backend::MergedTreeValue,
     cache: &BlobCache,
 ) -> Result<Value, Crash> {
+    // a conflict less each pair of sides that cancel, one added and one
+    // removed the same (§7.3), as jj simplifies a file conflict to write it
+    // out. jj keeps every term of a merge it cannot resolve, pairs that
+    // cancel included, so a replayed commit's conflict inherited from its
+    // parent was not the parent's, and each commit a rebase replayed above
+    // took two more sides for it. Where only directory sides would be left,
+    // the value is kept whole: jj keeps it as one conflict at the path, and
+    // the simplified one would be a conflict between directories, which jj
+    // merges entry by entry.
+    let simplified = (!value.is_resolved()).then(|| value.simplify()).filter(|v| !v.is_tree());
+    let value = simplified.as_ref().unwrap_or(value);
     if let Some(v) = value.as_resolved() {
         return match v {
             Some(tv) => tree_value_to_blob(store, path, tv).await,

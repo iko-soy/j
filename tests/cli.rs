@@ -2313,8 +2313,9 @@ fn jj_rebase(r: &Repo, id: &str, onto: &str) {
 fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_cancel() {
     // a tree of five sides, as jj's rebase of a conflicted commit makes one,
     // with a file conflict at `a` and a symlink/file conflict at `b`, whose
-    // description names L's symlink as removed once and added twice.
-    // Resolving `a` lets the scan write a tree of three
+    // description names L's symlink as removed once and added twice (`j`
+    // reads the conflict with the pair dropped, but keeps the tree as jj
+    // stored it). Resolving `a` lets the scan write a tree of three
     // sides, where `b`'s conflict has the pair cancelled and describes
     // itself in three lines, while the file, which nobody touched, still
     // holds the five a checkout wrote. The scan took that file for one
@@ -2342,7 +2343,7 @@ fn a_conflict_with_a_side_that_is_no_file_left_as_written_stays_when_its_sides_c
     r.j(&["new"]).ok();
     r.write("a", "other\n");
     r.j(&["describe \"M\""]).ok();
-    // R onto M as jj rebases it, which keeps the pair at `b`
+    // R onto M as jj rebases it, keeping the pair at `b` (replay drops it)
     jj_rebase(&r, "head (matching (\\c -> c.message == \"R\") all r)", "r.root.id");
     r.j(&[&goto("R")]).ok();
     r.j(&["new"]).ok();
@@ -3291,6 +3292,151 @@ fn replay_carries_conflicts_through() {
     let files = format!("\\r -> show (map (\\i -> (commitAt i r).files) ({} r))", named("right"));
     let files = r.j(&[&files]).ok().stdout;
     assert!(files.contains("blob \"right\\n\"") && files.contains("blob \"bee\\n\""), "{}", files);
+}
+
+#[test]
+fn a_replayed_conflict_keeps_no_sides_that_cancel() {
+    // replay kept every term of the merge of a conflicted input, sides that
+    // cancel included: rebasing a stack in which each commit conflicts with
+    // the new base gave the second its parent's conflict with a pair of
+    // sides added that cancel, so it listed its parent's path as changed,
+    // its inherited conflict was not its parent's, and each commit up the
+    // stack stored two sides more than the one below it (§7.3)
+    let named = |m: &str| format!("(matching (\\c -> c.message == \"{}\") all)", m);
+    let r = setup();
+    r.write("a", "a1\na2\na3\n");
+    r.write("b", "b1\nb2\nb3\n");
+    r.j(&["describe \"trunk\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "a1\nA2 one\na3\n");
+    r.j(&["describe \"one\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("b", "b1\nB2 two\nb3\n");
+    r.j(&["describe \"two\""]).ok();
+    r.j(&[&format!("new . goto {}", named("trunk"))]).ok();
+    r.write("a", "a1\nA2 trunk\na3\n");
+    r.write("b", "b1\nB2 trunk\nb3\n");
+    r.j(&["describe \"trunk 2\""]).ok();
+    r.j(&[&format!("goto {}", named("one"))]).ok();
+    r.j(&[&format!("rebase {}", named("trunk 2"))]).ok();
+    r.j(&[&format!("goto {}", named("two"))]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"] [\"b\"]]");
+    // two changed `b` only; its `a` is one's conflict, of three terms
+    assert_eq!(r.j(&["\\r -> show (changed r)"]).ok().stdout.trim(), "[[\"b\"]]");
+    let inherited = "\\r -> contentAt [\"a\"] (files r) == contentAt [\"a\"] (files (up r))";
+    assert_eq!(r.j(&[inherited]).ok().stdout.trim(), "true");
+    let text = r.j(&["\\r -> text (contentAt [\"a\"] (files r))"]).ok().stdout;
+    assert_eq!(text.matches("%%%%%%%").count(), 1, "{}", text);
+    // and each is stored as a merge of three trees
+    let repo = jj_repo(&r);
+    for m in ["one", "two"] {
+        let commit = jj_commit(&r, &repo, &format!("head ({} r)", named(m)));
+        assert_eq!(commit.tree_ids().iter().count(), 3, "{}", m);
+    }
+}
+
+#[test]
+fn a_conflict_jj_merged_reads_without_the_sides_that_cancel_and_keeps_its_tree() {
+    // jj's rebase keeps each term of a merge it cannot resolve, so in a
+    // stack jj rebased, where each commit conflicts with the new base, the
+    // second commit stores its parent's conflict with a pair of sides that
+    // cancel added. `j` read it so, as a change the commit did not make.
+    // Read without the pair, the conflict is the parent's; and the tree is
+    // written as jj stored it wherever the files are still its, so `new`
+    // leaves an empty child, as jj's `new` does, not one of another tree
+    // for the same files (§7.3, §7.5)
+    let named = |m: &str| format!("(matching (\\c -> c.message == \"{}\") all)", m);
+    let r = setup();
+    r.write("a", "a1\na2\na3\n");
+    r.write("b", "b1\nb2\nb3\n");
+    r.j(&["describe \"trunk\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "a1\nA2 one\na3\n");
+    r.j(&["describe \"one\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("b", "b1\nB2 two\nb3\n");
+    r.j(&["describe \"two\""]).ok();
+    r.j(&[&format!("new . goto {}", named("trunk"))]).ok();
+    r.write("a", "a1\nA2 trunk\na3\n");
+    r.write("b", "b1\nB2 trunk\nb3\n");
+    r.j(&["describe \"trunk 2\""]).ok();
+    // one onto trunk 2 as jj rebases it, and two with it
+    jj_rebase(&r, &format!("head ({} r)", named("one")), "r.root.id");
+    let repo = jj_repo(&r);
+    let tree = |m: &str| jj_commit(&r, &repo, &format!("head ({} r)", named(m))).tree_ids().clone();
+    let stored = tree("two");
+    assert_eq!(stored.iter().count(), 5);
+    r.j(&[&format!("goto {}", named("two"))]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"a\"] [\"b\"]]");
+    assert_eq!(r.j(&["\\r -> show (changed r)"]).ok().stdout.trim(), "[[\"b\"]]");
+    let inherited = "\\r -> contentAt [\"a\"] (files r) == contentAt [\"a\"] (files (up r))";
+    assert_eq!(r.j(&[inherited]).ok().stdout.trim(), "true");
+    // describing it, and its parent, keeps the tree jj stored
+    r.j(&["describe \"two, described\""]).ok();
+    r.j(&["at parents (describe \"one, described\")"]).ok();
+    let repo = jj_repo(&r);
+    let tree = |id: &str| jj_commit(&r, &repo, id).tree_ids().clone();
+    assert_eq!(tree("r.root.id"), stored);
+    // and a new child holds it too
+    r.j(&["new"]).ok();
+    let repo = jj_repo(&r);
+    let tree = |id: &str| jj_commit(&r, &repo, id).tree_ids().clone();
+    assert_eq!(tree("r.root.id"), stored);
+    assert_eq!(tree("(up r).root.id"), stored);
+    assert_eq!(r.j(&["\\r -> show (changed r)"]).ok().stdout.trim(), "[]");
+}
+
+#[test]
+fn a_conflict_whose_sides_left_are_directories_keeps_its_files() {
+    // a conflict at `d` whose file sides cancel, leaving directories only.
+    // jj keeps it as one conflict at the path; without its file sides it
+    // would be one between the directories, which jj merges entry by
+    // entry. So `j` reads it with every side, and a new child keeps it
+    // (§7.3)
+    let r = setup();
+    let dir = |x: &str| {
+        let _ = std::fs::remove_file(r.dir.join("d"));
+        std::fs::create_dir_all(r.dir.join("d")).unwrap();
+        r.write("d/x", x);
+    };
+    let file = || {
+        let _ = std::fs::remove_dir_all(r.dir.join("d"));
+        r.write("d", "f\n");
+    };
+    let sides: [(&str, &dyn Fn()); 5] =
+        [("A", &|| dir("1\n")), ("B", &file), ("C", &file), ("D", &|| dir("0\n")), ("E", &|| dir("2\n"))];
+    for (m, write) in sides {
+        write();
+        r.write("e", m);
+        r.j(&[&format!("describe \"{}\"", m)]).ok();
+        r.j(&["new"]).ok();
+    }
+    // A - B + C - D + E, as a commit X on E
+    use jj_lib::repo::Repo as _;
+    let named = |m: &str| format!("head ((matching (\\c -> c.message == \"{}\") all) r)", m);
+    let repo = jj_repo(&r);
+    let tree = |m: &str| jj_commit(&r, &repo, &named(m)).tree_ids().as_resolved().unwrap().clone();
+    let trees = jj_lib::merge::Merge::from_vec(["A", "B", "C", "D", "E"].map(tree).to_vec());
+    let tree = jj_lib::merged_tree::MergedTree::new(
+        repo.store().clone(),
+        trees,
+        jj_lib::conflict_labels::ConflictLabels::unlabeled(),
+    );
+    let mut tx = repo.start_transaction();
+    let parent = jj_commit(&r, &repo, &named("E")).id().clone();
+    pollster::block_on(tx.repo_mut().new_commit(vec![parent], tree.clone()).set_description("X").write()).unwrap();
+    pollster::block_on(tx.commit("X")).unwrap();
+    r.j(&["goto (matching (\\c -> c.message == \"X\") all)"]).ok();
+    let conflicted = "\\r -> show (conflicted (files r))";
+    assert_eq!(r.j(&[conflicted]).ok().stdout.trim(), "[[\"d\"] [\"e\"]]");
+    assert_eq!(r.j(&["\\r -> show (map (.path) (files r))"]).ok().stdout.trim(), "[[\"d\"] [\"e\"]]");
+    let text = r.j(&["\\r -> text (contentAt [\"d\"] (files r))"]).ok().stdout;
+    assert_eq!(text.matches("%%%%%%%").count(), 2, "{}", text);
+    r.j(&["new"]).ok();
+    let repo = jj_repo(&r);
+    assert_eq!(jj_commit(&r, &repo, "r.root.id").tree_ids(), tree.tree_ids());
 }
 
 #[cfg(unix)]

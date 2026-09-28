@@ -877,7 +877,13 @@ some other value in its place.
   the list of path components; components must be valid UTF-8, and a
   repository with a path that is not exits 2. `content` is a `Blob` carrying the file's
   content and type (regular, executable, symlink) and, for conflicted paths,
-  jj's conflict value for that path. The entries' order carries no meaning,
+  jj's conflict value for that path, less each pair of sides that cancel (a
+  side added and one removed that are the same), as jj drops them to write
+  a file's conflict out. jj keeps such pairs in the conflicts of the trees
+  it merges; dropped here, a conflict a commit inherits unchanged reads as
+  its parent's. A conflict whose sides left would all be directories keeps
+  every side, as jj keeps it as one conflict at the path rather than one
+  between directories. The entries' order carries no meaning,
   as a tree has none: persistence (§1.2 step 8, §7.5), the laws of §8 and
   the tree's empty mark compare snapshots path by path, though `==` compares
   them as lists (§4.5).
@@ -895,7 +901,10 @@ some other value in its place.
   content, non-overlapping line-level hunks). A path unresolved in any of the
   three takes part with all its sides, as when jj rebases a conflicted commit,
   so sides that cancel drop out and a replay can resolve a conflict as well
-  as keep one. It never crashes on content, except where a file meets a
+  as keep one. A conflict it keeps has no pair of sides that cancel
+  (above), so in a stack replayed commit by commit, a conflict each commit
+  inherits is its parent's, whatever conflicts the commits below added. It
+  never crashes on content, except where a file meets a
   directory (below). It crashes if any of the three is not a well-formed
   snapshot (a list of `Entry` records with unique paths, none of them the
   root `./`, and none both a file and a directory as `./a` beside `./a/b`
@@ -1071,9 +1080,14 @@ refs, which only `fetch` and `push` change. The interpreter may run any part
 of the walk through jj-lib's rebase machinery provided the stored result
 equals what the steps above produce. As in §1.2 step 8, steps 3 and 4 may
 compare tree hashes rather than values: files still as loaded from a stored
-tree are that tree's. A persisting run then reads the files of the focus, of
-the commits it writes, and of those whose files it compares with a tree they
-were not loaded from, but not those of the rest of the history.
+tree are that tree's. Step 4 writes a commit whose files are still as
+loaded from a stored tree, its own or another's (`new` gives the child its
+parent's), with that tree as jj stored it, pairs of sides that cancel and
+conflict labels included (§7.3), as jj's own `new` and `describe` keep a
+tree: one built from the files could be another tree for the same files.
+A persisting run then reads the files of the focus, of the commits it
+writes with other files, and of those whose files it compares with a tree
+they were not loaded from, but not those of the rest of the history.
 
 ### 7.6 Labels and the remote
 
