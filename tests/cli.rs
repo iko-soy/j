@@ -4297,6 +4297,103 @@ fn a_commit_left_with_its_parents_files_is_written_with_the_parents_tree() {
 }
 
 #[test]
+fn a_commit_moved_onto_its_own_files_is_written_with_the_parents_tree() {
+    // A commit can come to hold its parent's files while its own read as
+    // they did: an empty commit rebased onto another tree for the same
+    // files, an empty child of a commit squashed into its parent, a change
+    // the working copy reverts. Rewritten with its own stored tree, or
+    // snapshotted into the tree the snapshot built, it held another tree
+    // for its parent's files: jj took it for a change at each conflicted
+    // path, and `tree` did not mark it empty, though `changed` listed
+    // nothing and the dry run of the same edit marked it (§7.4, §7.5).
+    // The stack is the one above, with two empty children of two
+    let named = |m: &str| format!("(matching (\\c -> c.message == \"{}\") all)", m);
+    let head = |m: &str| format!("head ({} r)", named(m));
+    let r = setup();
+    r.write("a", "a1\na2\na3\n");
+    r.write("b", "b1\nb2\nb3\n");
+    r.j(&["describe \"B\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("a", "a1\nA2 one\na3\n");
+    r.j(&["describe \"one\""]).ok();
+    r.j(&["new"]).ok();
+    r.write("b", "b1\nB2 two\nb3\n");
+    r.j(&["describe \"two\""]).ok();
+    r.j(&["describe \"E\" . new"]).ok();
+    r.j(&[&format!("describe \"G\" . new . goto {}", named("two"))]).ok();
+    r.j(&[&format!("goto {}", named("B"))]).ok();
+    r.write("a", "a1\nA2 B\na3\n");
+    r.write("b", "b1\nB2 B\nb3\n");
+    r.j(&["id"]).ok();
+    let repo = jj_repo(&r);
+    let stored = jj_commit(&r, &repo, &head("two")).tree_ids().clone();
+    assert_eq!(stored.iter().count(), 5);
+    for m in ["E", "G"] {
+        assert_eq!(jj_commit(&r, &repo, &head(m)).tree_ids(), &stored, "{}", m);
+    }
+    // the commit `m` names holds its parent's tree, and jj takes it for empty
+    let empty = |m: &str, what: &str| {
+        use jj_lib::repo::Repo as _;
+        let repo = jj_repo(&r);
+        let c = jj_commit(&r, &repo, &head(m));
+        let parent = repo.store().get_commit(&c.parent_ids()[0]).unwrap();
+        assert_eq!(c.tree_ids(), parent.tree_ids(), "{}: {}", what, m);
+        assert!(pollster::block_on(c.is_empty(repo.as_ref())).unwrap(), "{}: {}", what, m);
+        let changed = format!("\\r -> show (changed (by ({}) r))", head(m));
+        assert_eq!(r.j(&[&changed]).ok().stdout.trim(), "[]", "{}: {}", what, m);
+    };
+    // whether the coloured tree `expr` renders draws the message `m` as an
+    // empty commit's, dim and italic
+    let marked_empty = |expr: &str, m: &str| {
+        let out = Command::new(j_bin())
+            .arg(expr)
+            .current_dir(&r.dir)
+            .env("XDG_CONFIG_HOME", &r.cfg)
+            .env_remove("NO_COLOR")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\x1b[2;3m{}\x1b[0m", m))
+    };
+    let coloured = "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"always\", lanes = 4, author = false, date = false, files = false })";
+    // rebase: Y, two's change picked onto one, holds two's files in a tree
+    // `j` builds, of three terms; G, empty on two, is moved onto it
+    let one = named("one");
+    r.j(&[&format!("describe \"Y\" . child (\\c -> c.message == \"\") . goto {} . pick {} . goto {}", one, one, named("two"))])
+        .ok();
+    let y = jj_commit(&r, &jj_repo(&r), &head("Y")).tree_ids().clone();
+    assert_eq!(y.iter().count(), 3);
+    r.j(&[&format!("rebase {} . goto {}", named("Y"), named("G"))]).ok();
+    empty("G", "rebase");
+    // a change the working copy reverts: R and S, each holding `z`, are
+    // rebased onto two, which gives each a tree `j` builds; with `z`
+    // removed, the snapshot alone gives R two's tree, and the snapshot a
+    // rewrite of S's message folds in gives S two's
+    for (m, record) in [("R", "id"), ("S", "describe \"S, reverted\"")] {
+        r.j(&[&format!("new . goto {}", one)]).ok();
+        r.write("z", "z\n");
+        r.j(&[&format!("describe \"{}\"", m)]).ok();
+        r.j(&[&format!("rebase {}", named("two"))]).ok();
+        std::fs::remove_file(r.dir.join("z")).unwrap();
+        r.j(&[record]).ok();
+    }
+    empty("R", "snapshot");
+    empty("S, reverted", "describe");
+    // squash: two is folded into one, which it rewrites with a tree `j`
+    // builds; E, R and S, empty on two, are moved onto it. The tree marks
+    // E empty after the squash as its dry run does
+    let squash = format!("describe \"F\" . squash . goto {}", named("two"));
+    assert!(marked_empty(&format!("{} . validate . {}", coloured, squash), "E"));
+    r.j(&[&squash]).ok();
+    for m in ["E", "R", "S, reverted", "F"] {
+        empty(m, "squash");
+    }
+    assert!(marked_empty(coloured, "E"));
+    let repo = jj_repo(&r);
+    assert_eq!(jj_commit(&r, &repo, &head("one")).tree_ids().iter().count(), 3);
+}
+
+#[test]
 fn a_conflict_whose_sides_left_are_directories_keeps_its_files() {
     // a conflict at `d` whose file sides cancel, leaving directories only.
     // jj keeps it as one conflict at the path; without its file sides it
