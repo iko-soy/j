@@ -132,18 +132,25 @@ fn stdin_is_ready(ms: i32) -> bool {
 }
 
 fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // §1: an expression is text, so an argument that is not UTF-8 is a
+    // usage error (`std::env::args` would panic on it)
+    let args: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+        Ok(args) => args,
+        Err(a) => return err(2, format!("argument is not valid UTF-8: {:?}", a)),
+    };
     // §1: stdin vs arguments. With no arguments the expression comes from
     // stdin, so reading to end-of-input is the whole point. With arguments,
     // stdin is only read to report the "both" error — and reading it blindly
     // hangs whenever the process inherited a pipe nobody is writing to (a
     // shell loop, a CI step), so wait only briefly for input to appear.
-    let mut stdin_content = String::new();
+    // Bytes that are not UTF-8 are input too, and an error only once they
+    // are the expression.
+    let mut stdin_content = Vec::new();
     let stdin_has_data = {
         if std::io::stdin().is_terminal() {
             false
         } else if args.is_empty() || stdin_is_ready(50) {
-            match std::io::stdin().read_to_string(&mut stdin_content) {
+            match std::io::stdin().read_to_end(&mut stdin_content) {
                 Ok(n) => n > 0,
                 Err(_) => false,
             }
@@ -155,7 +162,10 @@ fn run() -> ExitCode {
         return err(2, "expression given both as arguments and on stdin");
     }
     let text = if stdin_has_data {
-        stdin_content
+        match String::from_utf8(stdin_content) {
+            Ok(text) => text,
+            Err(_) => return err(2, "the expression on stdin is not valid UTF-8"),
+        }
     } else if !args.is_empty() {
         args.join(" ")
     } else {

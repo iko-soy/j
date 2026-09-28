@@ -191,6 +191,52 @@ fn both_stdin_and_args_rejected() {
 }
 
 #[test]
+fn an_expression_that_is_not_utf8_is_a_usage_error() {
+    // §1: an argument that was not UTF-8 (a path with a Latin-1 byte)
+    // panicked in `std::env::args` and exited 101, and such bytes on stdin
+    // read as no input at all, so the run printed the usage line
+    use std::ffi::OsStr;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let r = setup();
+    let run = |args: &[&OsStr], input: &[u8]| {
+        let mut child = Command::new(j_bin())
+            .args(args)
+            .current_dir(&r.dir)
+            .env("XDG_CONFIG_HOME", &r.cfg)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    };
+    let message = OsStr::from_bytes(b"describe \"\xff\"");
+    for args in [vec![message], vec![OsStr::new("remote"), OsStr::from_bytes(b"../nu\xff/r.git")]] {
+        let out = run(&args, b"");
+        assert_eq!(out.code, 2, "{}", out.stderr);
+        assert!(out.stderr.starts_with("j: argument is not valid UTF-8: "), "{}", out.stderr);
+        assert_eq!(out.stderr.lines().count(), 1, "{}", out.stderr);
+    }
+    let out = run(&[], message.as_bytes());
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(out.stderr, "j: the expression on stdin is not valid UTF-8\n");
+    // input on stdin is input, whatever its bytes (§1 rule 3)
+    let out = run(&[OsStr::new("1")], message.as_bytes());
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("both"), "{}", out.stderr);
+    // nothing was described
+    assert_eq!(r.j(&["\\r -> show (focus r).message"]).ok().stdout, "\"\"\n");
+}
+
+#[test]
 fn expression_from_stdin() {
     let r = setup();
     let out = r.j_stdin("1 + 2 * 3", &[]).ok();

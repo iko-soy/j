@@ -44,6 +44,9 @@ echo EXPRESSION | j
 4. If neither is present, print a one-line usage message to stderr and exit 2.
 5. `j` accepts no flags. Any argument, including ones beginning with `-`, is
    part of the expression.
+6. The expression is text: an argument that is not valid UTF-8 is a usage
+   error (exit 2) naming it, and so is an expression on standard input that
+   is not.
 
 ### 1.1 Reserved commands
 
