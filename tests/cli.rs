@@ -763,15 +763,19 @@ fn a_failed_checkout_puts_back_only_the_paths_it_was_to_change() {
     let log = r.j(&["log"]).ok().stdout;
     let ops = r.j(&["ops"]).ok().stdout.lines().count();
     // written in path order: `.gitignore`, `build/out`, `local.env`
-    // (skipped: already there), then the deep path fails
+    // (skipped: already there), then the deep path fails. Each record is
+    // parenthesised: side by side, the second would update the first (§3).
     let edit = format!(
         "mapRoot (\\c -> c {{ files = filter (\\e -> e.path /= [\".gitignore\"]) c.files ++ [\
-         {{ path = [\".gitignore\"], content = blob \"build/\\n\" }} \
-         {{ path = [\"build\" \"out\"], content = blob \"built\\n\" }} \
-         {{ path = [\"local.env\"], content = blob \"committed\\n\" }} \
-         {{ path = [{}], content = blob \"deep\" }}] }})",
+         ({{ path = [\".gitignore\"], content = blob \"build/\\n\" }}) \
+         ({{ path = [\"build\" \"out\"], content = blob \"built\\n\" }}) \
+         ({{ path = [\"local.env\"], content = blob \"committed\\n\" }}) \
+         ({{ path = [{}], content = blob \"deep\" }})] }})",
         too_deep("zz")
     );
+    let paths = r.j(&[&format!("\\r -> show (map (\\e -> e.path) (files (({}) r)))", edit)]).ok().stdout;
+    let paths = paths.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(paths.starts_with(r#"[["keep.txt"] [".gitignore"] ["build" "out"] ["local.env"] ["zz" "#), "{}", paths);
     let out = r.j(&[&edit]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(out.stderr.contains("cannot check out"), "{}", out.stderr);
@@ -1070,7 +1074,7 @@ fn replay_making_a_file_and_a_directory_of_one_path_refused() {
     // that made the directory `a` a file is refused too, where the in-memory
     // merge goes path by path and gives the file (§7.3, §10)
     let e = "replay [{ path = ./a, content = blob \"f\" }] \
-             ({ from = [{ path = ./a/y, content = blob \"y\" } { path = ./a/z, content = blob \"z\" }], \
+             ({ from = [({ path = ./a/y, content = blob \"y\" }) ({ path = ./a/z, content = blob \"z\" })], \
              to = [{ path = ./a/y, content = blob \"y\" }] })";
     let out = r.j(&[&format!("show ({})", e)]);
     assert_eq!(out.code, 1, "{}", out.stdout);
