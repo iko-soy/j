@@ -354,6 +354,8 @@ immutable = ancestorsOf trunk
 -- Focusing. `goto` is the only place a revset must have exactly one member.
 ------------------------------------------------------------------------------
 
+-- Move to the single commit selected by a revset.
+-- Example: j 'goto %feature'; use j 'new . goto trunk' to start on the main line.
 goto : Revset -> Edit
 goto = \rs repo ->
   let is = rs repo
@@ -433,10 +435,12 @@ rewrite = \f repo ->
 ------------------------------------------------------------------------------
 
 -- Set the message of the focused commit.
+-- Example: j 'describe "fix login"'
 describe : Text -> Edit
 describe = \m -> mapRoot (\c -> c { message = m })
 
 -- Start an empty child of the focus and move to it.
+-- Examples: j new; j 'describe "next change" . new'
 new : Edit
 new = \repo -> addChild (newCommit repo.root.files) repo
 
@@ -444,6 +448,7 @@ new = \repo -> addChild (newCommit repo.root.files) repo
 -- new empty commit on that parent becomes the focus (the parent may be
 -- immutable, and the focus never is). Refused for a commit the remote has a
 -- name for: push something else under that name first, or forget the name.
+-- Example: j abandon; preview first with j 'tree . abandon'.
 abandon : Edit
 abandon = \repo ->
   let c = repo.root
@@ -453,17 +458,20 @@ abandon = \repo ->
      else new (remove (eachChild (replayOnto p) repo))
 
 -- Push the files matching m from the focus down into its parent.
+-- Example: j 'contract (ext "rs")'
 contract : Fileset -> Edit
 contract = \m repo -> let a = repo.root
                       in at parents (rewrite (\q -> q { files = select m a.files q.files })) repo
 
 -- Fold the focus entirely into its parent; a new empty commit becomes the focus.
+-- Example: j squash; preview first with j 'tree . validate . squash'.
 squash : Edit
 squash = abandon . contract everything
 
 -- Push the files matching m from the focus up into a new child, which becomes
 -- the focus and inherits the old focus's children. Labels stay with the
 -- original commit, since they are the remote's.
+-- Example: j 'split (ext "rs")'; use (under ./src) to select a directory.
 split : Fileset -> Edit
 split = \m repo ->
   let a  = repo.root
@@ -473,6 +481,7 @@ split = \m repo ->
   in by x.id (repo { root = a', children = [{ root = x, children = repo.children }] })
 
 -- Move the focused subtree onto another commit. Returns to the moved commit.
+-- Example: j 'rebase trunk'; preview with j 'tree . validate . rebase trunk'.
 rebase : Revset -> Edit
 rebase = \rs repo ->
   let d = (goto rs repo).root
@@ -483,6 +492,7 @@ rebase = \rs repo ->
           in by me (attach x.subtree (by d.id x.rest))
 
 -- Apply the focused commit's change onto another commit, as a new child there.
+-- Example: j 'pick %main'
 pick : Revset -> Edit
 pick = \rs repo ->
   let ch = changeOf repo
@@ -490,6 +500,7 @@ pick = \rs repo ->
   in at rs (addChild (newCommit (replay t.files ch))) repo
 
 -- A new child of the focus that undoes the change of the given commit.
+-- Example: j 'backout %feature'
 backout : Revset -> Edit
 backout = \rs repo ->
   let ch = changeOf (goto rs repo)
@@ -542,6 +553,7 @@ touched : Change -> [Path]
 touched = touchedPaths
 
 -- Paths whose content differs between the focus and its parent.
+-- Example: j changed
 changed : Repo -> [Path]
 changed = \repo -> touched (changeOf repo)
 
@@ -556,12 +568,14 @@ diffs = \repo ->
 -- readable in the terminal. A focus that changes nothing reads "no changes";
 -- a difft that cannot be run (not on PATH) is a crash saying so, and
 -- otherwise whatever difft prints, even nothing, is the page.
+-- Example: j review (requires difftastic's difft on PATH).
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo
   in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
 -- A summary of the focus.
+-- Example: j status
 status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }
 status = \repo ->
   { id        = repo.root.id
@@ -571,6 +585,7 @@ status = \repo ->
   , conflicts = conflicted repo.root.files }
 
 -- A summary of every commit, top first, in preorder.
+-- Example: j log
 log : Repo -> [{ id : Id, message : Text, labels : [Label], focus : Bool }]
 log = \repo ->
   map (\c -> { id      = c.id
@@ -583,6 +598,7 @@ log = \repo ->
 -- (The parentheses are required: `f { … }` would be a record update of f.)
 -- The default `tree` shows every commit, sorted by time (parents always above
 -- their children); `treeCompact` folds uninteresting runs and far subtrees.
+-- Examples: j tree; j 'tree . squash' previews an edit without saving it.
 tree : Repo -> Text
 tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 

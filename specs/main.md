@@ -9,7 +9,7 @@ Nothing is implicit beyond the language itself. Every shape, builtin, and
 command is declared or defined in one user-owned file, `~/.config/j/config.j`,
 written in the language. The binary provides the language (its syntax, its
 operators and their fixities, its primitive kinds), the implementations of the
-declared builtins, eight reserved words, and the bridge to jj repositories.
+declared builtins, ten reserved words, and the bridge to jj repositories.
 `j` does not require the `jj` binary; it uses jj's on-disk formats through
 jj-lib.
 
@@ -41,9 +41,14 @@ echo EXPRESSION | j
    unquoted.
 3. If arguments are present and rule 1 also applies, exit 2 with
    `j: expression given both as arguments and on stdin`.
-4. If neither is present, print a one-line usage message to stderr and exit 2.
-5. `j` accepts no flags. Any argument, including ones beginning with `-`, is
-   part of the expression.
+4. If neither is present, or the input is only whitespace, print a concise
+   usage and getting-started guide to stderr and exit 2. The guide points to
+   `j help`, `j commands`, and commands for starting or inspecting a repository.
+   It does not read or create configuration or open a repository.
+5. `--help` and `-h` are aliases for the reserved command `help` only when
+   they are the first whitespace-separated word (§1.1). There are no other
+   flags or trailing help flags: `j 'new --help'` is an expression whose
+   `--help` is a language comment, and `j '"--help"'` prints text.
 6. The expression is text: an argument that is not valid UTF-8 is a usage
    error (exit 2) naming it, and so is an expression on standard input that
    is not.
@@ -52,10 +57,13 @@ echo EXPRESSION | j
 
 Before the expression is parsed, its text is trimmed of leading and trailing
 whitespace and split on whitespace into words. If the first word is one of the
-eight reserved words below, the whole text is a reserved command.
+ten reserved words below, the whole text is a reserved command. A first word
+of `--help` or `-h` is treated as `help`.
 
 | command | operation |
 |---|---|
+| `help [NAME]` | show the command guide, or help for a reserved command or config name; §1.1.1 |
+| `commands [QUERY]` | list the vocabulary, optionally searching names, signatures, and comments; §1.1.1 |
 | `init` | create a repository in the current directory; §7.8 |
 | `clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name in `URL`); §7.8 |
 | `remote URL` | set the URL of the remote `origin`, creating it if absent; §7.8 |
@@ -65,24 +73,53 @@ eight reserved words below, the whole text is a reserved command.
 | `redo` | reverse the newest undo; §7.7 |
 | `ops` | print the operation log; §7.7 |
 
-For every reserved command except `push`, the remaining words are literal
-arguments (no quoting, no escaping); a wrong number is a usage error (exit 2)
-and the language is not involved. For `push`, the remainder of the text is an
-expression, evaluated as in §1.2 steps 2–7 but against the repository as
-recorded, without snapshotting the working directory; its value must be a list
-of push records (§7.6).
+For every reserved command except `push` and `commands`, the remaining words
+are literal arguments (no quoting, no escaping); a wrong number is a usage
+error (exit 2) and the language is not involved. `commands` takes the remaining
+trimmed text as its optional search query, including spaces. For `push`, the
+remainder of the text is an expression, evaluated as in §1.2 steps 2–7 but
+against the repository as recorded, without snapshotting the working directory;
+its value must be a list of push records (§7.6).
 
 Matching is on the first word only, so an expression whose first token is one
 of these words cannot be written on the command line. `(push)` or `x fetch`
 are ordinary expressions. `config.j` may define functions with these names;
 they are reachable only inside larger expressions.
 
+#### 1.1.1 Help and command discovery
+
+`help` without a name prints a getting-started guide to stdout: repository
+setup, common commands grouped by task, examples, expression quoting and
+composition, dry runs, and how to find more commands. `help NAME` prints help
+for that reserved command or for a name in the current configuration, including
+its signature when present and available documentation. `--help [NAME]` and
+`-h [NAME]` are equivalent to `help [NAME]`. These successful requests exit 0.
+An unknown name is a usage error (exit 2) with guidance to use `j commands`.
+
+`commands` lists the reserved commands and the vocabulary actually declared or
+defined in the current configuration, including custom definitions without
+signatures. `commands QUERY` searches the catalog case-insensitively by name,
+signature, and documentation comments. The catalog does not present an
+undeclared builtin as available merely because the binary implements it.
+
+General help and help for reserved commands do not depend on configuration and
+remain available if it is unreadable or invalid. Discovery of configuration
+names reads the configured file (§6.1) without creating or modifying it. If the
+file is missing, it uses the embedded reference configuration; other read or
+parse errors exit 3 rather than silently substituting a different catalog.
+The config is never evaluated for discovery, so its definitions can refer to
+repository state without preventing their documentation from being read.
+
+Neither command locates or opens a repository, takes a repository lock,
+resolves commit ids, snapshots the working directory, or records operations.
+
 ### 1.2 Evaluating the expression
 
 1. Locate the repository (§7.1). If none, exit 2.
 2. Parse the expression (§3). On parse error, exit 3.
 3. Load and validate `config.j` (§6), except for its `Id` literals. If it is
-   missing or invalid, exit 3.
+   missing, create the reference configuration (§6.1); if loading or
+   validation fails, exit 3.
 4. Build the current repository value `r` (§7.2). This includes snapshotting
    the working directory into the focused commit (§7.4).
 5. Resolve every `Id` literal in `config.j` and in the expression (§4.10).
@@ -785,14 +822,20 @@ Since `show` returns a `Text` and a top-level `Text` displays raw,
 ### 6.1 Location and loading
 
 `j` reads `$XDG_CONFIG_HOME/j/config.j`, defaulting to `~/.config/j/config.j`.
-It is read by every invocation except `remote`, `fetch`, `undo`, `redo`, and
-`ops`: expression evaluation and `push` need its definitions, `init` and
+Expression evaluation, `push`, and `fetch` load the configuration; `init` and
 `clone` need `user`. When there is no repository yet (`init`, `clone`), only
 `user` is evaluated; `Id` literals are not resolved and no other definition
-is evaluated. If it does not exist, `j` exits 3 with
-`j: no config at <path>; the reference config.j is installed at <share-path>`.
-The binary is distributed with the reference `config.j` (§9) at
-`<prefix>/share/j/config.j`; `j` never writes to the config path itself.
+is evaluated. `remote`, `undo`, `redo`, and `ops` do not load configuration.
+When a command needs configuration and none exists, the binary writes its
+embedded reference `config.j` (§9) to that path as an editable starting point.
+An existing user configuration is not updated when the binary changes. The
+reference file is also distributed at `<prefix>/share/j/config.j`.
+
+Help and command discovery are read-only exceptions (§1.1.1): general help and
+reserved-command help need no config, while the catalog and help for config
+names read it without evaluation. If it is missing they use the embedded
+reference in memory without writing a file. The empty-invocation guide does
+not read or write configuration either.
 
 ### 6.2 Validation
 
@@ -1280,7 +1323,8 @@ operation is marked. Rendered in the binary like `tree`.
 duration.
 A second `j` exits 2 with `j: another j is running in this repository`.
 Display-only runs are not distinguishable in advance, so they take the lock
-too; only reserved commands that need no repository (`init`, `clone`) do not.
+too; reserved commands that need no repository (`help`, `commands`, `init`,
+`clone`) do not.
 The lock prevents `j` from ever producing two commits with one change id.
 Other tools operating concurrently are outside `j`'s control; if they produce
 that state, §7.2 applies.
@@ -2268,5 +2312,6 @@ and are read-only); hunk-level `split`; conflict resolution inside the
 language (blobs are opaque); workspaces other than the default; remotes other
 than `origin`; tags; submodules and LFS; ignore rules beyond `.gitignore`;
 changing file modes or symlinks from the language; repairing a repository in
-which one change id has two visible commits (refused; §7.2); a `--help` flag
-or any flag at all; static typing. None of these are precluded by the design.
+which one change id has two visible commits (refused; §7.2); general command
+flags beyond the first-word `--help` and `-h` aliases; static typing. None of
+these are precluded by the design.

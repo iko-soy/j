@@ -1,5 +1,7 @@
 //! j — a functional-programming-centered CLI for jj repositories (§1).
 
+mod help;
+
 use j::config::{self, Config};
 use j::jj::JjBackend;
 use j::parse::parse_expr;
@@ -9,7 +11,12 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 use std::rc::Rc;
 
-const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)";
+const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)
+
+Start a repository:  j init   or   j clone URL
+Inspect your work:   j status   or   j tree
+Discover commands:  j help   or   j commands
+Command details:    j help NAME";
 
 fn err(status: u8, msg: impl std::fmt::Display) -> ExitCode {
     j::report!("j: {}", msg);
@@ -101,7 +108,64 @@ fn write_default_config(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-const RESERVED: &[&str] = &["init", "clone", "remote", "fetch", "push", "undo", "redo", "ops"];
+const RESERVED: &[&str] = &[
+    "init", "clone", "remote", "fetch", "push", "undo", "redo", "ops", "help", "commands",
+];
+
+/// Discovery reads the user's vocabulary without creating or evaluating it.
+/// A missing file uses the embedded reference; other read errors stay visible.
+fn read_help_config() -> Result<(String, String), u8> {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(src) => Ok((src, path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((
+            DEFAULT_CONFIG.to_string(),
+            format!("embedded default config.j (no user config at {})", path),
+        )),
+        Err(e) => Err(fail(3, format!("cannot read config at {}: {}", path, e))),
+    }
+}
+
+fn run_help(text: &str) -> ExitCode {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    match words.as_slice() {
+        [_] => print_output(help::OVERVIEW),
+        [_, name] => {
+            if let Some(output) = help::reserved_help(name) {
+                return print_output(&output);
+            }
+            let (src, path) = or_exit(read_help_config());
+            match help::command_help(&src, name) {
+                Ok(Some(output)) => print_output(&format!("{}\nConfig: {}\n", output, path)),
+                Ok(None) => err(
+                    2,
+                    format!("unknown help topic `{}`; run `j commands` to browse or `j commands {}` to search", name, name),
+                ),
+                Err(message) => err(3, format!("{}: {}", path, message)),
+            }
+        }
+        _ => err(
+            2,
+            "usage: j help [NAME]; run `j commands` to search available names",
+        ),
+    }
+}
+
+fn run_commands(text: &str) -> ExitCode {
+    let query = text.strip_prefix("commands").unwrap_or("").trim();
+    let (src, path) = or_exit(read_help_config());
+    match help::command_list(&src, query) {
+        Ok(output) => print_output(&format!("{}\nConfig: {}\n", output, path)),
+        Err(message) => err(3, format!("{}: {}", path, message)),
+    }
+}
+
+fn command_usage(usage: &str, command: &str) -> ExitCode {
+    err(
+        2,
+        format!("usage: j {}; see `j help {}` for examples", usage, command),
+    )
+}
 
 fn main() -> ExitCode {
     // evaluation builds deep continuation chains (trampolined, but the final
@@ -134,7 +198,11 @@ fn stdin_is_ready(ms: i32) -> bool {
 fn run() -> ExitCode {
     // §1: an expression is text, so an argument that is not UTF-8 is a
     // usage error (`std::env::args` would panic on it)
-    let args: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+    let args: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect()
+    {
         Ok(args) => args,
         Err(a) => return err(2, format!("argument is not valid UTF-8: {:?}", a)),
     };
@@ -175,7 +243,14 @@ fn run() -> ExitCode {
 
     // §1.1: reserved commands
     let trimmed = text.trim();
+    if trimmed.is_empty() {
+        j::report!("{}", USAGE);
+        return ExitCode::from(2);
+    }
     let first = trimmed.split_whitespace().next().unwrap_or("");
+    if matches!(first, "--help" | "-h") {
+        return run_help(trimmed);
+    }
     if RESERVED.contains(&first) {
         return run_reserved(first, trimmed);
     }
@@ -186,9 +261,11 @@ fn run() -> ExitCode {
 fn run_reserved(cmd: &str, text: &str) -> ExitCode {
     let words: Vec<&str> = text.split_whitespace().collect();
     match cmd {
+        "help" => run_help(text),
+        "commands" => run_commands(text),
         "init" => {
             if words.len() != 1 {
-                return err(2, "usage: j init");
+                return command_usage("init", "init");
             }
             let (cfg, _) = or_exit(load_config_file());
             match j::jj::cmd_init(&cfg) {
@@ -198,7 +275,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "clone" => {
             if words.len() != 2 && words.len() != 3 {
-                return err(2, "usage: j clone URL [DIR]");
+                return command_usage("clone URL [DIR]", "clone");
             }
             let dir = if words.len() == 3 {
                 words[2].to_string()
@@ -206,7 +283,10 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
                 match default_clone_dir(words[1]) {
                     Some(dir) => dir,
                     None => {
-                        let msg = format!("`{}` names no directory to clone into; give one: j clone URL DIR", words[1]);
+                        let msg = format!(
+                            "`{}` names no directory to clone into; give one: j clone URL DIR",
+                            words[1]
+                        );
                         return err(2, msg);
                     }
                 }
@@ -219,7 +299,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "remote" => {
             if words.len() != 2 {
-                return err(2, "usage: j remote URL");
+                return command_usage("remote URL", "remote");
             }
             let backend = or_exit(open_repo());
             match backend.cmd_remote(words[1]) {
@@ -229,7 +309,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "fetch" => {
             if words.len() != 1 {
-                return err(2, "usage: j fetch");
+                return command_usage("fetch", "fetch");
             }
             let (cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
@@ -241,7 +321,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         "push" => {
             let rest = text.trim_start_matches("push").trim();
             if rest.is_empty() {
-                return err(2, "usage: j push EXPR");
+                return command_usage("push EXPR", "push");
             }
             let (mut cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
@@ -253,7 +333,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "undo" => {
             if words.len() != 1 {
-                return err(2, "usage: j undo");
+                return command_usage("undo", "undo");
             }
             let backend = or_exit(open_repo_noconfig());
             match backend.cmd_undo(false) {
@@ -263,7 +343,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "redo" => {
             if words.len() != 1 {
-                return err(2, "usage: j redo");
+                return command_usage("redo", "redo");
             }
             let backend = or_exit(open_repo_noconfig());
             match backend.cmd_undo(true) {
@@ -273,7 +353,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
         }
         "ops" => {
             if words.len() != 1 {
-                return err(2, "usage: j ops");
+                return command_usage("ops", "ops");
             }
             let backend = or_exit(open_repo_noconfig());
             match backend.cmd_ops() {
