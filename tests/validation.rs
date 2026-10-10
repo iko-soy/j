@@ -3,7 +3,7 @@
 use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
 use j::eval::Interp;
-use j::value::{Crash, Env, ThunkVal, Value};
+use j::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, Env, LazyBlob, ThunkVal, Value};
 use std::rc::Rc;
 
 const CONFIG: &str = include_str!("../config.j");
@@ -100,6 +100,62 @@ fn valid_repo_passes() {
 }
 
 #[test]
+fn every_commit_requires_a_text_message_without_reading_stored_files() {
+    let repo = |bad_id: Option<&str>, message: Option<Value>| {
+        let make = |id: &str| {
+            let files = if id == ROOT_ID || id == "kaaaaaaa" {
+                Value::list(vec![])
+            } else {
+                unreadable_tree(id, id)
+            };
+            let c = commit_holding(id, "", &[], files);
+            if bad_id != Some(id) {
+                return c;
+            }
+            let Value::Record(fields) = c else { unreachable!() };
+            let mut fields = (*fields).clone();
+            match &message {
+                Some(v) => { fields.insert("message".to_string(), v.clone()); }
+                None => { fields.remove("message"); }
+            }
+            Value::Record(Rc::new(fields))
+        };
+        // root -> parent -> [sibling, focus -> child], focused on focus.
+        let frame = |parent: Value, left: Vec<Value>| {
+            Value::record(&[
+                ("parent", parent),
+                ("left", Value::list(left)),
+                ("right", Value::list(vec![])),
+            ])
+        };
+        Value::record(&[
+            ("root", make("kaaaaaaa")),
+            ("children", Value::list(vec![subtree(make("kccccccc"), vec![])])),
+            (
+                "context",
+                Value::list(vec![
+                    frame(make("kppppppp"), vec![subtree(make("ksssssss"), vec![])]),
+                    frame(make(ROOT_ID), vec![]),
+                ]),
+            ),
+        ])
+    };
+    let old = repo(None, None);
+    assert_eq!(validate_with(&old, &old), Ok(()));
+    for id in ["kaaaaaaa", "kccccccc", "kppppppp", "ksssssss", ROOT_ID] {
+        let bad = repo(Some(id), Some(Value::int(1)));
+        assert_eq!(validate_with(&old, &bad), Err("expected Text, got a Int".into()), "{}", id);
+        let missing = repo(Some(id), None);
+        let want = if id == "kaaaaaaa" {
+            "persistence: the root is not a Commit"
+        } else {
+            "record has no field `message`"
+        };
+        assert_eq!(validate_with(&old, &missing), Err(want.into()), "{}", id);
+    }
+}
+
+#[test]
 fn duplicate_ids_rejected() {
     let old = two_commit_repo(&[]);
     // attach a as a child of itself
@@ -135,6 +191,57 @@ fn focus_with_files(files: Vec<Value>) -> Value {
         ("context", old.field("context").unwrap()),
         ("root", commit("kaaaaaaa", "a", &[], files)),
     ])
+}
+
+#[test]
+fn snapshot_entries_require_blob_content() {
+    let old = two_commit_repo(&[]);
+    let path = Value::list(vec![Value::text("a")]);
+    let missing = Value::record(&[("path", path.clone())]);
+    let scalar = Value::record(&[("path", path), ("content", Value::int(1))]);
+    for (entry, want) in [(missing, "no field `content`"), (scalar, "content is not a Blob")] {
+        // Both the validate builtin and persistence call this validator;
+        // previously only the later tree-writing step rejected the entry.
+        let new = focus_with_files(vec![entry.clone()]);
+        let message = validate_with(&old, &new).unwrap_err();
+        assert!(message.contains(want), "{}", message);
+
+        // A deferred list without a trusted stored-tree id still needs the
+        // same checks when it is materialized.
+        let lazy = Value::record(&[
+            ("children", old.field("children").unwrap()),
+            ("context", old.field("context").unwrap()),
+            (
+                "root",
+                commit_holding("kaaaaaaa", "a", &[], j::domain::lazy_files("kaaaaaaa", vec![entry])),
+            ),
+        ]);
+        let message = validate_with(&old, &lazy).unwrap_err();
+        assert!(message.contains(want), "{}", message);
+    }
+}
+
+#[test]
+fn snapshot_validation_accepts_blobs_without_reading_their_bytes() {
+    let old = two_commit_repo(&[]);
+    let contents = [
+        BlobContent::Resolved(Rc::new(vec![0xff, 0x00, 0x80])),
+        BlobContent::Conflict(vec![
+            Some(ConflictSide::regular(b"left\n")),
+            Some(ConflictSide::regular(b"base\n")),
+            None,
+        ]),
+        BlobContent::Lazy(Rc::new(LazyBlob::new("a".repeat(40), || {
+            Err(Crash::new("validation read a lazy blob"))
+        }))),
+    ];
+    let files = contents.into_iter().enumerate().map(|(n, content)| {
+        Value::record(&[
+            ("path", Value::list(vec![Value::text(format!("file{}", n))])),
+            ("content", Value::Blob(Rc::new(BlobVal { kind: BlobKind::Regular, content }))),
+        ])
+    }).collect();
+    assert_eq!(validate_with(&old, &focus_with_files(files)), Ok(()));
 }
 
 fn entry_at(path: &[&str], content: &str) -> Value {

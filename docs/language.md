@@ -227,7 +227,8 @@ distinct id each time it is evaluated (see §7).
 
 A `Blob` is the content of one file, either resolved or unresolved (a
 conflict). You rarely write them directly; you get them from a commit's
-`files`. `blob "…"` builds a resolved one, `text` reads it back:
+`files`. It carries the file kind as well as its bytes. `blob "…"` builds a
+resolved regular file from text; `text` reads it back:
 
 ```
 text (blob "file content")
@@ -636,6 +637,13 @@ unresolved (blob "x")   => false
 `unresolved b` is `true` iff the blob is a conflict (produced by a clashing
 `replay`). `text` on an unresolved blob yields its conflict-marker rendering.
 
+`blobHex kind hex` constructs a resolved blob with arbitrary bytes and a
+file kind: `"regular"`, `"executable"`, or `"symlink"`. Its second argument
+is an even-length hexadecimal text, accepting either letter case. Unknown
+kinds and invalid hex crash. For example,
+`text (blobHex "regular" "6869")` is `"hi"`. `text` crashes on non-UTF-8
+content; persisting a symlink requires its target to be valid UTF-8 too.
+
 ### Shapes and `extract`
 
 A type name in an expression is a `Shape`. `extract S v` returns every
@@ -667,6 +675,10 @@ A function that has a **signature** (a builtin, or a definition with one in
 parameter type as it is supplied, and the final result against the result
 type.
 
+Infix `&&` and `||` require their declarations in `config.j` and check the
+contracts of each evaluated operand and the result. Short-circuiting skips
+both evaluation and checking of the right operand.
+
 The check is one level deep — it never inspects inside a list or a record's
 field values (that would make every call cost the size of the value).
 
@@ -696,12 +708,16 @@ unchecked except through the functions they call.
 
 ## 12. `show`: rendering values as text
 
-`show v` renders values as expressions in the language, such that
-(except for closures and unresolved blobs) the result parses and evaluates
-back to an equal value. Resolved binary, executable, and symlink blobs have
-no equal literal, so `show` crashes on them, even inside lists or records.
-Since `show` returns a `Text`, and a top-level `Text` prints raw, `j show …`
-is how you inspect values.
+When it succeeds, `show v` renders a value as an expression in the language.
+Except for closures and unresolved blobs, the result parses and evaluates
+back to an equal value. Since `show` returns a `Text`, and a top-level `Text`
+prints raw, `j show …` is how you inspect values.
+
+Regular blobs with UTF-8 content render as `blob "…"`. Other resolved blobs
+render as `blobHex "kind" "…"` with lowercase hexadecimal bytes, preserving
+binary content and executable or symlink kinds. If an older custom config
+lacks `blobHex : Text -> Text -> Blob`, `show` crashes with instructions to
+add it when such a value is encountered. Existing configs are not modified.
 
 ```
 show 42                 => "42"
@@ -922,7 +938,7 @@ the algebra they are.
 
 **Text:** `splitOn` `startsWith` `endsWith` `concat` `++`
 
-**Blobs/repos:** `blob` `text` `unresolved` `replay` `by` `meta` `extract`
+**Blobs/repos:** `blob` `blobHex` `text` `unresolved` `replay` `by` `meta` `extract`
 `diff` `difft` `treeWith` `validate`
 
 **Reserved commands** (not expressions): `init` `clone URL [DIR]` `remote URL`

@@ -150,6 +150,43 @@ impl Drop for Env {
 }
 
 #[test]
+fn push_descriptions_cannot_impersonate_repository_creation() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    env.j(&dest, &["describe \"work\""]).ok();
+    let path = env.cfg.join("j/config.j");
+    let config = std::fs::read_to_string(&path).unwrap();
+    // Reserved command names remain valid names inside push expressions.
+    for (definition, expression, changed) in [
+        ("init = label \"feature\" here", "init", true),
+        ("clone = \\name -> label name here", "clone \"feature\"", true),
+        ("init = []", "init", false),
+    ] {
+        std::fs::write(&path, format!("{}\n{}\n", config, definition)).unwrap();
+        env.j(&dest, &[&format!("push {}", expression)]).ok();
+        let ops = env.j(&dest, &["ops"]).ok().stdout;
+        assert!(ops.lines().next().unwrap().ends_with(&format!("push {}", expression)), "{}", ops);
+        if changed {
+            assert_eq!(env.j(&dest, &["length . labelled \"feature\""]).ok().stdout.trim(), "1");
+        }
+        env.j(&dest, &["undo"]).ok();
+        assert_eq!(env.j(&dest, &["length . labelled \"feature\""]).ok().stdout.trim(), "0");
+        env.j(&dest, &["redo"]).ok();
+        let count = if changed { "1" } else { "0" };
+        assert_eq!(env.j(&dest, &["length . labelled \"feature\""]).ok().stdout.trim(), count);
+        if changed {
+            // Undo changes only the recorded label; the remote still has it.
+            git(&env.remote, &["rev-parse", "--verify", "refs/heads/feature"]);
+            env.j(&dest, &["push (unlabel \"feature\")"]).ok();
+        }
+    }
+    // Moving back past the push also remains possible.
+    env.j(&dest, &["undo"]).ok();
+    env.j(&dest, &["undo"]).ok();
+}
+
+#[test]
 fn clone_sets_origin_and_labels() {
     let env = setup();
     let dest = uniq("clone");
@@ -951,6 +988,26 @@ fn push_rename() {
     let branches = git(&env.remote, &["branch"]);
     assert!(branches.contains("new"), "{}", branches);
     assert!(!branches.contains("old"), "{}", branches);
+}
+
+#[test]
+fn push_can_create_update_and_delete_the_at_bookmark() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    assert_eq!(git(&dest, &["check-ref-format", "--branch", "@"]).trim(), "@");
+    env.j(&dest, &["describe \"first\""]).ok();
+    env.j(&dest, &["push (label \"@\" here)"]).ok();
+    let first = git(&env.remote, &["rev-parse", "refs/heads/@"]);
+    assert_eq!(env.j(&dest, &["length . labelled \"@\""]).ok().stdout.trim(), "1");
+
+    env.j(&dest, &["describe \"second\" . new"]).ok();
+    env.j(&dest, &["push (label \"@\" here)"]).ok();
+    assert_ne!(git(&env.remote, &["rev-parse", "refs/heads/@"]), first);
+    assert_eq!(git(&env.remote, &["log", "-1", "--format=%s", "refs/heads/@"]).trim(), "second");
+    env.j(&dest, &["push (unlabel \"@\")"]).ok();
+    assert!(git(&env.remote, &["for-each-ref", "--format=%(refname)", "refs/heads/@"]).is_empty());
+    assert_eq!(env.j(&dest, &["length . labelled \"@\""]).ok().stdout.trim(), "0");
 }
 
 #[test]
@@ -1761,6 +1818,34 @@ fn fetch_without_origin_is_exit_1() {
     let out = env.j(&dir, &["fetch"]);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("no remote origin"), "{}", out.stderr);
+}
+
+#[test]
+fn fetch_does_not_read_or_create_config_even_when_it_rebases() {
+    for contents in [Some(&b"this is malformed ["[..]), Some(&b"\xff"[..]), None] {
+        let env = setup();
+        let (w, seed) = clone_above_s_and_t(&env);
+        let config_path = env.cfg.join("j/config.j");
+        let saved = std::fs::read(&config_path).unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(&config_path, contents).unwrap();
+        } else {
+            std::fs::remove_dir_all(env.cfg.join("j")).unwrap();
+        }
+        force_push_dropping_t(&seed);
+        env.j(&w, &["fetch"]).ok();
+        if let Some(contents) = contents {
+            assert_eq!(std::fs::read(&config_path).unwrap(), contents);
+        } else {
+            assert!(!env.cfg.join("j").exists(), "fetch created the config directory");
+        }
+        // Rebase the recorded working-copy commit, leaving its checkout
+        // untouched until a persisting expression runs (§7.6).
+        assert_eq!(std::fs::read_to_string(w.join("t")).unwrap(), "t\n");
+        std::fs::create_dir_all(env.cfg.join("j")).unwrap();
+        std::fs::write(&config_path, saved).unwrap();
+        assert_eq!(env.j(&w, &[PARENT_MESSAGE]).ok().stdout.trim(), "s");
+    }
 }
 
 #[test]

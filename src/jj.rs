@@ -1446,6 +1446,17 @@ impl JjBackend {
                 ),
             ));
         }
+        // Snapshot and checkout both apply patterns saved by `jj sparse`,
+        // independently of our SnapshotOptions. Accepting a partial working
+        // copy would silently omit disk edits and skip files during checkout.
+        let sparse = workspace.working_copy().sparse_patterns()
+            .map_err(|e| (2, format!("cannot read the working copy's sparse patterns: {}", e)))?;
+        if !sparse.iter().any(|path| path.is_root()) {
+            return Err((
+                2,
+                "sparse working copies are not supported; run `jj sparse set --clear --add .` to include all files before running j".to_string(),
+            ));
+        }
         let workspace_name = workspace.workspace_name().to_owned();
         let repo = block_on(workspace.repo_loader().load_at_head())
             .map_err(|e| (2, format!("cannot load the repository at head: {}", e)))?;
@@ -2318,7 +2329,8 @@ impl JjBackend {
         let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
         let deletes_wait = check_push_records(&records, &base, &vis, &immutable)?;
-        let _ = self.push_to_origin(&base, origin, &records, deletes_wait, expr_text)?;
+        let description = format!("push {}", expr_text);
+        let _ = self.push_to_origin(&base, origin, &records, deletes_wait, &description)?;
         Ok(())
     }
 
@@ -2493,7 +2505,24 @@ impl JjBackend {
         let mut cur = base.operation().clone();
         let target_op_id: OperationId;
         loop {
-            match (op_marker(cur.metadata()), redo) {
+            let marker = op_marker(cur.metadata());
+            if let Some(m) = marker.as_ref().filter(|m| m.restores_view) {
+                // jj 0.45 names the operation whose view was restored.
+                // Repeating the same direction follows that target; reversing
+                // direction restores the marker's parent. The target may
+                // itself be an undo or redo, not just a normal operation.
+                if (m.kind == "redo") == redo {
+                    cur = block_on(loader.load_operation(&m.id))
+                        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+                    continue;
+                }
+                let Some(parent) = cur.parent_ids().first().cloned() else {
+                    return Err((1, if redo { "nothing to redo" } else { "nothing to undo" }.to_string()));
+                };
+                target_op_id = parent;
+                break;
+            }
+            match (marker, redo) {
                 (None, false) => {
                     let Some(parent) = cur.parent_ids().first().cloned() else {
                         return Err((1, "nothing to undo".to_string()));
@@ -2519,7 +2548,16 @@ impl JjBackend {
                         .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
                 }
                 (Some(m), true) if m.kind == "undo" => {
-                    target_op_id = m.id;
+                    // An old j marker names the discarded normal operation,
+                    // but its parent has the same view and retains any earlier
+                    // undos. Modern redo markers must keep that navigation
+                    // point so another redo can continue across the upgrade.
+                    target_op_id = if m.authored_by_j {
+                        cur.parent_ids().first().cloned()
+                            .ok_or_else(|| (1, "nothing to redo".to_string()))?
+                    } else {
+                        m.id
+                    };
                     break;
                 }
                 (Some(m), false) => {
@@ -2571,8 +2609,18 @@ impl JjBackend {
         if !redo && op_created_repo(cur.metadata()) {
             return Err((1, "nothing to undo".to_string()));
         }
-        let target_op = block_on(loader.load_operation(&target_op_id))
+        let mut target_op = block_on(loader.load_operation(&target_op_id))
             .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+        // jj also follows markers in the selected direction at the target:
+        // undoing a redo whose parent is an undo restores that undo's target,
+        // and conversely for redo. Keep the same canonical navigation point.
+        while let Some(m) = op_marker(target_op.metadata())
+            .filter(|m| m.restores_view && (m.kind == "redo") == redo)
+        {
+            target_op = block_on(loader.load_operation(&m.id))
+                .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+        }
+        let target_op_id = target_op.id().clone();
         let target_view = block_on(
             loader
                 .op_store()
@@ -2596,11 +2644,13 @@ impl JjBackend {
                 },
             ));
         }
-        let marker = if redo {
-            format!("redo: {}", cur.id().hex())
-        } else {
-            format!("undo: {}", cur.id().hex())
-        };
+        // Use jj's current marker so either CLI can continue this history.
+        // The older j and jj marker formats remain readable above.
+        let marker = format!(
+            "{}: restore to operation {}",
+            if redo { "redo" } else { "undo" },
+            target_op_id.hex()
+        );
         let mut tx = base.start_transaction();
         tx.repo_mut().set_view(target_view.clone());
         let unpublished = block_on(tx.write(&marker))
@@ -2671,8 +2721,8 @@ impl JjBackend {
             let mut tag = "";
             match op_kind(op.metadata()) {
                 OpKind::Normal => {}
-                OpKind::Undo { .. } => tag = "undo",
-                OpKind::Redo { .. } => tag = "redo",
+                OpKind::Undo => tag = "undo",
+                OpKind::Redo => tag = "redo",
             }
             if desc.is_empty() {
                 desc = "(no description)".to_string();
@@ -3265,29 +3315,29 @@ fn git_default_branch(
 
 enum OpKind {
     Normal,
-    /// the operation this undo discarded the view of
-    Undo { #[allow(dead_code)] undid: OperationId },
-    /// the undo this redo reversed
-    Redo { #[allow(dead_code)] redid: OperationId },
+    Undo,
+    Redo,
 }
 
 /// a marker parsed from an operation description (§7.7 kinds)
 struct OpMarker {
     kind: &'static str,
     id: OperationId,
-    /// whether the description is j's own exact marker (`undo: <id>` /
-    /// `redo: <id>`); only those are reliably loadable for the walk
+    /// jj 0.45 names the operation whose view was restored, rather than
+    /// the operation undone or the undo reversed.
+    restores_view: bool,
+    /// Whether a legacy marker is j's exact `undo: <id>` / `redo: <id>`
+    /// format, whose discarded-operation links the walk can follow.
     authored_by_j: bool,
 }
 
-/// §7.7 kinds: `j` marks undo/redo operations as `undo: <opid>` /
-/// `redo: <opid>` in the description (0.45's Transaction cannot write
-/// metadata tags); jj's own `undo operation <id>` / `redo operation <id>`
-/// markers are treated the same way.
+/// §7.7 kinds: new records use jj 0.45's restored-view descriptions. Older
+/// j `undo: <id>` / `redo: <id>` and jj `undo operation <id>` /
+/// `redo operation <id>` descriptions remain readable too.
 fn op_kind(meta: &jj_lib::op_store::OperationMetadata) -> OpKind {
     match op_marker(meta) {
-        Some(OpMarker { kind: "undo", id, .. }) => OpKind::Undo { undid: id },
-        Some(OpMarker { kind: "redo", id, .. }) => OpKind::Redo { redid: id },
+        Some(OpMarker { kind: "undo", .. }) => OpKind::Undo,
+        Some(OpMarker { kind: "redo", .. }) => OpKind::Redo,
         _ => OpKind::Normal,
     }
 }
@@ -3295,14 +3345,19 @@ fn op_kind(meta: &jj_lib::op_store::OperationMetadata) -> OpKind {
 fn op_marker(meta: &jj_lib::op_store::OperationMetadata) -> Option<OpMarker> {
     let desc = meta.description.trim();
     for kind in ["undo", "redo"] {
+        if let Some(rest) = desc.strip_prefix(&format!("{}: restore to operation ", kind)) {
+            if let Some(id) = parse_op_id(rest.trim()) {
+                return Some(OpMarker { kind, id, restores_view: true, authored_by_j: false });
+            }
+        }
         if let Some(rest) = desc.strip_prefix(&format!("{}:", kind)) {
             if let Some(id) = parse_op_id(rest.trim()) {
-                return Some(OpMarker { kind, id, authored_by_j: true });
+                return Some(OpMarker { kind, id, restores_view: false, authored_by_j: true });
             }
         }
         if let Some(rest) = desc.strip_prefix(&format!("{} operation", kind)) {
             if let Some(id) = parse_op_id(rest.trim()) {
-                return Some(OpMarker { kind, id, authored_by_j: false });
+                return Some(OpMarker { kind, id, restores_view: false, authored_by_j: false });
             }
         }
     }

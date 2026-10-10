@@ -152,11 +152,13 @@ fn short_circuit_operators_must_be_declared() {
         for expr in [
             format!("false {} true", op),
             format!("true {} false", op),
+            format!("(crash \"lhs evaluated\") {} true", op),
             format!("({}) true false", op),
             format!("(true {}) false", op),
             format!("({} false) true", op),
         ] {
             assert_eq!(crash(&mut i, &cfg, &expr), format!("crash: unbound name `{}`", op));
+            check!(i, cfg, &format!("({}) or 7", expr), Value::int(7));
         }
     }
 }
@@ -178,6 +180,10 @@ fn short_circuit_contracts_check_only_evaluated_arguments() {
             format!("{} {} true", reached, op),
             format!("({} {}) true", reached, op),
             format!("({} true) {}", op, reached),
+            // First-class applications stay strict, even when the first
+            // argument would short-circuit in an infix expression.
+            format!("({}) {} true", op, reached),
+            format!("({}) {} true", op, skipped),
         ] {
             assert_eq!(
                 crash(&mut i, &cfg, &expr),
@@ -213,11 +219,13 @@ fn short_circuit_contracts_check_results_including_aliases() {
                     format!("{} {} true", lhs, op),
                     format!("({} {}) true", lhs, op),
                     format!("({} true) {}", op, lhs),
+                    format!("({}) {} true", op, lhs),
                 ] {
                     assert_eq!(
                         crash(&mut i, &cfg, &expr),
                         format!("crash: contract: {}: result expected Text, got Bool", op)
                     );
+                    check!(i, cfg, &format!("({}) or 7", expr), Value::int(7));
                 }
             }
             let skipped = op == "||";

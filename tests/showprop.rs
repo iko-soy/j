@@ -7,7 +7,7 @@ use j::domain::MemBackend;
 use j::eval::Interp;
 use j::parse::parse_expr;
 use j::show::show;
-use j::value::{value_eq, BlobVal, Env, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, Env, Value};
 use proptest::prelude::*;
 use std::rc::Rc;
 
@@ -25,7 +25,13 @@ fn arb_value(depth: usize) -> BoxedStrategy<Value> {
         any::<i64>().prop_map(Value::int),
         "[a-zA-Z0-9 \n\t\"\\\\]{0,12}".prop_map(Value::text),
         any::<bool>().prop_map(Value::Bool),
-        Just(BlobVal::text_blob("blob content")),
+        (
+            prop::sample::select(vec![BlobKind::Regular, BlobKind::Executable, BlobKind::Symlink]),
+            prop::collection::vec(any::<u8>(), 0..64),
+        ).prop_map(|(kind, bytes)| Value::Blob(Rc::new(BlobVal {
+            kind,
+            content: BlobContent::Resolved(Rc::new(bytes)),
+        }))),
     ];
     leaf.prop_recursive(depth as u32, 24, 6, |inner| {
         prop_oneof![

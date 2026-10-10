@@ -59,6 +59,15 @@ fn setup() -> Repo {
 }
 
 impl Repo {
+    fn operation_heads(&self) -> Vec<std::ffi::OsString> {
+        let mut heads: Vec<_> = std::fs::read_dir(self.dir.join(".jj/repo/op_heads/heads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        heads.sort();
+        heads
+    }
+
     fn j(&self, args: &[&str]) -> Out {
         let out = Command::new(j_bin())
             .args(args)
@@ -191,37 +200,50 @@ fn both_stdin_and_args_rejected() {
 }
 
 #[test]
-fn conflicting_stdin_is_rejected_without_waiting_for_eof() {
+fn arguments_do_not_wait_for_an_open_stdin_pipe_to_close() {
     use std::io::Write;
     use std::time::{Duration, Instant};
     let r = setup();
-    let (reader, mut writer) = std::io::pipe().unwrap();
-    writer.write_all(b"1").unwrap();
-    let mut child = Command::new(j_bin())
-        .arg("describe \"must not run\"")
-        .current_dir(&r.dir)
-        .env("XDG_CONFIG_HOME", &r.cfg)
-        .stdin(reader)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("conflicting stdin waited for the still-open writer");
+    for input in [Some(b'1'), Some(0xff), None] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        // Supply input before spawning so the readiness check cannot race
+        // the writer. Keep the writer open until the command has exited.
+        if let Some(byte) = input {
+            writer.write_all(&[byte]).unwrap();
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let mut child = Command::new(j_bin())
+            .arg(if input.is_some() { "describe \"must not run\"" } else { "1" })
+            .current_dir(&r.dir)
+            .env("XDG_CONFIG_HOME", &r.cfg)
+            .env("NO_COLOR", "1")
+            .stdin(reader)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let out = child.wait_with_output().unwrap();
+                panic!("waited for stdin EOF with input {:?}: {}", input,
+                    String::from_utf8_lossy(&out.stderr));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        drop(writer);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if input.is_some() {
+            assert_eq!(out.status.code(), Some(2), "{}", stderr);
+            assert_eq!(stderr, "j: expression given both as arguments and on stdin\n");
+            assert!(out.stdout.is_empty());
+            assert_eq!(r.j(&["\\r -> show (focus r).message"]).ok().stdout, "\"\"\n");
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{}", stderr);
+            assert_eq!(out.stdout, b"1\n");
+        }
     }
-    let out = child.wait_with_output().unwrap();
-    // Keep the writer alive until after the command has exited.
-    drop(writer);
-    assert_eq!(out.status.code(), Some(2));
-    assert_eq!(String::from_utf8(out.stderr).unwrap(),
-        "j: expression given both as arguments and on stdin\n");
-    assert_eq!(r.j(&["\\r -> show (focus r).message"]).ok().stdout, "\"\"\n");
 }
 
 #[test]
@@ -470,6 +492,49 @@ fn validate_catches_what_persistence_refuses() {
     assert!(!out.stdout.is_empty());
     assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), before);
     r.j(&["squash"]).ok();
+}
+
+#[test]
+fn validate_and_persistence_reject_malformed_snapshot_contents() {
+    let r = setup();
+    r.write("kept", "original\n");
+    r.j(&["describe \"before\""]).ok();
+    let before = r.operation_heads();
+    for entry in ["{ path = ./x, content = 1 }", "{ path = ./x }"] {
+        let edit = format!("mapRoot (\\c -> c {{ files = [{}] }})", entry);
+        let dry = r.j(&[&format!("show . validate . {}", edit)]);
+        let persist = r.j(&[&edit]);
+        assert_eq!(dry.code, 1, "validate accepted {}: {}", entry, dry.stdout);
+        assert_eq!(persist.code, 1, "persistence accepted {}", entry);
+        assert_eq!(dry.stderr.lines().next(), persist.stderr.lines().next());
+        assert!(dry.stderr.contains("content"), "{}", dry.stderr);
+        assert_eq!(r.operation_heads(), before);
+        assert_eq!(r.read("kept"), "original\n");
+        assert!(!r.dir.join("x").exists());
+    }
+}
+
+#[test]
+fn validate_and_persistence_reject_nontext_commit_messages() {
+    let r = setup();
+    r.write("kept", "original\n");
+    r.j(&["describe \"parent\""]).ok();
+    r.j(&["new"]).ok();
+    r.j(&["describe \"focus\""]).ok();
+    let before = r.operation_heads();
+    for target in ["here", "parents"] {
+        for message in ["1", "[]", "true"] {
+            let edit = format!("at {} (mapRoot (\\c -> c {{ message = {} }}))", target, message);
+            let dry = r.j(&[&format!("show . validate . {}", edit)]);
+            let persist = r.j(&[&edit]);
+            assert_eq!(dry.code, 1, "validate accepted {}: {}", edit, dry.stdout);
+            assert_eq!(persist.code, 1, "persistence accepted {}", edit);
+            assert_eq!(dry.stderr.lines().next(), persist.stderr.lines().next());
+            assert!(dry.stderr.contains("expected Text"), "{}", dry.stderr);
+            assert_eq!(r.operation_heads(), before);
+            assert_eq!(r.read("kept"), "original\n");
+        }
+    }
 }
 
 #[test]
@@ -3285,6 +3350,92 @@ fn init_refuses_inside_existing_repo() {
 }
 
 #[test]
+fn show_files_roundtrips_binary_and_typed_blobs() {
+    let r = setup();
+    let bytes: Vec<u8> = (0..=255).collect();
+    std::fs::write(r.dir.join("binary"), &bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        r.write("executable", "#!/bin/sh\necho preserved\n");
+        std::fs::set_permissions(r.dir.join("executable"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("binary", r.dir.join("link")).unwrap();
+    }
+
+    let before = r.operation_heads();
+    let shown = r.j(&["show . files"]).ok().stdout;
+    let equal = format!("\\r -> files r == ({})", shown);
+    assert_eq!(r.j(&[&equal]).ok().stdout.trim(), "true");
+    assert_eq!(r.operation_heads(), before);
+
+    // Check out an empty child, then reconstruct its files from the shown
+    // expression so the backend must write the decoded bytes and kinds.
+    r.j(&["mapRoot (\\c -> c { files = [] }) . new . describe \"source\""]).ok();
+    assert!(!r.dir.join("binary").exists());
+    #[cfg(unix)]
+    {
+        assert!(!r.dir.join("executable").exists());
+        assert!(r.dir.join("link").symlink_metadata().is_err());
+    }
+    let restore = format!("mapRoot (\\c -> c {{ files = {}, message = \"restored\" }})", shown);
+    r.j(&[&restore]).ok();
+    assert_eq!(std::fs::read(r.dir.join("binary")).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(r.read("executable"), "#!/bin/sh\necho preserved\n");
+        assert_ne!(std::fs::metadata(r.dir.join("executable")).unwrap().permissions().mode() & 0o111, 0);
+        assert!(r.dir.join("link").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(r.dir.join("link")).unwrap(), PathBuf::from("binary"));
+    }
+    assert_eq!(r.j(&[&equal]).ok().stdout.trim(), "true");
+}
+
+#[test]
+fn invalid_utf8_config_is_preserved() {
+    let r = setup();
+    let cfg = r.cfg.join("j/config.j");
+    let original = b"-- Custom config with a Latin-1 comment: caf\xe9\n";
+    std::fs::write(&cfg, original).unwrap();
+    let before = r.operation_heads();
+
+    let out = r.j(&["describe \"must not run\""]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot read config"), "{}", out.stderr);
+    assert!(!out.stderr.contains("created an editable default config"), "{}", out.stderr);
+    assert_eq!(std::fs::read(&cfg).unwrap(), original);
+    assert_eq!(r.operation_heads(), before);
+}
+
+#[test]
+fn user_identity_control_characters_do_not_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let r = Repo { dir: temp.path().join("repo"), cfg: temp.path().join("config") };
+    std::fs::create_dir(&r.dir).unwrap();
+    std::fs::create_dir_all(r.cfg.join("j")).unwrap();
+    // Git signatures exclude CR/LF; exercise every other ASCII control
+    // character, including those the old TOML builder failed to escape.
+    let controls: String = (0u8..=31).chain([127])
+        .filter(|c| !matches!(c, b'\r' | b'\n')).map(char::from).collect();
+    let name = format!("A{}\\\"éZ", controls);
+    let email = format!("e{}\\\"é@example.com", controls);
+    let name_literal = j::show::text_literal(&name);
+    let email_literal = j::show::text_literal(&email);
+    let config = include_str!("../config.j")
+        .replace("\"Your Name\"", &name_literal)
+        .replace("\"you@example.com\"", &email_literal);
+    std::fs::write(r.cfg.join("j/config.j"), config).unwrap();
+
+    // init uses strict identity loading; subsequent commands open an
+    // existing workspace. Both used to parse hand-built, invalid TOML.
+    r.j(&["init"]).ok();
+    assert_eq!(r.j(&["1"]).ok().stdout, "1\n");
+    r.j(&["describe \"identity preserved\""]).ok();
+    assert_eq!(r.j(&["show user.name"]).ok().stdout, format!("{}\n", name_literal));
+    assert_eq!(r.j(&["show user.email"]).ok().stdout, format!("{}\n", email_literal));
+}
+
+#[test]
 fn missing_config_is_created_editable() {
     let dir = std::env::temp_dir().join(format!(
         "j-cli-nocfg-{}-{}",
@@ -3310,7 +3461,7 @@ fn missing_config_is_created_editable() {
     // the config now exists at the user path and is editable by the owner
     let cfg = cfg_home.join("j/config.j");
     let written = std::fs::read_to_string(&cfg).expect("config was created");
-    assert!(written.contains("treeWith"), "default config content");
+    assert_eq!(written, include_str!("../config.j"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

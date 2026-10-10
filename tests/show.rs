@@ -5,7 +5,7 @@ use j::domain::MemBackend;
 use j::eval::Interp;
 use j::parse::parse_expr;
 use j::show::{show, text_literal, unified_diff};
-use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Env, LazyBlob, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Crash, Env, LazyBlob, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -109,6 +109,89 @@ fn show_roundtrips_all_kinds() {
     // shapes
     let s = i.shapes.shape_of("Commit").unwrap();
     roundtrip(&mut i, &cfg, &Value::Shape(Rc::new(s)));
+}
+
+#[test]
+fn show_preserves_resolved_blob_bytes_and_file_types() {
+    let (mut i, cfg) = make_interp();
+    for kind in [BlobKind::Regular, BlobKind::Executable, BlobKind::Symlink] {
+        for bytes in [vec![], b"target\n".to_vec(), vec![0xff, 0x80], (0..=255).collect()] {
+            let bytes = Rc::new(bytes);
+            let eager = Value::Blob(Rc::new(BlobVal {
+                kind: kind.clone(),
+                content: BlobContent::Resolved(bytes.clone()),
+            }));
+            let lazy = Value::Blob(Rc::new(BlobVal {
+                kind: kind.clone(),
+                content: BlobContent::Lazy(Rc::new(LazyBlob::new(
+                    "stored-blob".into(), move || Ok(bytes),
+                ))),
+            }));
+            assert_eq!(show(&i, &eager).unwrap(), show(&i, &lazy).unwrap());
+            roundtrip(&mut i, &cfg, &eager);
+            roundtrip(&mut i, &cfg, &lazy);
+            // Snapshots exercise atom parentheses and wide rendering too.
+            let snapshot = Value::list(vec![Value::record(&[
+                ("content", lazy),
+                ("path", Value::list(vec![Value::text("file")])),
+            ])]);
+            roundtrip(&mut i, &cfg, &snapshot);
+        }
+    }
+    assert_eq!(show(&i, &BlobVal::text_blob("text")).unwrap(), "blob \"text\"");
+    let binary = Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Regular,
+        content: BlobContent::Resolved(Rc::new(vec![0xff, 0x80])),
+    }));
+    assert_eq!(show(&i, &binary).unwrap(), "blobHex \"regular\" \"ff80\"");
+}
+
+#[test]
+fn show_requires_a_lossless_constructor_in_older_configs() {
+    let src = CONFIG.lines().filter(|line| !line.starts_with("blobHex "))
+        .collect::<Vec<_>>().join("\n");
+    let cfg = config::load_config(&src).unwrap();
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).unwrap();
+    assert_eq!(show(&i, &BlobVal::text_blob("text")).unwrap(), "blob \"text\"");
+    for (kind, bytes) in [
+        (BlobKind::Regular, vec![0xff, 0x80]),
+        (BlobKind::Executable, b"script".to_vec()),
+        (BlobKind::Symlink, b"target".to_vec()),
+    ] {
+        let v = Value::Blob(Rc::new(BlobVal {
+            kind,
+            content: BlobContent::Resolved(Rc::new(bytes)),
+        }));
+        let error = show(&i, &v).unwrap_err();
+        assert!(error.msg.contains("blobHex : Text -> Text -> Blob"), "{}", error.msg);
+    }
+}
+
+#[test]
+fn show_propagates_blob_read_errors() {
+    let (i, _) = make_interp();
+    let v = Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Executable,
+        content: BlobContent::Lazy(Rc::new(LazyBlob::new(
+            "missing-blob".into(), || Err(Crash::new("store cannot read blob")),
+        ))),
+    }));
+    assert_eq!(show(&i, &v).unwrap_err().msg, "store cannot read blob");
+}
+
+#[test]
+fn difft_rejects_path_components_that_are_not_basenames() {
+    let mut invalid = vec!["", ".", "..", "../outside", "../../outside", "/outside", "nested/file", "./file", "file/"];
+    if cfg!(windows) {
+        invalid.extend(["..\\outside", "nested\\file", "C:\\outside", "C:outside", "\\outside", "file\\"]);
+    }
+    for name in invalid {
+        let path = Value::list(vec![Value::text(name)]);
+        let error = j::show::difft(&path, &BlobVal::text_blob("old"), &BlobVal::text_blob("new"))
+            .unwrap_err();
+        assert!(error.msg.contains("last path component must be a filename"), "{name:?}: {}", error.msg);
+    }
 }
 
 #[test]
@@ -235,16 +318,20 @@ fn show_unresolved_blob() {
 }
 
 #[test]
-fn show_refuses_resolved_blobs_without_an_equal_literal() {
-    let (mut i, cfg) = make_interp();
+fn show_older_configs_refuse_resolved_blobs_without_an_equal_literal() {
+    let src = CONFIG.lines().filter(|line| !line.starts_with("blobHex "))
+        .collect::<Vec<_>>().join("\n");
+    let cfg = config::load_config(&src).unwrap();
+    let mut i = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut i, &cfg).unwrap();
     let catcher = parse_expr("\\x -> show x or \"caught\"", Rc::new(cfg.global_names.clone())).unwrap();
     let env = i.global_env();
     let catcher = i.eval(&Rc::new(catcher), &env).unwrap();
     for lazy in [false, true] {
-        for (kind, bytes, message) in [
-            (BlobKind::Regular, vec![0xff, 0xfe], "non-UTF-8"),
-            (BlobKind::Executable, b"echo hi\n".to_vec(), "executable"),
-            (BlobKind::Symlink, b"target".to_vec(), "symlink"),
+        for (kind, bytes) in [
+            (BlobKind::Regular, vec![0xff, 0xfe]),
+            (BlobKind::Executable, b"echo hi\n".to_vec()),
+            (BlobKind::Symlink, b"target".to_vec()),
         ] {
             let content = if lazy {
                 BlobContent::Lazy(Rc::new(LazyBlob::new("stored".into(), move || Ok(Rc::new(bytes)))))
@@ -259,7 +346,7 @@ fn show_refuses_resolved_blobs_without_an_equal_literal() {
                 ("path", Value::list(vec![Value::text("file")])),
             ])]);
             let error = show(&i, &snapshot).unwrap_err();
-            assert!(error.msg.contains(message), "{}", error.msg);
+            assert!(error.msg.contains("blobHex : Text -> Text -> Blob"), "{}", error.msg);
             let caught = i.apply(catcher.clone(), snapshot.clone()).unwrap();
             assert_eq!(caught.as_text().unwrap(), "caught");
             assert!(show(&i, &snapshot).is_err());

@@ -110,6 +110,69 @@ fn eval_and_display(interp: &mut Interp, cfg: &config::Config, src: &str, repo: 
 }
 
 #[test]
+fn custom_aliases_do_not_displace_special_display_shapes() {
+    let names = ["Commit", "Entry", "Subtree", "Repo", "Frame", "Change"];
+    let mut source = CONFIG.to_string();
+    // Deliberately choose an alias-first map order for every display shape.
+    // Rendering is tested once against the normal config, not repeatedly
+    // until randomized HashMap iteration happens to expose the old bug.
+    let cfg = (0..128).find_map(|n| {
+        for name in names {
+            source.push_str(&format!("\nAlias{}{} = {}\n", name, n, name));
+        }
+        let cfg = config::load_config(&source).unwrap();
+        let aliases_first = names.iter().all(|name| {
+            let kind = cfg.shapes.shape_of(name).unwrap().kind;
+            cfg.shapes.decls.keys().find(|candidate| {
+                cfg.shapes.shape_of(candidate).is_some_and(|shape| shape.kind == kind)
+            }).is_some_and(|first| first != name)
+        });
+        aliases_first.then_some(cfg)
+    }).expect("could not construct alias-first declarations");
+    let (repo, backend) = sample_repo();
+    let mut aliased = Interp::new(Rc::new(backend), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut aliased, &cfg).unwrap();
+    let (_, backend) = sample_repo();
+    let (mut normal, normal_cfg) = make_interp(backend);
+    for expression in [
+        "focus",
+        "head . files",
+        "files",
+        "\\r -> { root = r.root, children = r.children }",
+        "id",
+        "head . (.context)",
+        "changeOf",
+        "\\r -> { commit = r.root, entry = head r.root.files, repo = r, frame = head r.context, change = changeOf r }",
+    ] {
+        let expected = eval_and_display(&mut normal, &normal_cfg, expression, repo.clone());
+        let actual = eval_and_display(&mut aliased, &cfg, expression, repo.clone());
+        assert_eq!(actual, expected, "{}", expression);
+    }
+}
+
+#[test]
+fn display_shapes_still_resolve_configured_aliases_and_field_sets() {
+    let source = CONFIG.replace(
+        "Entry    = { path : Path, content : Blob }",
+        "Entry = FileEntry\nFileEntry = { path : Path, content : Blob, note : Text }",
+    );
+    let cfg = config::load_config(&source).unwrap();
+    let (repo, backend) = sample_repo();
+    let mut interp = Interp::new(Rc::new(backend), cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut interp, &cfg).unwrap();
+    let out = eval_and_display(
+        &mut interp, &cfg,
+        "{ path = ./file, content = blob \"hello\", note = \"metadata\" }", repo.clone(),
+    );
+    assert_eq!(out, "  file  5 B\n");
+    // The original two-field record no longer has the configured Entry shape.
+    let out = eval_and_display(
+        &mut interp, &cfg, "{ path = ./file, content = blob \"hello\" }", repo,
+    );
+    assert!(out.starts_with("content  ‹5 B›\n"), "{}", out);
+}
+
+#[test]
 fn status_example() {
     let (repo, be) = sample_repo();
     let (mut i, cfg) = make_interp(be);

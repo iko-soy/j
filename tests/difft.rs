@@ -1,14 +1,12 @@
-//! Difftastic receives valid filenames without changing their basenames.
-
+//! Difftastic receives unchanged basenames in isolated temporary directories.
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const CONFIG: &str = include_str!("../config.j");
-
 #[test]
-fn difft_preserves_long_and_special_filenames() {
+fn difft_preserves_basenames_and_cleans_up_temporary_files() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let config = temp.path().join("config");
@@ -16,21 +14,18 @@ fn difft_preserves_long_and_special_filenames() {
     std::fs::create_dir(&repo).unwrap();
     std::fs::create_dir_all(config.join("j")).unwrap();
     std::fs::create_dir(&bin).unwrap();
-    std::fs::write(config.join("j/config.j"), CONFIG).unwrap();
+    std::fs::write(
+        config.join("j/config.j"),
+        include_str!("../config.j")
+            .replace("Your Name", "Test User")
+            .replace("you@example.com", "test@example.com"),
+    ).unwrap();
     let stub = bin.join("difft");
-    std::fs::write(&stub, r#"#!/bin/sh
-case "$1" in */old/*) ;; *) exit 10 ;; esac
-case "$2" in */new/*) ;; *) exit 11 ;; esac
-[ "${1##*/}" = "${2##*/}" ] || exit 12
-[ "$1" != "$2" ] || exit 13
-IFS= read -r before < "$1"
-IFS= read -r after < "$2"
-printf '%s|%s|%s\n' "${1##*/}" "$before" "$after"
-"#).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nIFS= read -r old < \"$1\"\nIFS= read -r new < \"$2\"\nprintf '%s\\n' \"$1\" \"$2\" \"$old\" \"$new\"\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |expr: &str| -> Output {
+    let run = |expression: &str| -> Output {
         Command::new(env!("CARGO_BIN_EXE_j"))
-            .arg(expr)
+            .arg(expression)
             .current_dir(&repo)
             .env("XDG_CONFIG_HOME", &config)
             .env("PATH", &bin)
@@ -40,16 +35,32 @@ printf '%s|%s|%s\n' "${1##*/}" "$before" "$after"
     };
     let init = run("init");
     assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
-    for name in [
-        format!("{}.rs", "x".repeat(252)), // NAME_MAX = 255 bytes, including the suffix
-        "Makefile".to_string(),
-        "file with spaces.rs".to_string(),
+
+    let longest = format!("{}.rs", "a".repeat(252)); // NAME_MAX, including suffix
+    for (path, basename) in [
+        (format!("[{}]", j::show::text_literal(&longest)), longest.as_str()),
+        ("[\"src\" \"main.rs\"]".to_string(), "main.rs"),
+        ("[\"Makefile\"]".to_string(), "Makefile"),
+        ("[\"file with spaces.rs\"]".to_string(), "file with spaces.rs"),
+        ("[]".to_string(), "file"),
     ] {
-        let expr = format!("difft [{}] (blob \"before\\n\") (blob \"after\\n\")", j::show::text_literal(&name));
-        let result = run(&expr);
+        let result = run(&format!("difft {} (blob \"old\\n\") (blob \"new\\n\")", path));
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-        assert_eq!(String::from_utf8(result.stdout).unwrap(), format!("{}|before|after\n", name));
+        let output = String::from_utf8(result.stdout).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 4, "{output}");
+        assert_eq!(&lines[2..], &["old", "new"]);
+        let old = PathBuf::from(lines[0]);
+        let new = PathBuf::from(lines[1]);
+        assert_eq!(old.file_name().unwrap(), basename);
+        assert_eq!(new.file_name().unwrap(), basename);
+        assert_eq!(old.parent().unwrap().file_name().unwrap(), "old");
+        assert_eq!(new.parent().unwrap().file_name().unwrap(), "new");
+        assert_ne!(old.parent(), new.parent());
+        assert_eq!(old.parent().unwrap().parent(), new.parent().unwrap().parent());
+        assert!(!old.parent().unwrap().parent().unwrap().exists(), "temporary directory leaked");
     }
+
     // Paths are structural lists at run time. A malformed last component
     // must not let `join` put temporary blob contents outside their directory.
     let escaped = temp.path().join("escaped");

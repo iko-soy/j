@@ -171,11 +171,16 @@ fn field_set(v: &Value) -> Option<BTreeSet<String>> {
 
 fn shape_of_record(interp: &Interp, v: &Value) -> Option<String> {
     let fs = field_set(v)?;
-    for (name, _) in &interp.shapes.decls {
+    // Only these named shapes have special display forms (§5.1). Searching
+    // every declaration let a custom alias win in HashMap iteration order,
+    // randomly turning Commit, Entry, etc. values into generic records.
+    // Resolve each configured shape so aliases and custom field sets still
+    // determine which records match.
+    for name in ["Commit", "Entry", "Subtree", "Repo", "Frame", "Change"] {
         if let Some(s) = interp.shapes.shape_of(name) {
             if let ShapeKind::Record(want) = &s.kind {
                 if want == &fs {
-                    return Some(name.clone());
+                    return Some(name.to_string());
                 }
             }
         }

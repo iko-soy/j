@@ -39,7 +39,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ".", "id", "const", "crash", "==", "/=", "&&", "||", "not", "+", "-", "*", "<", "<=", ">",
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
-    "replay", "unresolved", "blob", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
+    "replay", "unresolved", "blob", "blobHex", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
     "extract", "touchedPaths", "subtreeCommits", "lookupCommit", "lookupContent",
 ];
 

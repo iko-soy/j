@@ -256,7 +256,9 @@ not  : Bool -> Bool
 ```
 
 `&&` and `||` short-circuit (the right operand is not evaluated if the left
-decides the result). Operands must be `Bool`.
+decides the result). Operands must be `Bool`. Infix use requires their
+declarations in `config.j` and checks the contracts of evaluated operands
+and the result; a skipped right operand is not checked.
 
 ```
 1 == 1 && 2 == 2        => true
@@ -301,12 +303,16 @@ Defined on `Int` only; crash on anything else. Non-associative (cannot chain:
 show : a -> Text
 ```
 
-Renders values in the language's literal syntax, such that (except for
-closures and unresolved blobs) the text parses and evaluates back to an equal
-value. Resolved binary, executable, and symlink blobs have no equal literal;
-`show` crashes on them, even inside other values. A top-level `Text` prints
-raw, so `j show …` is how you inspect values.
+When it succeeds, `show` renders a value in the language's literal syntax.
+Except for closures and unresolved blobs, the text parses and evaluates back
+to an equal value. A top-level `Text` prints raw, so `j show …` is how you inspect values.
 See §5.2 of the spec for the exact rendering.
+
+Regular UTF-8 blobs render as `blob "…"`; binary blobs, executables, and
+symlinks render as `blobHex "kind" "…"`, preserving bytes and file type with
+lowercase hexadecimal content. An older custom config without
+`blobHex : Text -> Text -> Blob` must add that declaration before showing
+these values; otherwise `show` crashes with instructions to do so.
 
 ```
 show 42                 => "42"
@@ -443,11 +449,12 @@ unresolved ((head (replay [({ path = ./f, content = blob "onto" })]
 Two laws to internalise it: `replay b { from = b, to = x } = x` and
 `replay x { from = b, to = b } = x`.
 
-### `unresolved`, `blob`, `text` — blob primitives
+### `unresolved`, `blob`, `blobHex`, `text` — blob primitives
 
 ```
 unresolved : Blob -> Bool
 blob       : Text -> Blob
+blobHex    : Text -> Text -> Blob
 text       : Blob -> Text
 ```
 
@@ -455,9 +462,16 @@ text       : Blob -> Text
 blob's content (its conflict-marker rendering if unresolved). `unresolved b`
 is `true` iff the blob is a conflict.
 
+`blobHex kind hex` constructs a resolved blob from its file kind and bytes.
+The kind must be `"regular"`, `"executable"`, or `"symlink"`; the bytes must
+be an even-length hexadecimal text, using uppercase or lowercase letters.
+An unknown kind or malformed hex crashes. `text` crashes on non-UTF-8 bytes;
+persisting a symlink also requires a UTF-8 target.
+
 ```
 blob "content"              =>  blob "content"
 text (blob "content")       => "content"
+text (blobHex "regular" "6869") => "hi"
 unresolved (blob "x")       => false
 ```
 
@@ -1144,6 +1158,7 @@ j 'tree'
 | `attach` | `Subtree -> Edit` | §7.1 |
 | `backout` | `Revset -> Edit` | §8 |
 | `blob` | `Text -> Blob` | §5 |
+| `blobHex` | `Text -> Text -> Blob` | §5 |
 | `both` | `Fileset -> Fileset -> Fileset` | §7.2 |
 | `by` | `Id -> Repo -> Repo` | §5 |
 | `changeOf` | `Repo -> Change` | §7.2 |

@@ -82,6 +82,32 @@ fn arithmetic() {
 }
 
 #[test]
+fn blob_hex_decodes_exact_bytes_and_file_type() {
+    use j::value::BlobKind;
+    let (mut i, cfg) = make_interp();
+    for (name, kind) in [
+        ("regular", BlobKind::Regular),
+        ("executable", BlobKind::Executable),
+        ("symlink", BlobKind::Symlink),
+    ] {
+        for (hex, bytes) in [("", vec![]), ("00ff80A5", vec![0, 255, 128, 165])] {
+            let v = ok(&mut i, &cfg, &format!("blobHex \"{}\" \"{}\"", name, hex));
+            let Value::Blob(b) = v else { panic!("expected Blob") };
+            assert_eq!(b.kind, kind);
+            assert_eq!(b.bytes().unwrap(), bytes);
+            assert!(!b.is_unresolved());
+        }
+    }
+    for hex in ["f", "xyz", "0g", "é", "00 ff"] {
+        let msg = crash(&mut i, &cfg, &format!("blobHex \"regular\" \"{}\"", hex));
+        assert!(msg.contains("invalid hexadecimal content"), "{}", msg);
+    }
+    assert!(crash(&mut i, &cfg, "blobHex \"directory\" \"\"").contains("kind must be"));
+    assert!(crash(&mut i, &cfg, "blobHex 1 \"00\"").contains("expected Text"));
+    assert!(crash(&mut i, &cfg, "blobHex \"regular\" 1").contains("expected Text"));
+}
+
+#[test]
 fn identity_and_const() {
     let (mut i, cfg) = make_interp();
     check!(i, cfg, "id 5", Value::int(5));
