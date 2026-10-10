@@ -481,6 +481,9 @@ fn validate_tree(tree: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash>
             id
         )));
     }
+    // Persistence reads every description as Text, even when its files
+    // stay backed by a stored tree. A dry run must reject the same value.
+    root.field("message")?.as_text()?;
     // a list loaded from a stored tree is a snapshot already: jj's tree
     // holds each name once, and lists a path as a file or as a directory.
     // Reading every commit's to check it made each persist read the files
@@ -496,13 +499,18 @@ fn validate_tree(tree: &Value, seen: &mut BTreeSet<String>) -> Result<(), Crash>
     Ok(())
 }
 
-/// unique paths, none of them the root `./`, none both a file and a
-/// directory (§7.5 step 1)
+/// Entries have Blob contents and unique paths, none of them the root `./`
+/// or both a file and a directory (§7.3, §7.5 step 1).
 fn validate_snapshot(files: &Value) -> Result<(), Crash> {
     let files = files.as_list()?;
     let mut paths = BTreeSet::new();
     for e in files {
         let p = e.field("path")?;
+        // Inspect the value's kind only: binary and unresolved blobs are
+        // valid, and a lazy blob need not read its bytes to pass validation.
+        if !matches!(e.field("content")?, Value::Blob(_)) {
+            return Err(Crash::new("persistence: snapshot content is not a Blob"));
+        }
         let p = p.as_list()?;
         let key: Vec<String> = p
             .iter()

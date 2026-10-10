@@ -226,15 +226,14 @@ fn run() -> ExitCode {
     // stdin is only read to report the "both" error — and reading it blindly
     // hangs whenever the process inherited a pipe nobody is writing to (a
     // shell loop, a CI step), so wait only briefly for input to appear.
-    // Bytes that are not UTF-8 are input too, and an error only once they
-    // are the expression.
+    // One byte already proves the "both" error: do not wait for the pipe's
+    // writer to close it. Bytes that are not UTF-8 are input too, and an
+    // error only once they are the expression.
     let mut stdin_content = Vec::new();
     let stdin_has_data = {
         if std::io::stdin().is_terminal() {
             false
         } else if args.is_empty() || stdin_is_ready(50) {
-            // With arguments, a single byte proves the invocation invalid.
-            // Waiting for EOF would hang while a pipe's writer remains open.
             let limit = if args.is_empty() { u64::MAX } else { 1 };
             match std::io::stdin().take(limit).read_to_end(&mut stdin_content) {
                 Ok(n) => n > 0,
@@ -329,8 +328,7 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             if words.len() != 1 {
                 return command_usage("fetch", "fetch");
             }
-            let (cfg, _) = or_exit(load_config_file());
-            let backend = or_exit(open_repo_locked(&cfg));
+            let backend = or_exit(open_repo_noconfig());
             command_result(
                 j::terminal::with_progress("Fetching changes", || backend.cmd_fetch()),
                 "Fetch complete",

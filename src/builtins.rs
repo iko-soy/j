@@ -97,6 +97,7 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("touchedPaths", 1, b_touched_paths),
         builtin("subtreeCommits", 1, b_subtree_commits),
         builtin("blob", 1, b_blob),
+        builtin("blobHex", 2, b_blob_hex),
         builtin("text", 1, b_text),
         builtin("by", 2, b_by),
         builtin("lookupCommit", 2, b_lookup_commit),
@@ -526,6 +527,21 @@ fn b_blob(_i: &mut Interp, args: &[Value]) -> BResult {
     Ok(Value::Blob(Rc::new(BlobVal {
         kind: BlobKind::Regular,
         content: BlobContent::Resolved(Rc::new(t.as_bytes().to_vec())),
+    })))
+}
+
+fn b_blob_hex(_i: &mut Interp, args: &[Value]) -> BResult {
+    let kind = match args[0].as_text()? {
+        "regular" => BlobKind::Regular,
+        "executable" => BlobKind::Executable,
+        "symlink" => BlobKind::Symlink,
+        _ => return Err(Crash::new("blobHex: kind must be regular, executable, or symlink")),
+    };
+    let bytes = hex::decode(args[1].as_text()?)
+        .map_err(|e| Crash::new(format!("blobHex: invalid hexadecimal content: {}", e)))?;
+    Ok(Value::Blob(Rc::new(BlobVal {
+        kind,
+        content: BlobContent::Resolved(Rc::new(bytes)),
     })))
 }
 

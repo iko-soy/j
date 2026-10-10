@@ -146,6 +146,7 @@ unresolved : Blob -> Bool
 touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;
                                            -- blobs compared by content id, bytes never read
 blob       : Text -> Blob                  -- a resolved regular file
+blobHex    : Text -> Text -> Blob          -- kind (regular/executable/symlink), hex bytes
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
 lookupCommit : Id -> Repo -> Commit       -- indexed commit lookup without moving the focus

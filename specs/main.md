@@ -560,6 +560,7 @@ as in §4.13.
 | `replay onto ch` | replay the change `ch` (`{ from, to }`) onto the snapshot `onto`; §7.3 |
 | `unresolved b` | `true` iff the blob is a conflict |
 | `blob t` | a resolved regular-file blob with content `t` |
+| `blobHex kind hex` | a resolved blob of kind `"regular"`, `"executable"`, or `"symlink"`, with bytes decoded from an even-length hexadecimal text; accepts either letter case, crashes for an unknown kind or invalid hex |
 | `text b` | the content of a blob as text; for an unresolved blob, its conflict-marker rendering |
 | `by i repo` | the repo refocused on the commit with id `i`; crashes if absent. Backed by the change-id index; its reference definition is in §10 |
 | `lookupCommit i repo` | `(by i repo).root`, indexed once per repository value without constructing a location for each lookup. Duplicate ids select the first preorder match; malformed trees retain `by`'s traversal behavior |
@@ -659,6 +660,11 @@ signature is a crash, not a reason to try the other side. A signature on
 a definition that is not a function (`user`, `conflicts`) is checked once,
 against the value, when the definition is evaluated at load.
 
+Infix `&&` and `||` must be declared like other builtins. Their contracts
+check each operand that is evaluated and the result, including a result
+decided by the left operand alone. A skipped right operand is neither
+evaluated nor checked.
+
 The check is one level deep and never inspects inside a list or a record's
 field values:
 
@@ -702,7 +708,9 @@ indented under their key or bullet. Colour follows §7.11's rules and is used
 only when stdout is a terminal; nothing is conveyed by colour alone.
 
 Shapes are recognised by their exact field set, as in §4.12: `Commit`, `Entry`,
-`Subtree`, `Repo`, `Frame`, `Change`. Any other record is generic.
+`Subtree`, `Repo`, `Frame`, `Change`, checked in that order using their
+configured definitions. Additional type aliases do not displace these
+display forms. Any other record is generic.
 
 | kind | line form | block form |
 |---|---|---|
@@ -798,16 +806,18 @@ j: crash: expected one revision, got 0
 
 ### 5.2 `show`
 
-`show v` renders `v` as an expression in the language. Resolved blobs that
-are not UTF-8 regular files cannot be represented by `blob "…"`: `show`
-crashes on binary, executable, or symlink blobs, including inside other
-values, instead of substituting different contents or file types. For every
-value it renders except closures, unresolved blobs, and values nested past
-the parser's bound (§3.4: a list 40,000 deep, a record about 20,000), `show v`
-parses and evaluates to a value equal to `v` under the same `config.j`. It
-never uses colour and never truncates. A value holding a part the store
-cannot supply (a `files` list or a file's content, §7.2) crashes `show` as it
-crashes any other use: `show` writes no stand-in for the part.
+When it succeeds, `show v` renders `v` as an expression in the language, such
+that for every value except closures, unresolved blobs, and values nested past the parser's
+bound (§3.4: a list 40,000 deep, a record about 20,000), `show v` parses and
+evaluates to a value equal to `v` under the same `config.j`. It never uses
+colour and never truncates. A value holding a part the store cannot supply (a
+`files` list or a file's content, §7.2) crashes `show` as it crashes any other
+use: `show` writes no stand-in for the part.
+
+Binary blobs and non-regular file kinds require the declaration
+`blobHex : Text -> Text -> Blob` in `config.j`; if it is missing, `show`
+crashes with instructions to add it. Existing custom configs are not
+modified automatically.
 
 | kind | rendering |
 |---|---|
@@ -817,7 +827,8 @@ crashes any other use: `show` writes no stand-in for the part.
 | list | `[v1 v2 …]` |
 | record | `{ a = v, b = w }`, fields in ascending lexicographic order |
 | `Id` | `@` followed by the full id, e.g. `@wqztkpqxmnrvyxskptlmzzzzabcd` |
-| resolved UTF-8 regular `Blob` | `blob "…"`; other resolved blobs crash |
+| resolved regular `Blob` with valid UTF-8 content | `blob "…"` |
+| other resolved `Blob` | `blobHex "kind" "…"`, preserving file kind and bytes, with lowercase hexadecimal content |
 | unresolved `Blob` | `{- unresolved -} blob "…"` with the conflict-marker rendering |
 | builtin | its declared name, operators parenthesised: `map`, `(++)` |
 | selector | the selector itself: `.id` |
@@ -855,10 +866,10 @@ Since `show` returns a `Text` and a top-level `Text` displays raw,
 ### 6.1 Location and loading
 
 `j` reads `$XDG_CONFIG_HOME/j/config.j`, defaulting to `~/.config/j/config.j`.
-Expression evaluation, `push`, and `fetch` load the configuration; `init` and
+Expression evaluation and `push` load the configuration; `init` and
 `clone` need `user`. When there is no repository yet (`init`, `clone`), only
 `user` is evaluated; `Id` literals are not resolved and no other definition
-is evaluated. `remote`, `undo`, `redo`, and `ops` do not load configuration.
+is evaluated. `remote`, `fetch`, `undo`, `redo`, and `ops` do not load configuration.
 When a command needs configuration and none exists, the binary writes its
 embedded reference `config.j` (§9) to that path as an editable starting point,
 readable and writable by its owner, and reports its path. An existing file is
@@ -924,6 +935,10 @@ but nothing here requires the `jj` binary to be installed.
 Walk up from the current directory to the first directory containing `.jj`.
 Only the default workspace is supported; if the working directory belongs to
 another workspace, exit 2.
+The working copy must also include the whole repository: sparse patterns
+must contain the root path. Otherwise exit 2 without changing the patterns,
+files, or operations, with instructions to run
+`jj sparse set --clear --add .` before using `j`.
 
 ### 7.2 Building the `Repo` value
 
@@ -1027,10 +1042,11 @@ some other value in its place.
   `./a` to `./a/b` replayed onto `./a/b`; the deletion of `./a/z` replayed
   onto a snapshot where `./a` is a file gives that file), and it may crash
   where jj carries a conflict that one of the three held at `./a`.
-- `unresolved`, `blob`, and `text` are as in §4.9. `blob` produces a regular
-  file. File type (executable, symlink) travels with a `Blob` but cannot be
-  changed in the language. `text` of a symlink is its target; `text` of a
-  non-UTF-8 blob crashes.
+- `unresolved`, `blob`, `blobHex`, and `text` are as in §4.9. `blob` produces
+  a regular file from text. `blobHex` constructs a regular file, executable,
+  or symlink from its kind and hexadecimal bytes, so `show` can preserve both
+  content and file type. `text` of a symlink is its target; `text` of a
+  non-UTF-8 blob crashes. Persisting a symlink with a non-UTF-8 target crashes.
 
 ### 7.4 Working-directory invariant
 
@@ -1133,11 +1149,14 @@ recorded, described by the expression text (truncated to 200 characters).
 Within it:
 
 1. **Validate shape.** `new` has the shape of a `Repo`; every `id` occurs
-   exactly once; every snapshot has unique paths, none of them the root `./`
-   and none both a file and a directory (§7.3); every path component of the
-   focus, of every other commit that is not in `old`, and of every path any
-   other commit holds that it did not hold in `old` (§7.3), is a name a
-   checkout can create: not empty, `.`, `..`, `.git` or `.jj`, without `/`
+   exactly once; every commit's `message` is a `Text`; every snapshot entry
+   has a `path` list of texts and a `content` that is a `Blob`; every snapshot
+   has unique paths, none of them the root `./` and none both a file and a
+   directory (§7.3); every path
+   component of the focus, of every other commit that is not in `old`, and
+   of every path any other commit holds that it did not hold in `old`
+   (§7.3), is a name a checkout can create: not empty, `.`, `..`, `.git` or
+   `.jj`, without `/`
    or NUL, and a name the workspace's filesystem can hold. A name the working
    directory holds (§7.4) is one. A name longer than 255 bytes, the limit of
    ext4, is tried on the filesystem, since exFAT, NTFS and APFS count 255
@@ -1319,27 +1338,43 @@ Bringing work up to date is a separate expression, e.g. `rebase trunk`.
 ### 7.7 Operations, undo, redo, and the lock
 
 Every persisting `j` program, and each of `fetch` and `push`, records exactly
-one jj operation, described by the expression or command text. Crashes record
-nothing, except as §7.5 step 7 says.
+one jj operation, described by the expression or command text. A push's
+description includes its `push ` prefix, so an expression named `init` or
+`clone` cannot be mistaken for the operation that created the repository.
+Crashes record nothing, except as §7.5 step 7 says.
 
-**Kinds.** `j` marks each operation it records, in the operation's metadata,
-as *normal*, *undo* (naming the operation it undid), or *redo* (naming the
-undo it reversed). Operations recorded by other tools are treated as normal,
-except that an operation whose description carries jj's own undo or redo
-marker is treated accordingly, so mixed use chains correctly where the marker
-is present and degrades to "undo the newest operation" where it is not.
+**Kinds.** An operation is *normal*, *undo*, or *redo*, determined by its
+description. New undo and redo records use jj's current markers,
+`undo: restore to operation <id>` and `redo: restore to operation <id>`.
+The id names the exact operation whose view was restored, retaining the
+navigation point for later undo and redo commands.
+Older `j` markers (`undo: <id>` naming the discarded operation and
+`redo: <id>` naming the reversed undo) and jj's legacy `undo operation <id>` /
+`redo operation <id>` markers remain readable with their original meanings.
+An operation without a recognized marker is normal, so mixed use degrades
+to "undo the newest operation" where no marker is present.
 
-**`undo`** finds the operation to undo: starting at the head, while the
-current operation is an undo, move to the operation it undid and then to that
-operation's parent; while it is a redo, move past the operation it reapplied.
-The first normal operation reached is undone by recording a new operation
-that restores its parent's view, marked as an undo of it. If none is found,
-or the one found is the operation `init` or `clone` recorded (§7.8), before
-which there was no repository, exit 1 with `j: nothing to undo`.
+For current markers, start at the head and follow restored-operation links
+while their kind matches the command: undo links for `undo`, redo links for
+`redo`. The command then selects that operation's parent. Follow links of
+the same kind at the selected target too, and record the final target's id
+and view. Reversing direction therefore restores the opposite marker's
+parent, and either CLI can continue the other's undo/redo chain.
 
-**`redo`** requires the head to be an undo (possibly reached through redos);
-it records an operation restoring the view of the operation that undo
-discarded, marked as a redo. Otherwise exit 1 with `j: nothing to redo`.
+**`undo`** restores the state before the operation reached by that walk.
+If no parent exists, or the operation reached is the `init` or `clone`
+operation (§7.8), before which there was no repository, exit 1 with
+`j: nothing to undo`.
+
+**`redo`** requires the operation reached through redo links to be an undo;
+it restores the state that undo discarded. Otherwise exit 1 with
+`j: nothing to redo`.
+
+For older `j` markers, undo follows an undo's discarded operation to its
+parent, or a redo's reversed undo to the operation it discarded. Redo
+follows a redo's reversed undo to its parent until it reaches an undo,
+then restores that undo's parent. This preserves pending redos when a
+history crosses from older markers into current ones.
 
 Both refuse, before doing anything, if the working directory holds a change
 the focused commit does not, as a snapshot would find it (§7.4; a stale
@@ -1769,6 +1804,7 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
 blob       : Text -> Blob                  -- a resolved regular file
+blobHex    : Text -> Text -> Blob          -- kind (regular/executable/symlink), hex bytes
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
 subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one
@@ -2217,9 +2253,9 @@ treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false,
 ## 10. Testing
 
 The interpreter must be testable without a jj repository. Provide an in-memory
-implementation of the domain builtins (`replay`, `unresolved`, `blob`,
+implementation of the domain builtins (`replay`, `unresolved`, `blob`, `blobHex`,
 `text`, `by`, `extract`, `meta`, `difft` as a stub, and the minting
-of `@`) in which a blob is text, a
+of `@`) in which a resolved blob carries bytes and a file kind, a
 conflict is a record of the three sides, and `replay` resolves a path exactly
 when at most one side changed it or both made the same change, path by path
 even where a file meets a directory, which jj merges as one value (§7.3).
@@ -2349,9 +2385,9 @@ j 'pr "fix login"' && j 'push (label "fix-login" here)'
 
 Second parents of merge commits (merges are placed under their first parent
 and are read-only); hunk-level `split`; conflict resolution inside the
-language (blobs are opaque); workspaces other than the default; remotes other
-than `origin`; tags; submodules and LFS; ignore rules beyond `.gitignore`;
-changing file modes or symlinks from the language; repairing a repository in
-which one change id has two visible commits (refused; §7.2); general command
-flags beyond the first-word `--help` and `-h` aliases; static typing. None of
+language (blobs are opaque); workspaces other than the default; sparse working
+copies (refused; §7.1); remotes other than `origin`; tags; submodules and LFS;
+ignore rules beyond `.gitignore`; repairing a repository in which one change
+id has two visible commits (refused; §7.2); general command flags beyond the
+first-word `--help` and `-h` aliases; static typing. None of
 these are precluded by the design.

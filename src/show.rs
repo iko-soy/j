@@ -67,7 +67,7 @@ fn render(interp: &Interp, v: &Value, out: &mut String) -> Result<(), Crash> {
             }
             out.push_str(" }");
         }
-        Value::Blob(b) => return render_blob(b, out),
+        Value::Blob(b) => return render_blob(interp, b, out),
         Value::Shape(s) => out.push_str(&s.name),
         Value::Fun(f) => return render_fun(interp, f, out),
     }
@@ -84,31 +84,43 @@ fn render_int(n: &BigInt, out: &mut String) {
 }
 
 #[inline(never)]
-fn render_blob(b: &BlobVal, out: &mut String) -> Result<(), Crash> {
-    // Conflicts deliberately show their markers, without promising a round
-    // trip (§5.2). Every resolved blob must instead have an equal literal:
-    // `blob` constructs only a regular UTF-8 file, so other kinds and bytes
-    // cannot be silently replaced by a different blob.
+fn render_blob(interp: &Interp, b: &BlobVal, out: &mut String) -> Result<(), Crash> {
+    // Unresolved blobs render as marker text, explicitly outside the
+    // round-trip guarantee. Resolved blobs must preserve bytes and kind.
     if b.is_unresolved() {
         let bytes = b.bytes()?;
         out.push_str("{- unresolved -} blob ");
         push_text_literal(&String::from_utf8_lossy(&bytes), out);
         return Ok(());
     }
-    match b.kind {
-        BlobKind::Regular => {}
-        BlobKind::Executable => return Err(Crash::new("show: cannot represent an executable blob")),
-        BlobKind::Symlink => return Err(Crash::new("show: cannot represent a symlink blob")),
-    }
     let bytes = match &b.content {
         BlobContent::Resolved(bytes) => bytes.clone(),
         BlobContent::Lazy(lazy) => lazy.force()?,
         BlobContent::Conflict(_) => unreachable!("handled above"),
     };
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| Crash::new("show: cannot represent a non-UTF-8 blob"))?;
-    out.push_str("blob ");
-    push_text_literal(text, out);
+    if b.kind == BlobKind::Regular {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            out.push_str("blob ");
+            push_text_literal(text, out);
+            return Ok(());
+        }
+    }
+    // Existing user configs are never upgraded automatically. Do not emit
+    // an expression they cannot read back when they lack the new builtin.
+    if interp.globals.lookup("blobHex").is_none() {
+        return Err(Crash::new(
+            "show: binary, executable, and symlink blobs require `blobHex : Text -> Text -> Blob` in config.j",
+        ));
+    }
+    let kind = match b.kind {
+        BlobKind::Regular => "regular",
+        BlobKind::Executable => "executable",
+        BlobKind::Symlink => "symlink",
+    };
+    out.push_str("blobHex ");
+    push_text_literal(kind, out);
+    out.push(' ');
+    push_text_literal(&hex::encode(bytes.as_ref()), out);
     Ok(())
 }
 
@@ -443,8 +455,12 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
         .map(|c| c.as_text().map(|s| s.to_string()))
         .transpose()?
         .unwrap_or_else(|| "file".to_string());
-    if std::path::Path::new(&last).file_name().and_then(|n| n.to_str()) != Some(last.as_str()) {
-        return Err(Crash::new("difft: expected a filename as the last path component"));
+    // A Path value can be built directly in the language. Only a basename
+    // may be joined below the temporary directories: an absolute path or
+    // a component containing separators must not escape them.
+    let name = std::path::Path::new(&last);
+    if name.file_name() != Some(name.as_os_str()) {
+        return Err(Crash::new("difft: the last path component must be a filename"));
     }
     let a_bytes = match a {
         Value::Blob(bl) => bl.bytes()?,
@@ -462,8 +478,8 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
     let new_dir = dir.path().join("new");
     std::fs::create_dir(&old_dir).map_err(|e| Crash::new(format!("difft: {}", e)))?;
     std::fs::create_dir(&new_dir).map_err(|e| Crash::new(format!("difft: {}", e)))?;
-    let old = old_dir.join(&last);
-    let new = new_dir.join(&last);
+    let old = old_dir.join(name);
+    let new = new_dir.join(name);
     std::fs::write(&old, &a_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
     std::fs::write(&new, &b_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
     let mut cmd = std::process::Command::new("difft");
