@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, ThunkVal, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, ConflictSide, Crash, LazyBlob, ListVal, ThunkVal, Value};
 use futures::{StreamExt, TryStreamExt};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
@@ -31,12 +31,12 @@ use jj_lib::store::Store;
 use jj_lib::transaction::UnpublishedOperation;
 use jj_lib::working_copy::{LockedWorkingCopy, SnapshotError, SnapshotOptions};
 use jj_lib::workspace::Workspace;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -1416,6 +1416,7 @@ fn with_tree(commit: &Commit, tree: MergedTree) -> Commit {
 #[derive(Clone)]
 pub struct JjBackend {
     inner: Arc<JjInner>,
+    replay_cache: Rc<ReplayCache>,
 }
 
 impl JjBackend {
@@ -1448,6 +1449,7 @@ impl JjBackend {
         let repo = block_on(workspace.repo_loader().load_at_head())
             .map_err(|e| (2, format!("cannot load the repository at head: {}", e)))?;
         Ok(JjBackend {
+            replay_cache: Rc::new(ReplayCache::default()),
             inner: Arc::new(JjInner {
                 workspace_root: root,
                 workspace: Mutex::new(workspace),
@@ -1502,7 +1504,7 @@ impl JjBackend {
             .map_err(|e| (2, format!("cannot reload the repository at head: {}", e)))?;
         *self.inner.repo.lock().unwrap() = head_repo;
         let loaded_visible = Arc::new(block_on(read_visible(&self.current_repo()))?);
-        let loaded = build_repo_value(&loaded_visible, &loaded_visible.wc_change_id)?;
+        let loaded = build_repo_value(&loaded_visible, &loaded_visible.wc_change_id, &self.replay_cache)?;
 
         let current = if snapshot {
             // §7.4: snapshot the working directory into the wc commit; the
@@ -1519,7 +1521,7 @@ impl JjBackend {
                 Some(pending) => {
                     *self.inner.pending.lock().unwrap() = Some(pending);
                     let vis = block_on(read_visible(&post))?;
-                    let cur = build_repo_value(&vis, &vis.wc_change_id)?;
+                    let cur = build_repo_value(&vis, &vis.wc_change_id, &self.replay_cache)?;
                     *self.inner.visible.lock().unwrap() = Some(Arc::new(vis));
                     cur
                 }
@@ -2729,6 +2731,7 @@ pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
     }
     .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
     let backend = JjBackend {
+        replay_cache: Rc::new(ReplayCache::default()),
         inner: Arc::new(JjInner {
             workspace_root: cwd.clone(),
             workspace: Mutex::new(workspace),
@@ -2973,6 +2976,7 @@ fn clone_into(
     ))
     .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
     let backend = JjBackend {
+        replay_cache: Rc::new(ReplayCache::default()),
         inner: Arc::new(JjInner {
             workspace_root: dir_path.to_path_buf(),
             workspace: Mutex::new(workspace),
@@ -3749,8 +3753,16 @@ impl Backend for JjBackend {
     }
 
     fn replay(&self, onto: &[Value], from: &[Value], to: &[Value]) -> Result<Vec<Value>, Crash> {
+        self.replay_snapshot(
+            &Value::list(onto.to_vec()),
+            &Value::list(from.to_vec()),
+            &Value::list(to.to_vec()),
+        )?.as_list().map(<[Value]>::to_vec)
+    }
+
+    fn replay_snapshot(&self, onto: &Value, from: &Value, to: &Value) -> Result<Value, Crash> {
         let store = self.current_repo().store().clone();
-        block_on(jj_replay(&store, onto, from, to))
+        block_on(jj_replay(&store, &self.replay_cache, onto, from, to))
     }
 }
 
@@ -3758,15 +3770,119 @@ impl Backend for JjBackend {
 // jj three-way tree merge for `replay` (§7.3)
 // ----------------------------------------------------------------------
 
+/// Replay sees the same lists repeatedly: a parent's old and new files
+/// become each child's bases. Retain their validated trees by list identity,
+/// including its offset, without keeping discarded snapshots alive.
+#[derive(Default)]
+struct ReplayCache {
+    trees: RefCell<HashMap<(*const Vec<Value>, usize), ReplayTree>>,
+    empty_subtrees: RefCell<HashMap<TreeId, bool>>,
+    next_sweep: Cell<usize>,
+    blobs: BlobCache,
+    entries: EntryCache,
+}
+
+struct ReplayTree {
+    storage: Weak<Vec<Value>>,
+    tree: MergedTree,
+    /// A list read from a resolved tree, already in canonical path order.
+    canonical: bool,
+}
+
+impl ReplayCache {
+    fn remember(&self, list: &ListVal, tree: MergedTree, canonical: bool) {
+        let mut trees = self.trees.borrow_mut();
+        trees.insert(list.identity(), ReplayTree {
+            storage: list.weak_storage(),
+            tree,
+            canonical,
+        });
+        if trees.len() >= self.next_sweep.get().max(256) {
+            trees.retain(|_, t| t.storage.strong_count() != 0);
+            self.next_sweep.set((trees.len() * 2).max(256));
+        }
+    }
+
+    async fn tree_of(&self, store: &Arc<Store>, files: &Value) -> Result<(MergedTree, bool), Crash> {
+        let Value::List(list) = files else {
+            files.as_list()?;
+            unreachable!();
+        };
+        if let Some(cached) = self.trees.borrow().get(&list.identity()) {
+            // The weak reference keeps its allocation reserved, so another
+            // list cannot reuse this address while the key is cached.
+            if cached.storage.strong_count() != 0 {
+                return Ok((cached.tree.clone(), cached.canonical));
+            }
+        }
+        // Validate every new list before caching it, even when from == to:
+        // an unchanged change must still reject malformed snapshots.
+        let tree = build_tree(store, files).await?;
+        self.remember(list, tree.clone(), false);
+        Ok((tree, false))
+    }
+
+    async fn files_of(&self, store: &Arc<Store>, tree: &MergedTree) -> Result<Value, Crash> {
+        let (files, reusable) = tree_to_files_inner(store, tree, &self.blobs, &self.entries).await?;
+        let list = ListVal::new(files);
+        if reusable && !self.has_empty_subtrees(tree).await? {
+            self.remember(&list, tree.clone(), true);
+        }
+        Ok(Value::List(list))
+    }
+
+    /// Flattening a Git tree omits empty directories. Reusing such a tree
+    /// would let a replay conflict with a directory absent from its input
+    /// snapshot. Inspect directories once per tree, without rebuilding files.
+    async fn has_empty_subtrees(&self, tree: &MergedTree) -> Result<bool, Crash> {
+        let Some(root) = tree.tree_ids().as_resolved() else { return Ok(true) };
+        if let Some(found) = self.empty_subtrees.borrow().get(root) {
+            return Ok(*found);
+        }
+        let store = tree.store();
+        let mut pending = vec![(RepoPathBuf::root(), root.clone())];
+        let mut visited = BTreeSet::new();
+        while let Some((dir, id)) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let known = self.empty_subtrees.borrow().get(&id).copied();
+            if let Some(found) = known {
+                if found {
+                    self.empty_subtrees.borrow_mut().insert(root.clone(), true);
+                    return Ok(true);
+                }
+                continue;
+            }
+            let loaded = store.get_tree(dir.clone(), &id).await
+                .map_err(|e| Crash::new(format!("cannot read a tree: {}", e)))?;
+            for entry in loaded.entries_non_recursive() {
+                if let TreeValue::Tree(child) = entry.value() {
+                    if child == store.empty_tree_id() {
+                        self.empty_subtrees.borrow_mut().insert(root.clone(), true);
+                        return Ok(true);
+                    }
+                    pending.push((dir.join(entry.name()), child.clone()));
+                }
+            }
+        }
+        // Every subtree visited was nonempty all the way down. Sharing this
+        // answer also avoids rescanning unchanged directories of later trees.
+        self.empty_subtrees.borrow_mut().extend(visited.into_iter().map(|id| (id, false)));
+        Ok(false)
+    }
+}
+
 async fn jj_replay(
     store: &Arc<Store>,
-    onto: &[Value],
-    from: &[Value],
-    to: &[Value],
-) -> Result<Vec<Value>, Crash> {
-    let onto_tree = build_tree(store, &Value::list(onto.to_vec())).await?;
-    let from_tree = build_tree(store, &Value::list(from.to_vec())).await?;
-    let to_tree = build_tree(store, &Value::list(to.to_vec())).await?;
+    cache: &ReplayCache,
+    onto: &Value,
+    from: &Value,
+    to: &Value,
+) -> Result<Value, Crash> {
+    let (onto_tree, onto_canonical) = cache.tree_of(store, onto).await?;
+    let (from_tree, from_canonical) = cache.tree_of(store, from).await?;
+    let (to_tree, to_canonical) = cache.tree_of(store, to).await?;
     // any of the three may itself be conflicted (a snapshot with unresolved
     // blobs, §7.3), so merge the trees the way jj's rebase does:
     // MergedTree::merge flattens conflicted inputs into one merge, simplifies
@@ -3780,8 +3896,20 @@ async fn jj_replay(
     .await
     .map_err(|e| Crash::new(format!("replay: {}", e)))?;
     refuse_file_directory_clash(&merged, &onto_tree, &from_tree, &to_tree).await?;
+    // Reusing a resolved tree's list preserves replay's sorted output. A
+    // constructed list may have another order, and conflicts may simplify
+    // on reading, so neither can take this shortcut.
+    for (files, tree, canonical) in [
+        (onto, &onto_tree, onto_canonical),
+        (to, &to_tree, to_canonical),
+        (from, &from_tree, from_canonical),
+    ] {
+        if canonical && merged.tree_ids() == tree.tree_ids() {
+            return Ok(files.clone());
+        }
+    }
     // conflicts stay as unresolved blobs (§7.3)
-    tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
+    cache.files_of(store, &merged).await
 }
 
 /// Crash if the merge left a conflict with a file on one side and, on
@@ -4077,34 +4205,49 @@ fn to_repo_path(path: &[String]) -> Result<RepoPathBuf, Crash> {
 // jj trees -> values
 // ----------------------------------------------------------------------
 
-/// blob contents keyed by file id, shared across the whole repo load: most
-/// files are unchanged between commits, so inflating each blob once (instead
-/// of once per commit that references it) keeps loading linear in the
-/// repository's unique data rather than commits × files
+/// Blob contents keyed by file id, shared while snapshots hold their bytes.
+/// Weak entries let discarded replay results release their conflict sides.
 #[derive(Clone, Default)]
-struct BlobCache(Rc<RefCell<HashMap<FileId, Rc<Vec<u8>>>>>);
+struct BlobCache {
+    bytes: Rc<RefCell<HashMap<FileId, Weak<Vec<u8>>>>>,
+    next_sweep: Rc<Cell<usize>>,
+}
 
 impl BlobCache {
     fn get(&self, id: &FileId) -> Option<Rc<Vec<u8>>> {
-        self.0.borrow().get(id).cloned()
+        self.bytes.borrow().get(id).and_then(Weak::upgrade)
     }
     fn insert(&self, id: FileId, bytes: Rc<Vec<u8>>) {
-        self.0.borrow_mut().insert(id, bytes);
+        let mut cached = self.bytes.borrow_mut();
+        cached.insert(id, Rc::downgrade(&bytes));
+        if cached.len() >= self.next_sweep.get().max(256) {
+            cached.retain(|_, bytes| bytes.strong_count() != 0);
+            self.next_sweep.set((cached.len() * 2).max(256));
+        }
     }
 }
 
-/// whole file *entries* ({path, content}) keyed by (path, blob identity),
-/// shared across the whole repo load: an unchanged file is the same Value in
-/// every commit, so it is built once and cloned (an Rc bump) thereafter
+/// Whole file entries keyed by (path, blob identity), shared by loaded
+/// snapshots and replays. Weak references let transient replay results go
+/// away while unchanged entries still held by a snapshot are reused.
 #[derive(Clone, Default)]
-struct EntryCache(Rc<RefCell<HashMap<String, Value>>>);
+struct EntryCache {
+    entries: Rc<RefCell<HashMap<String, Weak<crate::value::RecordMap>>>>,
+    next_sweep: Rc<Cell<usize>>,
+}
 
 impl EntryCache {
     fn get(&self, key: &str) -> Option<Value> {
-        self.0.borrow().get(key).cloned()
+        self.entries.borrow().get(key).and_then(Weak::upgrade).map(Value::Record)
     }
     fn insert(&self, key: String, entry: Value) {
-        self.0.borrow_mut().insert(key, entry);
+        let Value::Record(record) = entry else { return };
+        let mut entries = self.entries.borrow_mut();
+        entries.insert(key, Rc::downgrade(&record));
+        if entries.len() >= self.next_sweep.get().max(256) {
+            entries.retain(|_, entry| entry.strong_count() != 0);
+            self.next_sweep.set((entries.len() * 2).max(256));
+        }
     }
 }
 
@@ -4284,9 +4427,27 @@ async fn tree_to_files(
     cache: &BlobCache,
     entries: &EntryCache,
 ) -> Result<Vec<Value>, Crash> {
+    tree_to_files_inner(store, tree, cache, entries).await.map(|(files, _)| files)
+}
+
+/// Whether these files can reuse the original tree in replay. Reading a
+/// conflict simplifies it, and an unsupported git submodule reads as an
+/// empty file, so their original trees cannot represent the resulting list.
+async fn tree_to_files_inner(
+    store: &Arc<Store>,
+    tree: &MergedTree,
+    cache: &BlobCache,
+    entries: &EntryCache,
+) -> Result<(Vec<Value>, bool), Crash> {
     let mut out = Vec::new();
+    let mut reusable = tree.tree_ids().is_resolved();
     for (path, value) in tree.entries() {
         let value = value.map_err(|e| Crash::new(format!("cannot read a tree entry: {}", e)))?;
+        reusable &= match value.as_resolved() {
+            Some(Some(TreeValue::File { copy_id, .. })) => *copy_id == CopyId::placeholder(),
+            Some(Some(TreeValue::Symlink(_))) => true,
+            _ => false,
+        };
         // cache key: the entry is fully determined by its path and the
         // identity of its (resolved) content; conflicts are not cached
         let key = match value.as_resolved() {
@@ -4317,7 +4478,7 @@ async fn tree_to_files(
         };
         out.push(entry);
     }
-    Ok(out)
+    Ok((out, reusable))
 }
 
 // ----------------------------------------------------------------------
@@ -4360,15 +4521,13 @@ fn new_id_set(repo: &Value) -> Result<BTreeSet<String>, Crash> {
 // building the Repo value from the visible map (§7.2)
 // ----------------------------------------------------------------------
 
-fn build_repo_value(vis: &VisibleRepo, focus_change: &str) -> Result<Value, OpenError> {
+fn build_repo_value(vis: &VisibleRepo, focus_change: &str, replay_cache: &Rc<ReplayCache>) -> Result<Value, OpenError> {
     let root_rec = vis
         .commits
         .get(ROOT_ID)
         .ok_or_else(|| (2, "no root commit".to_string()))?;
     let store = root_rec.commit.store().clone();
-    let cache = BlobCache::default();
-    let entries = EntryCache::default();
-    let mut subtree = build_subtree(vis, root_rec, &store, &cache, &entries)?;
+    let mut subtree = build_subtree(vis, root_rec, &store, replay_cache)?;
     sort_subtree(&mut subtree, vis);
     let top = Value::record(&[
         ("children", subtree.field("children").map_err(|e| (2, e.msg))?),
@@ -4385,8 +4544,7 @@ fn build_subtree(
     vis: &VisibleRepo,
     rec: &StoredCommit,
     store: &Arc<Store>,
-    cache: &BlobCache,
-    entries: &EntryCache,
+    replay_cache: &Rc<ReplayCache>,
 ) -> Result<Value, OpenError> {
     // the files list is lazy (§7.2): most commits are never inspected, so
     // their file entries are materialized only on first `field("files")`.
@@ -4397,11 +4555,9 @@ fn build_subtree(
         let store = store.clone();
         let tree = rec.commit.tree();
         let name = Some(tree_name(&tree));
-        let cache = cache.clone();
-        let entries = entries.clone();
+        let replay_cache = replay_cache.clone();
         Value::Thunk(Rc::new(crate::value::ThunkVal::stored(rec.change_id.clone(), name, move || {
-            let files = block_on(tree_to_files(&store, &tree, &cache, &entries))?;
-            Ok(Value::list(files))
+            block_on(replay_cache.files_of(&store, &tree))
         })))
     };
     let labels: Vec<Value> = vis
@@ -4422,7 +4578,7 @@ fn build_subtree(
     if let Some(kids) = vis.children.get(&rec.change_id) {
         for kid in kids {
             if let Some(krec) = vis.commits.get(kid) {
-                children.push(build_subtree(vis, krec, store, cache, entries)?);
+                children.push(build_subtree(vis, krec, store, replay_cache)?);
             }
         }
     }
@@ -4463,6 +4619,112 @@ mod tests {
     use super::*;
     use jj_lib::backend::SymlinkId;
     use jj_lib::conflict_labels::ConflictLabels;
+
+    fn replay_store() -> (tempfile::TempDir, Arc<Store>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, repo) = block_on(Workspace::init_colocated_git(
+            &user_settings(None), dir.path(), gix::hash::Kind::Sha1,
+        )).unwrap();
+        (dir, repo.store().clone())
+    }
+
+    fn file(path: &str, content: &str) -> Value {
+        Value::record(&[
+            ("path", Value::list(vec![Value::text(path)])),
+            ("content", BlobVal::text_blob(content)),
+        ])
+    }
+
+    fn loaded_files(store: &Arc<Store>, cache: &ReplayCache, files: Vec<Value>) -> Value {
+        let tree = block_on(build_tree(store, &Value::list(files))).unwrap();
+        block_on(cache.files_of(store, &tree)).unwrap()
+    }
+
+    #[test]
+    fn replay_reuses_loaded_snapshots_and_unchanged_entries() {
+        let (_dir, store) = replay_store();
+        let cache = ReplayCache::default();
+        let base = loaded_files(&store, &cache, vec![file("a", "base a"), file("b", "base b")]);
+        let same = block_on(jj_replay(&store, &cache, &base, &base, &base)).unwrap();
+        let (Value::List(before), Value::List(after)) = (&base, &same) else { panic!() };
+        assert_eq!(before.identity(), after.identity(), "no-op replay must retain the snapshot");
+
+        let onto = loaded_files(&store, &cache, vec![file("a", "onto"), file("b", "base b")]);
+        let to = loaded_files(&store, &cache, vec![file("a", "base a"), file("b", "to")]);
+        let merged = block_on(jj_replay(&store, &cache, &onto, &base, &to)).unwrap();
+        let expected = Value::list(vec![file("a", "onto"), file("b", "to")]);
+        assert!(crate::value::value_eq(&merged, &expected).unwrap());
+        for (result, input) in [
+            (&merged.as_list().unwrap()[0], &onto.as_list().unwrap()[0]),
+            (&merged.as_list().unwrap()[1], &to.as_list().unwrap()[1]),
+        ] {
+            let (Value::Record(result), Value::Record(input)) = (result, input) else { panic!() };
+            assert!(Rc::ptr_eq(result, input), "unchanged file entries must be shared");
+        }
+    }
+
+    #[test]
+    fn replay_cache_preserves_validation_ordering_and_list_offsets() {
+        let (_dir, store) = replay_store();
+        let cache = ReplayCache::default();
+        let unsorted = Value::list(vec![file("b", "b"), file("a", "a")]);
+        let empty = Value::list(vec![]);
+        let sorted = block_on(jj_replay(&store, &cache, &unsorted, &empty, &empty)).unwrap();
+        assert!(crate::value::value_eq(&sorted, &Value::list(vec![file("a", "a"), file("b", "b")])).unwrap());
+
+        let Value::List(list) = &sorted else { panic!() };
+        let tail = Value::List(list.skip(1));
+        let replayed_tail = block_on(jj_replay(&store, &cache, &tail, &empty, &empty)).unwrap();
+        assert!(crate::value::value_eq(&tail, &replayed_tail).unwrap());
+        assert_eq!(replayed_tail.as_list().unwrap().len(), 1);
+
+        let malformed = Value::list(vec![file("a", "one"), file("a", "two")]);
+        let err = block_on(jj_replay(&store, &cache, &sorted, &malformed, &malformed)).unwrap_err();
+        assert!(err.msg.contains("duplicate paths"), "{}", err.msg);
+    }
+
+    #[test]
+    fn replay_ignores_empty_directories_not_represented_by_snapshots() {
+        let (_dir, store) = replay_store();
+        let cache = ReplayCache::default();
+        let entry = |id| jj_lib::backend::Tree::from_sorted_entries(vec![
+            (RepoPathComponentBuf::new("d".to_string()).unwrap(), TreeValue::Tree(id)),
+        ]);
+        let direct = block_on(store.write_tree(RepoPath::root(), entry(store.empty_tree_id().clone()))).unwrap();
+        let nested = block_on(store.write_tree(RepoPath::root(), entry(direct.id().clone()))).unwrap();
+        let empty = Value::list(vec![]);
+        let to = Value::list(vec![file("d", "file")]);
+        for tree in [direct, nested] {
+            let tree = MergedTree::resolved(store.clone(), tree.id().clone());
+            let onto = block_on(cache.files_of(&store, &tree)).unwrap();
+            assert!(onto.as_list().unwrap().is_empty());
+            let result = block_on(jj_replay(&store, &cache, &onto, &empty, &to)).unwrap();
+            assert!(crate::value::value_eq(&result, &to).unwrap());
+        }
+    }
+
+    #[test]
+    fn replay_cache_does_not_keep_discarded_snapshots_alive() {
+        let (_dir, store) = replay_store();
+        let cache = ReplayCache::default();
+        let files = loaded_files(&store, &cache, vec![file("a", "a")]);
+        let Value::List(list) = &files else { panic!() };
+        let storage = list.weak_storage();
+        let Value::Record(entry) = &files.as_list().unwrap()[0] else { panic!() };
+        let entry = Rc::downgrade(entry);
+        drop(files);
+        assert!(storage.upgrade().is_none());
+        assert!(entry.upgrade().is_none());
+
+        let bytes = Rc::new(vec![1, 2, 3]);
+        let weak_bytes = Rc::downgrade(&bytes);
+        let id = FileId::new(vec![1; 20]);
+        cache.blobs.insert(id.clone(), bytes.clone());
+        assert!(Rc::ptr_eq(&cache.blobs.get(&id).unwrap(), &bytes));
+        drop(bytes);
+        assert!(weak_bytes.upgrade().is_none());
+        assert!(cache.blobs.get(&id).is_none());
+    }
 
     #[test]
     fn a_description_names_its_terms_whatever_their_labels_and_the_sides_that_cancel() {

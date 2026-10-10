@@ -4,7 +4,7 @@
 use crate::domain::{Backend, ROOT_ID};
 use crate::eval::Interp;
 use crate::value::{value_eq, Crash, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// navigate: refocus `repo` on the commit with change id `id` (§10 reference).
 ///
@@ -65,6 +65,43 @@ fn find_path(children: &[Value], id: &str, path: &mut Vec<usize>) -> Result<bool
         path.pop();
     }
     Ok(false)
+}
+
+thread_local! {
+    // One repository value, held while it is the key so its address cannot
+    // be reused. Edits create a different record and invalidate the index.
+    static COMMIT_INDEX: std::cell::RefCell<Option<(
+        std::rc::Rc<crate::value::RecordMap>, Option<HashMap<String, Value>>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The root of `by_id`, without allocating a zipper for every queried id.
+/// A malformed tree uses the original walk: a commit found before a bad
+/// sibling must still be readable, and duplicate ids keep their first match.
+pub fn commit_by_id(repo: &Value, id: &str) -> Result<Option<Value>, Crash> {
+    if let Value::Record(key) = repo {
+        let indexed = COMMIT_INDEX.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.as_ref().is_some_and(|(k, _)| std::rc::Rc::ptr_eq(k, key)) {
+                let index = (|| -> Result<HashMap<String, Value>, Crash> {
+                    let mut index = HashMap::new();
+                    let mut pending = vec![top_of(repo)?];
+                    while let Some(tree) = pending.pop() {
+                        let commit = tree.field("root")?;
+                        index.entry(id_of(&commit)?).or_insert(commit);
+                        pending.extend(tree.field("children")?.as_list()?.iter().rev().cloned());
+                    }
+                    Ok(index)
+                })().ok();
+                *cache = Some((key.clone(), index));
+            }
+            cache.as_ref().unwrap().1.as_ref().map(|index| index.get(id).cloned())
+        });
+        if let Some(found) = indexed {
+            return Ok(found);
+        }
+    }
+    by_id(repo, id)?.map(|r| r.field("root")).transpose()
 }
 
 /// compare a commit's id without copying it out

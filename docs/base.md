@@ -810,6 +810,9 @@ goto parents            -- == prev
 ```
 
 **`commitAt : Id -> Repo -> Commit`** — the commit with a given id.
+The reference definition uses `lookupCommit`, which indexes the repository
+once and retrieves commits without moving the focus. Its result is the same
+as `(by i repo).root`.
 
 **`prev : Edit`** — to the parent (`goto parents`).
 
@@ -1045,6 +1048,20 @@ j 'files'               -- the working-copy commit's files
 
 **`contentAt : Path -> Snapshot -> Blob`** — the content at a path, or an
 empty file if absent.
+The reference definition uses `lookupContent`, which shares a path index
+between repeated lookups in each snapshot. Duplicate paths still select the
+first entry, as `head (entryAt p s)` does.
+
+Existing user configurations keep working with their original definitions.
+To enable both indexed lookups, add these builtin declarations to your config:
+
+```
+lookupCommit : Id -> Repo -> Commit
+lookupContent : Path -> Snapshot -> Blob
+```
+
+Then replace the bodies of `commitAt` and `contentAt` with `lookupCommit` and
+`lookupContent`, respectively, keeping their existing signatures.
 
 ```
 contentAt ./a [({ path = ./a, content = blob "x" })]

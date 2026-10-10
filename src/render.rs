@@ -3,7 +3,8 @@
 use crate::domain::ROOT_ID;
 use crate::eval::Interp;
 use crate::value::{Crash, ListVal, RecordMap, ShapeKind, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Bound;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
@@ -1836,25 +1837,25 @@ fn tree_render(
     // Step 2 — row order (topological, oldest first)
     let mut flat: Vec<&Display> = Vec::new();
     flatten_display(&droot, &mut flat);
-    let preorder: BTreeMap<usize, usize> =
-        flat.iter().enumerate().map(|(i, n)| (n.uid(), i)).collect();
-    let mut ready: Vec<&Display> = vec![&droot];
+    // Display uids are dense. Keep the preorder position as the heap's
+    // second key, so a newly ready descendant wins a time tie with a later
+    // sibling just as it does in the specification's ready set.
+    let mut preorder = vec![0; flat.len()];
+    for (i, n) in flat.iter().enumerate() {
+        preorder[n.uid()] = i;
+    }
+    let mut ready = BinaryHeap::from([Reverse((droot.time(), 0usize))]);
     let mut rows: Vec<&Display> = Vec::new();
-    while !ready.is_empty() {
-        let best = ready
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, n)| (n.time(), preorder[&n.uid()]))
-            .map(|(i, _)| i)
-            .unwrap();
-        let n = ready.remove(best);
+    while let Some(Reverse((_, i))) = ready.pop() {
+        let n = flat[i];
         rows.push(n);
         for c in n.children() {
-            ready.push(c);
+            ready.push(Reverse((c.time(), preorder[c.uid()])));
         }
     }
     // Step 3 — lanes
-    let placements = assign_lanes(&rows, &trunk, lanes_n);
+    let index = RowIndex::new(&rows);
+    let placements = assign_lanes(&rows, &index, &trunk, lanes_n);
     // id column: shortest unique prefix among the display tree's commits, min 4
     // (sorted once, so each row costs a lookup rather than a scan of them all)
     let mut ids: Vec<String> = rows
@@ -1866,7 +1867,7 @@ fn tree_render(
         crate::eval::unique_prefix_in(&ids, id).len()
     };
     // Step 4 — draw
-    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len, term_w)
+    draw_rows(&rows, &index, &placements, opts, pal, lanes_n, with_focus, &prefix_len, term_w)
 }
 
 fn id_of_frame_parent(frame: &Value) -> Result<String, Crash> {
@@ -2142,23 +2143,65 @@ fn mark_subtree(n: &Display, set: &mut BTreeSet<usize>) {
     }
 }
 
-fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> Vec<Placement> {
+/// Relations in display-row order, indexed once for lane assignment and
+/// size bars. Finding a parent or the focus afresh on every row made even a
+/// single line of history take quadratic time.
+struct RowIndex {
+    row_of: Vec<usize>,
+    parent: Vec<Option<usize>>,
+    last_child: Vec<Option<usize>>,
+    focus_adjacent: Vec<bool>,
+}
+
+impl RowIndex {
+    fn new(rows: &[&Display]) -> Self {
+        let mut index = RowIndex {
+            row_of: vec![0; rows.len()],
+            parent: vec![None; rows.len()],
+            last_child: vec![None; rows.len()],
+            focus_adjacent: vec![false; rows.len()],
+        };
+        for (i, n) in rows.iter().enumerate() {
+            index.row_of[n.uid()] = i;
+        }
+        for (i, n) in rows.iter().enumerate() {
+            for c in n.children() {
+                let child = index.row_of[c.uid()];
+                index.parent[child] = Some(i);
+                index.last_child[i] = Some(index.last_child[i].map_or(child, |last| last.max(child)));
+            }
+        }
+        if let Some(focus) = rows.iter().position(|n| n.commit().is_some_and(|c| c.is_focus)) {
+            if let Some(parent) = index.parent[focus] {
+                index.focus_adjacent[parent] = true;
+            }
+            for c in rows[focus].children() {
+                index.focus_adjacent[index.row_of[c.uid()]] = true;
+            }
+        }
+        index
+    }
+}
+
+fn assign_lanes(
+    rows: &[&Display],
+    index: &RowIndex,
+    trunk: &BTreeSet<String>,
+    lanes_n: usize,
+) -> Vec<Placement> {
     let mut rails: Vec<Option<Rail>> = vec![None; lanes_n];
     let mut out: Vec<Placement> = Vec::new();
     let mut flattened: BTreeSet<usize> = BTreeSet::new();
     // each node's row: "last child" and "after t" are in row order, which is
     // not sibling order once an edit appends a child (`new`, `rebase`)
-    let row_of: BTreeMap<usize, usize> =
-        rows.iter().enumerate().map(|(i, n)| (n.uid(), i)).collect();
+    let row_of = &index.row_of;
     for (idx, n) in rows.iter().enumerate() {
         let in_trunk = n.in_trunk(trunk);
-        let parent = rows[..idx]
-            .iter()
-            .copied()
-            .find(|p| p.children().iter().any(|c| c.uid() == n.uid()));
-        let parent_lane = parent.and_then(|p| out[rows[..idx].iter().position(|x| x.uid() == p.uid()).unwrap()].lane);
-        let is_last_child = parent
-            .map(|p| p.children().iter().all(|c| row_of[&c.uid()] <= idx))
+        let parent_idx = index.parent[idx];
+        let parent = parent_idx.map(|i| rows[i]);
+        let parent_lane = parent_idx.and_then(|i| out[i].lane);
+        let is_last_child = parent_idx
+            .map(|i| index.last_child[i] == Some(idx))
             .unwrap_or(false);
         let was_flat = flattened.contains(&n.uid());
         let mut lane: Option<usize> = None;
@@ -2225,9 +2268,9 @@ fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> 
             if let Some(t) = cs.iter().find(|c| c.in_trunk(trunk)) {
                 let mut after: Vec<&Display> = cs
                     .iter()
-                    .filter(|c| row_of[&c.uid()] > row_of[&t.uid()])
+                    .filter(|c| row_of[c.uid()] > row_of[t.uid()])
                     .collect();
-                after.sort_by_key(|c| row_of[&c.uid()]);
+                after.sort_by_key(|c| row_of[c.uid()]);
                 for c in after {
                     if flattened.contains(&c.uid()) {
                         continue;
@@ -2273,7 +2316,7 @@ struct RowText {
 
 fn build_row_text(
     n: &Display,
-    rows: &[&Display],
+    focus_adjacent: bool,
     opts: &TreeOptions,
     pal: &Palette,
     with_focus: bool,
@@ -2311,23 +2354,8 @@ fn build_row_text(
         },
     };
     // size bar
-    let focus_idx = rows
-        .iter()
-        .position(|m| m.commit().map(|x| x.is_focus).unwrap_or(false));
-    let is_focus_parent = focus_idx
-        .map(|fi| {
-            rows[..fi].iter().any(|p| {
-                p.children()
-                    .iter()
-                    .any(|ch| ch.uid() == rows[fi].uid()) && p.uid() == n.uid()
-            })
-        })
-        .unwrap_or(false);
-    let is_focus_child = focus_idx
-        .map(|fi| rows[fi].children().iter().any(|ch| ch.uid() == n.uid()))
-        .unwrap_or(false);
     let show_bar = opts.detail >= 1
-        && c.map(|x| opts.detail >= 2 || x.is_focus || is_focus_parent || is_focus_child)
+        && c.map(|x| opts.detail >= 2 || x.is_focus || focus_adjacent)
             .unwrap_or(false);
     let bar = if show_bar {
         c.map(|x| size_bar(x.size, pal)).unwrap_or_default()
@@ -2392,6 +2420,7 @@ fn build_row_text(
 #[allow(clippy::too_many_arguments)]
 fn draw_rows(
     rows: &[&Display],
+    index: &RowIndex,
     placements: &[Placement],
     opts: &TreeOptions,
     pal: &Palette,
@@ -2403,8 +2432,15 @@ fn draw_rows(
     let rail_chars = 2 * lanes_n;
     // each row's rails, drawn once; a run row's go on past the rails area
     // when its count does not fit
-    let rails: Vec<(Vec<char>, Vec<bool>)> = (0..rows.len())
-        .map(|idx| rail_row(rows, placements, idx, lanes_n, opts))
+    let mut rail_state = vec![None; lanes_n];
+    let rails: Vec<(Vec<char>, Vec<bool>)> = rows
+        .iter()
+        .zip(placements)
+        .map(|(n, p)| {
+            let row = rail_row(n, p, &rail_state, lanes_n, opts);
+            advance_rail_state(&mut rail_state, n, p);
+            row
+        })
         .collect();
     // id column width: 4-char min prefix plus the `@` literal prefix, and
     // what a run count writes into it past the rails area and the space
@@ -2423,8 +2459,8 @@ fn draw_rows(
         .any(|n| n.commit().map(|c| !c.labels.is_empty()).unwrap_or(false));
     // build row texts
     let mut texts: Vec<RowText> = Vec::new();
-    for n in rows {
-        texts.push(build_row_text(n, rows, opts, pal, with_focus, prefix_len, id_w));
+    for (i, n) in rows.iter().enumerate() {
+        texts.push(build_row_text(n, index.focus_adjacent[i], opts, pal, with_focus, prefix_len, id_w));
     }
     // Columns 4–8 start at the same offset on every row (§Step 4). The size
     // bar's column is there when any row draws a bar — ` ▅`, two columns —
@@ -2512,7 +2548,11 @@ fn draw_rows(
     let lab_off = msg_col + msg_w + 2;
     let meta_off = if label_col { lab_off + lab_w + 2 } else { lab_off };
     let mut lines: Vec<String> = Vec::new();
+    // Detail lines use the state below their row. Advance it once per row,
+    // as above, rather than replaying the preceding history.
+    rail_state.fill(None);
     for (idx, n) in rows.iter().enumerate() {
+        advance_rail_state(&mut rail_state, n, &placements[idx]);
         let t = &texts[idx];
         let mut line = std::mem::take(&mut heads[idx]);
         if n.commit().is_some() {
@@ -2548,7 +2588,7 @@ fn draw_rows(
             && n.commit().map(|c| c.is_focus && !c.detail_marks.is_empty()).unwrap_or(false)
         {
             let c = n.commit().unwrap();
-            let (dchars, dlane0) = detail_rail_row(rows, placements, idx, lanes_n);
+            let (dchars, dlane0) = detail_rail_row(&rail_state);
             let mut dline = String::new();
             dline.push_str("  ");
             dline.push_str(&color_rails(&dchars, &dlane0, pal, None));
@@ -2731,54 +2771,37 @@ fn append_legend(
     }
 }
 
-/// rails state below row `upto` (exclusive): which lanes hold rails, and which
-/// of those are lane-0
-fn rail_state_below(
-    rows: &[&Display],
-    placements: &[Placement],
-    upto: usize,
-    lanes_n: usize,
-) -> Vec<Option<bool>> {
-    let mut state: Vec<Option<bool>> = vec![None; lanes_n]; // Some(lane==0)
-    for (j, m) in rows.iter().enumerate().take(upto) {
-        let p = &placements[j];
-        if let Some((src, clears)) = p.fork {
-            if clears {
-                state[src] = None;
-            }
-        }
-        if let Some(l) = p.ends {
-            state[l] = None;
-        }
-        if let Some(l) = p.lane {
-            state[l] = if m.children().is_empty() {
-                None
-            } else {
-                Some(l == 0)
-            };
-        }
-        for &(l, _) in &p.reservations {
-            state[l] = Some(false);
+/// Update the rails above a row to the rails below it. Each occupied lane
+/// records whether it belongs to lane 0.
+fn advance_rail_state(state: &mut [Option<bool>], n: &Display, p: &Placement) {
+    if let Some((src, clears)) = p.fork {
+        if clears {
+            state[src] = None;
         }
     }
-    state
+    if let Some(l) = p.ends {
+        state[l] = None;
+    }
+    if let Some(l) = p.lane {
+        state[l] = if n.children().is_empty() { None } else { Some(l == 0) };
+    }
+    for &(l, _) in &p.reservations {
+        state[l] = Some(false);
+    }
 }
 
-/// rails characters for the row of node `idx` (§Step 4, the character table).
+/// Rails characters for one node's row (§Step 4, the character table).
 /// Returns the characters and, per character, whether it belongs to lane 0.
 /// On a run row they go on past the rails area when its count does not fit.
 fn rail_row(
-    rows: &[&Display],
-    placements: &[Placement],
-    idx: usize,
+    n: &Display,
+    pl: &Placement,
+    state: &[Option<bool>],
     lanes_n: usize,
     opts: &TreeOptions,
 ) -> (Vec<char>, Vec<bool>) {
-    let n = rows[idx];
-    let pl = &placements[idx];
     let mut chars = vec![' '; 2 * lanes_n];
     let mut lane0 = vec![false; 2 * lanes_n];
-    let state = rail_state_below(rows, placements, idx, lanes_n);
     // horizontal segments: (start, end) in lane coordinates
     let mut segments: Vec<(usize, usize)> = Vec::new();
     if let Some((src, _)) = pl.fork {
@@ -2860,13 +2883,8 @@ fn rail_row(
 
 /// detail line (§Step 4): `│` in every lane that holds a rail below the focus
 /// row, including the focus's own lane if it has children
-fn detail_rail_row(
-    rows: &[&Display],
-    placements: &[Placement],
-    idx: usize,
-    lanes_n: usize,
-) -> (Vec<char>, Vec<bool>) {
-    let state = rail_state_below(rows, placements, idx + 1, lanes_n);
+fn detail_rail_row(state: &[Option<bool>]) -> (Vec<char>, Vec<bool>) {
+    let lanes_n = state.len();
     let mut chars = vec![' '; 2 * lanes_n];
     let mut lane0 = vec![false; 2 * lanes_n];
     for i in 0..lanes_n {
