@@ -91,6 +91,28 @@ You'll want the reference `config.j` (see next section) and, for `review`/`difft
 
 ## Configuration
 
+### Terminal colors and motion
+
+In an interactive terminal, `j` uses vivid branch colors, a blue focus band,
+colorful data and status messages, and animated progress indicators while
+repository operations run. Colored trees and tables appear in a quick cascade.
+Progress starts only when an operation takes a moment; fast commands do not
+wait for a spinner.
+
+To keep the colors but turn off animation:
+
+```sh
+J_ANIMATIONS=never j tree
+```
+
+Set `NO_COLOR=1` for plain, motion-free output. Motion is also disabled when
+either output stream is redirected, `TERM=dumb`, or `CI` is nonempty. Automatic
+colors follow the terminal for each stream; piped output stays plain unless
+you explicitly request `treeWith`'s `color = "always"`. `NO_COLOR` takes
+precedence even over that setting.
+
+### User config
+
 Expressions read `~/.config/j/config.j` (or `$XDG_CONFIG_HOME/j/config.j`).
 An expression can only use a name this file declares or defines. The reference
 [`config.j`](config.j) ships with the binary. Commands that execute against a

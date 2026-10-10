@@ -250,18 +250,29 @@ drawn with `⌂`.
 
 #### Colour
 
-Glyphs are coloured by meaning (the same precedence as their shape): root bold,
-conflict red, empty dim, immutable blue, focus bold cyan, ancestor of focus
-green, other light grey. Ids keep their existing colours (conflict red,
-immutable blue). Messages are bold on the focus row, red on a conflict, and
-dim-italic when empty. Labels are green; the margin and the data columns are
-grey with author-hued initials. Rail connectors in lane 0 take the immutable
-colour; connectors in other lanes are dim.
+Glyphs are coloured by meaning (the same precedence as their shape): root bold
+magenta, conflict bright red, empty dim, immutable bright blue, focus bold
+cyan, ancestor of focus bright green, other bright white. Ids are bold magenta,
+with conflict red and immutable blue taking precedence; the focus id and `▶`
+gutter are bold cyan. Messages are bold on the focus row, red on a conflict,
+and dim-italic when empty. Labels are bold green; the margin and data columns
+are grey with bright author-hued initials. Size bars progress from cyan
+through blue and magenta to yellow as their height increases. Rail connectors
+in lane 0 take the immutable colour; other lanes cycle through magenta, cyan,
+yellow, and green by lane position. Glyphs always keep their semantic colour.
 
-The whole focus row is highlighted with a background band that spans the full
-terminal width. This is colour only: glyphs, rails, and the `▶` gutter still
-carry the meaning, so a colourless rendering loses nothing — the band is a
-no-op when colour is off.
+The whole focus row is highlighted with bright text on a dark-blue background
+band that spans the full terminal width. This is colour only: glyphs, rails,
+and the `▶` gutter still carry the meaning, so a colourless rendering loses
+nothing — the band is a no-op when colour is off.
+
+Structured value display shares this palette: id prefixes are bold magenta,
+field names and table headers dim cyan, paths cyan, integers and file sizes
+yellow, and booleans green for true and red for false. Raw text and blob
+contents are never styled. `color = "auto"` requires a terminal whose `TERM`
+is not `dumb`; `color = "always"` explicitly enables colour and `"never"`
+disables it. A non-empty `NO_COLOR` disables colour in every mode. Redirected
+output remains plain in auto mode.
 
 #### Legend
 

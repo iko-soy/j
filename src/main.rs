@@ -19,14 +19,14 @@ Discover commands:  j help   or   j commands
 Command details:    j help NAME";
 
 fn err(status: u8, msg: impl std::fmt::Display) -> ExitCode {
-    j::report!("j: {}", msg);
+    j::terminal::report_error(format_args!("j: {}", msg));
     ExitCode::from(status)
 }
 
 /// Report a failure that ends the process, keeping the status as a number so
 /// callers do not have to recover it from an `ExitCode`.
 fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
-    j::report!("j: {}", msg);
+    j::terminal::report_error(format_args!("j: {}", msg));
     status
 }
 
@@ -35,9 +35,8 @@ fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
 /// rest is dropped and the run still succeeds. Any other write failure is an
 /// error line. `print!` would panic on either.
 fn print_output(s: &str) -> ExitCode {
-    use std::io::Write;
     let mut out = std::io::stdout().lock();
-    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+    match j::terminal::write_output(&mut out, s) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => err(1, format!("cannot write output: {}", e)),
@@ -45,7 +44,7 @@ fn print_output(s: &str) -> ExitCode {
 }
 
 fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
-    j::report!("j: crash: {}", c.msg);
+    j::terminal::report_error(format_args!("j: crash: {}", c.msg));
     match (&c.def, expr_text) {
         (Some(d), Some(e)) => j::report!("   in {}, from {}", d, e),
         (None, Some(e)) => j::report!("   from {}", e),
@@ -167,6 +166,16 @@ fn command_usage(usage: &str, command: &str) -> ExitCode {
     )
 }
 
+fn command_result(result: Result<(), (u8, String)>, message: &str) -> ExitCode {
+    match result {
+        Ok(()) => {
+            j::terminal::success(message);
+            ExitCode::SUCCESS
+        }
+        Err(e) => err(e.0, e.1),
+    }
+}
+
 fn main() -> ExitCode {
     // evaluation builds deep continuation chains (trampolined, but the final
     // continuation still tears down by recursive Drop), so run the real work
@@ -268,10 +277,10 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
                 return command_usage("init", "init");
             }
             let (cfg, _) = or_exit(load_config_file());
-            match j::jj::cmd_init(&cfg) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Creating repository", || j::jj::cmd_init(&cfg)),
+                "Repository created",
+            )
         }
         "clone" => {
             if words.len() != 2 && words.len() != 3 {
@@ -292,20 +301,20 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
                 }
             };
             let (cfg, _) = or_exit(load_config_file());
-            match j::jj::cmd_clone(&cfg, words[1], &dir) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Cloning repository", || j::jj::cmd_clone(&cfg, words[1], &dir)),
+                "Repository cloned",
+            )
         }
         "remote" => {
             if words.len() != 2 {
                 return command_usage("remote URL", "remote");
             }
             let backend = or_exit(open_repo());
-            match backend.cmd_remote(words[1]) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Updating remote", || backend.cmd_remote(words[1])),
+                "Remote updated",
+            )
         }
         "fetch" => {
             if words.len() != 1 {
@@ -313,10 +322,10 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             }
             let (cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
-            match backend.cmd_fetch() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Fetching changes", || backend.cmd_fetch()),
+                "Fetch complete",
+            )
         }
         "push" => {
             let rest = text.trim_start_matches("push").trim();
@@ -326,37 +335,37 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             let (mut cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
             // evaluate EXPR against the recorded repository (no snapshot)
-            match backend.cmd_push(&mut cfg, rest) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Pushing changes", || backend.cmd_push(&mut cfg, rest)),
+                "Push complete",
+            )
         }
         "undo" => {
             if words.len() != 1 {
                 return command_usage("undo", "undo");
             }
             let backend = or_exit(open_repo_noconfig());
-            match backend.cmd_undo(false) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Undoing operation", || backend.cmd_undo(false)),
+                "Undo complete",
+            )
         }
         "redo" => {
             if words.len() != 1 {
                 return command_usage("redo", "redo");
             }
             let backend = or_exit(open_repo_noconfig());
-            match backend.cmd_undo(true) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => err(e.0, e.1),
-            }
+            command_result(
+                j::terminal::with_progress("Redoing operation", || backend.cmd_undo(true)),
+                "Redo complete",
+            )
         }
         "ops" => {
             if words.len() != 1 {
                 return command_usage("ops", "ops");
             }
             let backend = or_exit(open_repo_noconfig());
-            match backend.cmd_ops() {
+            match j::terminal::with_progress("Loading operation log", || backend.cmd_ops()) {
                 Ok(log) => print_output(&log),
                 Err(e) => err(e.0, e.1),
             }
@@ -434,7 +443,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
 
     // §1.2.4: build the current repository value (with snapshot)
     let (mut interp, loaded_repo, current_repo) =
-        match backend.build_interp(&mut cfg, text, snapshot) {
+        match j::terminal::with_progress("Reading repository", || backend.build_interp(&mut cfg, text, snapshot)) {
             Ok(t) => t,
             Err((2, m)) => return err(2, m),
             Err((3, m)) => return err(3, m),
@@ -448,9 +457,9 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         Err(failures) => {
             let (prefix, candidates) = &failures[0];
             if candidates.is_empty() {
-                j::report!("j: crash: `@{}` matches no commit", prefix);
+                j::terminal::report_error(format_args!("j: crash: `@{}` matches no commit", prefix));
             } else {
-                j::report!("j: crash: `@{}` is ambiguous", prefix);
+                j::terminal::report_error(format_args!("j: crash: `@{}` is ambiguous", prefix));
                 for c in candidates {
                     j::report!("   {}", c);
                 }
@@ -482,14 +491,19 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
 
     // §1.2.8: a Repo is persisted (unless unchanged)
     if is_repo_value(&v) {
-        match backend.persist(&mut interp, &cfg, &loaded_repo, &current_repo, &v, text) {
-            Ok(()) => ExitCode::SUCCESS,
+        match j::terminal::with_progress("Saving changes", || {
+            backend.persist(&mut interp, &cfg, &loaded_repo, &current_repo, &v, text)
+        }) {
+            Ok(()) => {
+                j::terminal::success("Expression complete");
+                ExitCode::SUCCESS
+            }
             Err(c) => crash_err(&c, Some(text)),
         }
     } else {
         // §1.2.9: display
         let color = j::render::color_enabled("auto");
-        match j::render::display(&mut interp, &v, color) {
+        match j::terminal::with_progress("Rendering output", || j::render::display(&mut interp, &v, color)) {
             Ok(s) => print_output(&s),
             Err(c) => crash_err(&c, Some(text)),
         }

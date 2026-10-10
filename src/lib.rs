@@ -5,8 +5,7 @@
 #[macro_export]
 macro_rules! report {
     ($($arg:tt)*) => {{
-        use ::std::io::Write as _;
-        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        $crate::terminal::report(format_args!($($arg)*));
     }};
 }
 
@@ -22,6 +21,7 @@ pub mod render;
 pub mod repo;
 pub mod shape;
 pub mod show;
+pub mod terminal;
 pub mod value;
 
 pub mod jj;
