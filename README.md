@@ -95,9 +95,12 @@ You'll want the reference `config.j` (see next section) and, for `review`/`difft
 
 In an interactive terminal, `j` uses vivid branch colors, a blue focus band,
 colorful data and status messages, and animated progress indicators while
-repository operations run. Colored trees and tables appear in a quick cascade.
-Progress starts only when an operation takes a moment; fast commands do not
-wait for a spinner.
+repository operations or expressions run. Each indicator names the current
+operation and shows a spinner, a moving activity bar, and elapsed time. The
+bar shows activity, not a completion percentage; on narrow terminals it makes
+room for the operation's name. Colored trees and tables appear in a quick
+cascade. Progress starts only when an operation takes a moment; fast commands
+do not wait for a spinner.
 
 To keep the colors but turn off animation:
 

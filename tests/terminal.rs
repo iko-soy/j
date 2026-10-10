@@ -9,6 +9,12 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use unicode_width::UnicodeWidthStr;
+
+const CLEAR_LINE: &str = "\r\x1b[2K";
+// A bounded builtin fold keeps evaluation active for multiple progress frames
+// without constructing a deep recursive value or touching the network.
+const SLOW_SUM: &str = "foldl (+) 0 (range 0 500000)";
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -84,8 +90,14 @@ struct Out {
 
 /// Return the master to capture output and the slave to install as stdout or
 /// stderr. Disable newline translation so assertions see the bytes j wrote.
-fn pty() -> (File, File) {
+fn pty(columns: u16) -> (File, File) {
     let (mut master, mut slave): (RawFd, RawFd) = (-1, -1);
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -93,7 +105,7 @@ fn pty() -> (File, File) {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null(),
-                std::ptr::null(),
+                &size,
             )
         },
         0,
@@ -128,12 +140,21 @@ fn read_stream(mut reader: Box<dyn Read + Send>) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-fn capture(mut command: Command, stdout_tty: bool, stderr_tty: bool) -> Out {
-    let stdout = stdout_tty.then(pty).map(|(master, slave)| {
+fn capture(command: Command, stdout_tty: bool, stderr_tty: bool) -> Out {
+    capture_with_stderr_width(command, stdout_tty, stderr_tty, 80)
+}
+
+fn capture_with_stderr_width(
+    mut command: Command,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    columns: u16,
+) -> Out {
+    let stdout = stdout_tty.then(|| pty(80)).map(|(master, slave)| {
         command.stdout(slave);
         master
     });
-    let stderr = stderr_tty.then(pty).map(|(master, slave)| {
+    let stderr = stderr_tty.then(|| pty(columns)).map(|(master, slave)| {
         command.stderr(slave);
         master
     });
@@ -201,6 +222,26 @@ fn without_sgr(text: &str) -> String {
     plain
 }
 
+fn assert_progress(out: &Out, label: &str) {
+    let frames: Vec<_> = out.stderr.split(CLEAR_LINE)
+        .filter(|frame| frame.contains(label))
+        .map(without_sgr)
+        .collect();
+    assert!(frames.len() >= 2, "no repeated {label} frames: {:?}", out.stderr);
+    let mut bars = std::collections::BTreeSet::new();
+    for frame in &frames {
+        let (_, details) = frame.split_once(" [")
+            .unwrap_or_else(|| panic!("missing activity bar: {frame:?}"));
+        let (bar, elapsed) = details.split_once("] ")
+            .unwrap_or_else(|| panic!("missing elapsed time: {frame:?}"));
+        assert!(bar.contains('━') && bar.contains('·'), "invalid activity bar: {bar:?}");
+        assert!(elapsed.strip_suffix('s').and_then(|s| s.parse::<f64>().ok()).is_some(),
+            "invalid elapsed time: {elapsed:?}");
+        bars.insert(bar);
+    }
+    assert!(bars.len() >= 2, "activity bar did not animate: {frames:?}");
+}
+
 #[test]
 fn terminal_tree_is_colored_and_raw_text_is_unchanged() {
     let fixture = Fixture::new();
@@ -216,6 +257,65 @@ fn terminal_tree_is_colored_and_raw_text_is_unchanged() {
     assert_eq!(terminal.code, 0, "{}", terminal.stderr);
     assert_eq!(terminal.stdout, plain.stdout);
     assert_eq!(terminal.stdout, "a rainbow\nkeeps its bytes\n");
+}
+
+#[test]
+fn slow_expression_animates_and_clears_before_reporting_failure() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let expr = format!(
+        "if {SLOW_SUM} == 124999750000 then crash \"expression fixture failure\" else \"\""
+    );
+    let out = capture(fixture.command(&[&expr]), true, true);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "progress leaked into stdout: {:?}", out.stdout);
+    assert_progress(&out, "Evaluating expression");
+    let last_clear = out.stderr.rfind(CLEAR_LINE).expect("progress was never cleared");
+    let diagnostic = without_sgr(&out.stderr[last_clear + CLEAR_LINE.len()..]);
+    assert!(diagnostic.starts_with("j:"), "progress label was not cleared: {diagnostic:?}");
+    assert!(diagnostic.contains("expression fixture failure"), "{diagnostic:?}");
+    assert!(diagnostic.ends_with('\n'), "diagnostic did not end a line: {diagnostic:?}");
+}
+
+#[test]
+fn slow_implicit_application_preserves_output_and_respects_opt_outs() {
+    let fixture = Fixture::new();
+    fixture.init();
+    // Evaluating this lambda is fast; applying it to the implicit repository
+    // must remain inside the same progress phase.
+    let expr = format!(
+        "\\repo -> if {SLOW_SUM} == 124999750000 then \"computed\\nunchanged\\n\" else crash \"unexpected sum\""
+    );
+    let animated = capture(fixture.command(&[&expr]), true, true);
+    assert_eq!(animated.code, 0, "{}", animated.stderr);
+    assert_eq!(animated.stdout, "computed\nunchanged\n");
+    assert_progress(&animated, "Evaluating expression");
+    assert!(animated.stderr.ends_with(CLEAR_LINE), "progress was not cleared: {:?}", animated.stderr);
+
+    let mut command = fixture.command(&[&expr]);
+    command.env("J_ANIMATIONS", "off");
+    let opted_out = capture(command, true, true);
+    let piped = capture(fixture.command(&[&expr]), false, false);
+    for out in [opted_out, piped] {
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, animated.stdout);
+        assert_no_motion(&out);
+    }
+}
+
+#[test]
+fn slow_configuration_animates_and_clears_before_output() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let path = fixture.cfg.join("j/config.j");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(&format!("\nterminalWork = {SLOW_SUM}\n"));
+    std::fs::write(path, config).unwrap();
+    let out = capture(fixture.command(&["show terminalWork"]), true, true);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "124999750000\n");
+    assert_progress(&out, "Evaluating configuration");
+    assert!(out.stderr.ends_with(CLEAR_LINE), "progress was not cleared: {:?}", out.stderr);
 }
 
 #[test]
@@ -251,6 +351,24 @@ fn successful_slow_work_clears_before_its_confirmation() {
     assert!(final_line.starts_with("✓"), "spinner label was not cleared: {final_line:?}");
     assert!(final_line.contains("j:"), "missing success confirmation: {final_line:?}");
     assert!(fixture.dir.join("clone/.jj").is_dir());
+}
+
+#[test]
+fn progress_fits_a_narrow_stderr_terminal() {
+    let fixture = Fixture::new();
+    // stdout stays 80 columns wide: progress must measure its own stderr.
+    let out = capture_with_stderr_width(fixture.slow_clone(false), true, true, 18);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let segments: Vec<_> = out.stderr.split(CLEAR_LINE).skip(1).collect();
+    let (confirmation, frames) = segments.split_last().expect("progress was never cleared");
+    assert!(frames.len() >= 2, "no repeated frames: {:?}", out.stderr);
+    for frame in frames {
+        let plain = without_sgr(frame);
+        assert!(!plain.contains('\n'), "progress used multiple rows: {plain:?}");
+        assert!(plain.width() <= 17, "progress wrapped the 18-column terminal: {plain:?}");
+    }
+    assert!(without_sgr(confirmation).starts_with('✓'), "confirmation was not preserved: {confirmation:?}");
+    assert!(out.stdout.is_empty(), "progress leaked into stdout: {:?}", out.stdout);
 }
 
 #[test]
