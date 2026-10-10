@@ -47,6 +47,19 @@ pub struct Interp {
     sorted_ids: RefCell<Option<Rc<Vec<String>>>>,
 }
 
+impl Drop for Interp {
+    fn drop(&mut self) {
+        // These are the interpreter's language-value roots. Release them
+        // before collecting, so config definitions and cached closures do
+        // not keep their recursive environments alive between invocations.
+        self.globals = Env::empty();
+        self.old_repo.get_mut().take();
+        self.given_repo.get_mut().take();
+        self.revsets.get_mut().clear();
+        crate::value::collect_cycles();
+    }
+}
+
 /// length of the common leading run of two ids (ids are ASCII, so bytes)
 fn common_prefix_len(a: &str, b: &str) -> usize {
     a.bytes()
@@ -104,11 +117,14 @@ pub(crate) enum Cont {
         env: Env,
         cont: Rc<Cont>,
     },
-    /// short-circuit ops with the unevaluated rhs
-    And(Rc<Expr>, Env, Rc<Cont>),
-    Or2(Rc<Expr>, Env, Rc<Cont>),
-    /// check the rhs of && / || evaluated to a Bool
-    ExpectBool(&'static str, Rc<Cont>),
+    /// `&&` or `||` after applying its first operand normally, so the
+    /// declared contract has checked it; the rhs is still unevaluated
+    ShortCircuit {
+        op: &'static str,
+        rhs: Rc<Expr>,
+        env: Env,
+        cont: Rc<Cont>,
+    },
     /// `or` after both evaluated as functions: build the lifted function
     OrBoth(Value, Rc<Cont>),
     /// a shared continuation (used when both `or` outcomes continue the same way)
@@ -258,9 +274,7 @@ fn parent_rc(k: &Cont) -> Option<&Rc<Cont>> {
         Cont::Fun(_, k) => Some(k),
         Cont::If(_, _, _, k) => Some(k),
         Cont::LetRest { cont, .. } => Some(cont),
-        Cont::And(_, _, k) => Some(k),
-        Cont::Or2(_, _, k) => Some(k),
-        Cont::ExpectBool(_, k) => Some(k),
+        Cont::ShortCircuit { cont, .. } => Some(cont),
         Cont::OrBoth(_, k) => Some(k),
         Cont::Shared(k) => Some(k),
         Cont::ApplyTo(_, k) => Some(k),
@@ -609,10 +623,14 @@ impl Interp {
     }
 
     fn run(&mut self, st: State) -> EResult {
-        match self.trampoline(st) {
+        let result = match self.trampoline(st) {
             Ok(v) => Ok(v),
             Err(c) => Err(self.decorate(c)),
-        }
+        };
+        // Keep a returned closure alive as a root while reclaiming local
+        // recursive environments abandoned by the completed evaluation.
+        crate::value::collect_cycles();
+        result
     }
 
     fn trampoline(&mut self, st: State) -> EResult {
@@ -776,29 +794,26 @@ impl Interp {
                 Cont::Arg(x.clone(), env, Rc::new(k)),
             )),
             Expr::BinOp(op, a, b) => {
-                if *op == "&&" {
-                    return Run::Step(State::Eval(
-                        a.clone(),
-                        env.clone(),
-                        Cont::And(b.clone(), env, Rc::new(k)),
-                    ));
-                }
-                if *op == "||" {
-                    return Run::Step(State::Eval(
-                        a.clone(),
-                        env.clone(),
-                        Cont::Or2(b.clone(), env, Rc::new(k)),
-                    ));
-                }
                 let fv = match env.lookup(op) {
                     Some(v) => v,
                     None => return Run::Crash(Crash::new(format!("unbound name `{}`", op))),
                 };
-                // eval a, apply the operator to it, then apply the result to b
+                let next = if *op == "&&" || *op == "||" {
+                    Cont::ShortCircuit {
+                        op,
+                        rhs: b.clone(),
+                        env: env.clone(),
+                        cont: Rc::new(k),
+                    }
+                } else {
+                    Cont::Arg(b.clone(), env.clone(), Rc::new(k))
+                };
+                // Every operator must be declared, and its first operand
+                // is checked by ordinary application, including && and ||.
                 Run::Step(State::Eval(
                     a.clone(),
-                    env.clone(),
-                    Cont::Fun(fv, Rc::new(Cont::Arg(b.clone(), env, Rc::new(k)))),
+                    env,
+                    Cont::Fun(fv, Rc::new(next)),
                 ))
             }
             Expr::Or(a, b) => {
@@ -913,24 +928,42 @@ impl Interp {
                     ))
                 }
             }
-            Cont::And(b, env, k) => match v {
-                Value::Bool(false) => Run::Step(State::Ret(Value::Bool(false), (*k).clone())),
-                Value::Bool(true) => Run::Step(State::Eval(b, env, Cont::ExpectBool("&&", k))),
-                _ => Run::Crash(Crash::new(format!("&&: expected Bool, got a {}", v.kind_name()))),
-            },
-            Cont::Or2(b, env, k) => match v {
-                Value::Bool(true) => Run::Step(State::Ret(Value::Bool(true), (*k).clone())),
-                Value::Bool(false) => Run::Step(State::Eval(b, env, Cont::ExpectBool("||", k))),
-                _ => Run::Crash(Crash::new(format!("||: expected Bool, got a {}", v.kind_name()))),
-            },
-            Cont::ExpectBool(op, k) => match v {
-                Value::Bool(_) => Run::Step(State::Ret(v, (*k).clone())),
-                _ => Run::Crash(Crash::new(format!(
-                    "{}: expected Bool, got a {}",
-                    op,
-                    v.kind_name()
-                ))),
-            },
+            Cont::ShortCircuit { op, rhs, env, cont } => {
+                // Operator names are reserved: resolving && or || and
+                // applying one operand always gives its builtin partial.
+                let (lhs, pending) = match &v {
+                    Value::Fun(f) => match &**f {
+                        FunVal::Builtin { args, pending, .. } if args.len() == 1 => {
+                            (&args[0], pending)
+                        }
+                        _ => return Run::Crash(Crash::new("internal: invalid boolean operator")),
+                    },
+                    _ => return Run::Crash(Crash::new("internal: invalid boolean operator")),
+                };
+                let lhs = match lhs {
+                    Value::Bool(b) => *b,
+                    other => return Run::Crash(Crash::new(format!(
+                        "{}: expected Bool, got a {}", op, other.kind_name()
+                    ))),
+                };
+                if lhs == (op == "||") {
+                    let result = Value::Bool(lhs);
+                    if let Some((name, c, _)) = pending {
+                        // Skipping an operand must not evaluate or check
+                        // it, but the operator still returns a checked
+                        // result after its two parameter positions (§4.13).
+                        let c = crate::shape::ContractExpr::apply_first_rc(c.clone());
+                        if let Err(cr) = c.check_result(&self.shapes, name, &result) {
+                            return Run::Crash(self.blame_builtin(cr, op, name));
+                        }
+                    }
+                    Run::Step(State::Ret(result, (*cont).clone()))
+                } else {
+                    // The normal application path checks the rhs and the
+                    // builtin's result, with the same argument numbering.
+                    Run::Step(State::Eval(rhs, env, Cont::Fun(v, cont)))
+                }
+            }
             Cont::OrBoth(a, k) => {
                 if matches!(v, Value::Fun(_)) {
                     Run::Step(State::Ret(Value::Fun(Rc::new(FunVal::OrFun(a, v))), (*k).clone()))

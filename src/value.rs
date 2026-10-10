@@ -3,7 +3,7 @@
 use crate::ast::{Expr, Pattern};
 use num_bigint::BigInt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub type RecordMap = BTreeMap<String, Value>;
 
@@ -764,10 +764,10 @@ pub struct Env {
     frame: Option<Rc<Frame>>,
 }
 
-/// A large acyclic let can have one frame per binding. Release unique
-/// frames iteratively, keeping the next parent alive while its child's
-/// values drop, so closures capturing earlier frames cannot recurse down
-/// that chain either (§4.1).
+/// A large acyclic let or a collected recursive cycle can release a long
+/// chain of parent frames. Release unique frames iteratively, keeping the
+/// next parent alive while its child's values drop, so closures capturing
+/// earlier frames cannot recurse down that chain either (§4.1).
 impl Drop for Env {
     fn drop(&mut self) {
         let mut next = self.frame.take();
@@ -820,16 +820,20 @@ impl Env {
     /// extend with a recursive frame (for `let` blocks) binding `names`,
     /// whose values are pushed to the returned cell in the same order
     pub fn extend_rec(&self, names: Rc<[String]>) -> (Env, Rc<std::cell::RefCell<Vec<Value>>>) {
+        // Collect before allocating: `self` and all values the evaluator is
+        // using are still ordinary strong roots during this check.
+        maybe_collect_cycles();
         let cell = Rc::new(std::cell::RefCell::new(Vec::with_capacity(names.len())));
-        (
-            Env {
-                frame: Some(Rc::new(Frame {
-                    kind: FrameKind::Rec(names, cell.clone()),
-                    parent: self.clone(),
-                })),
-            },
-            cell,
-        )
+        let frame = Rc::new(Frame {
+            kind: FrameKind::Rec(names, cell.clone()),
+            parent: self.clone(),
+        });
+        RECURSIVE_FRAMES.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            registry.frames.push(Rc::downgrade(&frame));
+            registry.allocations += 1;
+        });
+        (Env { frame: Some(frame) }, cell)
     }
 
     pub fn lookup(&self, name: &str) -> Option<Value> {
@@ -899,6 +903,302 @@ impl Env {
                 }
             }
             cur = f.parent.frame.as_ref();
+        }
+    }
+}
+
+// A recursive environment owns its bindings, and a closure in those bindings
+// may own the environment again. Weak captures would lose an escaping
+// closure's bindings, so these are real strong references. Collect their
+// unreachable cycles by subtracting the references inside their owned graph
+// from each node's reference count. References from outside that graph are
+// roots: returned values, the interpreter, and the running machine's states
+// and continuations. No explicit evaluator root stack is needed.
+//
+// Only recursive frames can introduce cycles in language values. The
+// registry is weak, and all traversal and marking below use explicit work
+// lists, including through shared lists, records, and function wrappers.
+#[derive(Default)]
+struct RecursiveFrames {
+    frames: Vec<Weak<Frame>>,
+    allocations: usize,
+    next_collection: usize,
+    without_environments: HashMap<(u8, usize), EnvironmentFree>,
+    cached_since_pruning: usize,
+    collecting: bool,
+}
+
+thread_local! {
+    static RECURSIVE_FRAMES: std::cell::RefCell<RecursiveFrames> =
+        std::cell::RefCell::new(RecursiveFrames::default());
+}
+
+const MIN_CYCLE_BATCH: usize = 256;
+
+fn maybe_collect_cycles() {
+    let due = RECURSIVE_FRAMES.with(|registry| {
+        let registry = registry.borrow();
+        !registry.collecting
+            && registry.allocations >= registry.next_collection.max(MIN_CYCLE_BATCH)
+    });
+    if due {
+        collect_cycles();
+    }
+}
+
+/// Reclaim dead recursive environments. The caller must retain any result
+/// it wants to return while this runs, as an ordinary strong reference.
+pub(crate) fn collect_cycles() {
+    RECURSIVE_FRAMES.with(|shared| {
+        let mut registry = {
+            let mut registry = shared.borrow_mut();
+            if registry.collecting { return; }
+            let previous = std::mem::take(&mut *registry);
+            registry.collecting = true;
+            previous
+        };
+        // Do not hold the registry borrow while dropping values. Opaque
+        // Rust backend captures can run destructors that allocate frames or
+        // drop another interpreter; such nested collections are deferred.
+        let mut graph = CycleGraph::default();
+        for frame in &registry.frames {
+            if let Some(frame) = frame.upgrade() {
+                graph.add(CycleNode::Frame(frame));
+            }
+        }
+        graph.trace(&registry.without_environments);
+        registry.cached_since_pruning += graph.cache_environment_free(&mut registry.without_environments);
+        graph.collect();
+        // Release the collector's temporary roots before pruning the weak
+        // registry. Live recursive frames set the next batch size so a
+        // growing set of escaping closures costs amortized linear work.
+        drop(graph);
+        registry.frames.retain(|frame| frame.strong_count() != 0);
+        registry.allocations = 0;
+        registry.next_collection = registry.frames.len().max(MIN_CYCLE_BATCH);
+        // Immutable repository trees usually hold no functions. Remember
+        // that once, without keeping their values alive. Pruning is batched
+        // too: a large, live tree must not be scanned on every collection.
+        if registry.frames.is_empty() {
+            registry.without_environments.clear();
+            registry.cached_since_pruning = 0;
+        } else if registry.cached_since_pruning >=
+            (registry.without_environments.len() / 2).max(MIN_CYCLE_BATCH)
+        {
+            registry.without_environments.retain(|_, cached| cached.is_alive());
+            registry.cached_since_pruning = 0;
+        }
+        let mut pending = shared.borrow_mut();
+        registry.frames.append(&mut pending.frames);
+        registry.allocations += pending.allocations;
+        *pending = registry;
+    });
+}
+
+// These containers are immutable while shared. Weak references both avoid
+// extending their lives and prevent address reuse from giving a false hit.
+// Rc::make_mut dissociates weak pointers before it can change a container.
+enum EnvironmentFree {
+    List(Weak<Vec<Value>>),
+    Record(Weak<RecordMap>),
+}
+
+impl EnvironmentFree {
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::List(v) => v.strong_count() != 0,
+            Self::Record(v) => v.strong_count() != 0,
+        }
+    }
+}
+
+enum CycleNode {
+    Frame(Rc<Frame>),
+    Bindings(Rc<std::cell::RefCell<Vec<Value>>>),
+    Function(Rc<FunVal>),
+    List(Rc<Vec<Value>>),
+    Record(Rc<RecordMap>),
+}
+
+impl CycleNode {
+    fn key(&self) -> (u8, usize) {
+        match self {
+            Self::Frame(v) => (0, Rc::as_ptr(v) as usize),
+            Self::Bindings(v) => (1, Rc::as_ptr(v) as usize),
+            Self::Function(v) => (2, Rc::as_ptr(v) as usize),
+            Self::List(v) => (3, Rc::as_ptr(v) as usize),
+            Self::Record(v) => (4, Rc::as_ptr(v) as usize),
+        }
+    }
+
+    fn strong_count(&self) -> usize {
+        match self {
+            Self::Frame(v) => Rc::strong_count(v),
+            Self::Bindings(v) => Rc::strong_count(v),
+            Self::Function(v) => Rc::strong_count(v),
+            Self::List(v) => Rc::strong_count(v),
+            Self::Record(v) => Rc::strong_count(v),
+        }
+    }
+
+    fn children(&self) -> Vec<CycleNode> {
+        let mut out = Vec::new();
+        let mut value = |v: &Value| match v {
+            Value::Fun(f) => out.push(Self::Function(f.clone())),
+            // A list view owns its whole backing vector, including the
+            // prefix that `tail`/`drop` no longer exposes.
+            Value::List(xs) => out.push(Self::List(xs.items.clone())),
+            Value::Record(fields) => out.push(Self::Record(fields.clone())),
+            // Backend thunks are opaque Rust closures. Their references,
+            // if any, remain external roots; never guess what they own.
+            _ => {}
+        };
+        match self {
+            Self::Frame(frame) => {
+                match &frame.kind {
+                    FrameKind::Small(bindings) => {
+                        for (_, v) in bindings { value(v); }
+                    }
+                    FrameKind::Big(bindings) => {
+                        for v in bindings.values() { value(v); }
+                    }
+                    FrameKind::Rec(_, bindings) => {
+                        out.push(Self::Bindings(bindings.clone()));
+                    }
+                }
+                if let Some(parent) = &frame.parent.frame {
+                    out.push(Self::Frame(parent.clone()));
+                }
+            }
+            Self::Bindings(bindings) => {
+                for v in bindings.borrow().iter() { value(v); }
+            }
+            Self::Function(f) => {
+                match f.as_ref() {
+                    FunVal::Closure { env, applied_args, .. } => {
+                        for v in applied_args { value(v); }
+                        if let Some(frame) = &env.frame {
+                            out.push(Self::Frame(frame.clone()));
+                        }
+                    }
+                    FunVal::Builtin { args, .. } => {
+                        for v in args { value(v); }
+                    }
+                    FunVal::OrFun(a, b) | FunVal::ComposeLazy(a, b) => {
+                        value(a);
+                        value(b);
+                    }
+                    FunVal::Labelled(_, f) => value(f),
+                }
+            }
+            Self::List(items) => {
+                for v in items.iter() { value(v); }
+            }
+            Self::Record(fields) => {
+                for v in fields.values() { value(v); }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Default)]
+struct CycleGraph {
+    // Exactly one temporary strong reference per node. All temporary edge
+    // clones are consumed by `add` before reference counts are examined.
+    nodes: Vec<CycleNode>,
+    indices: HashMap<(u8, usize), usize>,
+    edges: Vec<Vec<usize>>,
+    incoming: Vec<usize>,
+}
+
+impl CycleGraph {
+    fn add(&mut self, node: CycleNode) -> usize {
+        let key = node.key();
+        if let Some(&index) = self.indices.get(&key) {
+            return index;
+        }
+        let index = self.nodes.len();
+        self.indices.insert(key, index);
+        self.nodes.push(node);
+        self.edges.push(Vec::new());
+        self.incoming.push(0);
+        index
+    }
+
+    fn trace(&mut self, without_environments: &HashMap<(u8, usize), EnvironmentFree>) {
+        let mut index = 0;
+        while index < self.nodes.len() {
+            for child in self.nodes[index].children() {
+                if without_environments.contains_key(&child.key()) {
+                    continue;
+                }
+                let next = self.add(child);
+                self.edges[index].push(next);
+                self.incoming[next] += 1;
+            }
+            index += 1;
+        }
+    }
+
+    fn cache_environment_free(&self, cache: &mut HashMap<(u8, usize), EnvironmentFree>) -> usize {
+        let mut parents = vec![Vec::new(); self.nodes.len()];
+        for (index, edges) in self.edges.iter().enumerate() {
+            for &next in edges { parents[next].push(index); }
+        }
+        let mut reaches_frame = vec![false; self.nodes.len()];
+        let mut work = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if matches!(node, CycleNode::Frame(_)) {
+                reaches_frame[index] = true;
+                work.push(index);
+            }
+        }
+        while let Some(index) = work.pop() {
+            for &parent in &parents[index] {
+                if !reaches_frame[parent] {
+                    reaches_frame[parent] = true;
+                    work.push(parent);
+                }
+            }
+        }
+        let mut added = 0;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !reaches_frame[index] {
+                let cached = match node {
+                    CycleNode::List(v) => EnvironmentFree::List(Rc::downgrade(v)),
+                    CycleNode::Record(v) => EnvironmentFree::Record(Rc::downgrade(v)),
+                    _ => continue,
+                };
+                if cache.insert(node.key(), cached).is_none() { added += 1; }
+            }
+        }
+        added
+    }
+
+    fn collect(&self) {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut work = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.strong_count() > self.incoming[index] + 1 {
+                reachable[index] = true;
+                work.push(index);
+            }
+        }
+        while let Some(index) = work.pop() {
+            for &next in &self.edges[index] {
+                if !reachable[next] {
+                    reachable[next] = true;
+                    work.push(next);
+                }
+            }
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !reachable[index] {
+                if let CycleNode::Bindings(bindings) = node {
+                    bindings.borrow_mut().clear();
+                }
+            }
         }
     }
 }

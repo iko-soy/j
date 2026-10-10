@@ -191,6 +191,40 @@ fn both_stdin_and_args_rejected() {
 }
 
 #[test]
+fn conflicting_stdin_is_rejected_without_waiting_for_eof() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let r = setup();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(b"1").unwrap();
+    let mut child = Command::new(j_bin())
+        .arg("describe \"must not run\"")
+        .current_dir(&r.dir)
+        .env("XDG_CONFIG_HOME", &r.cfg)
+        .stdin(reader)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("conflicting stdin waited for the still-open writer");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    // Keep the writer alive until after the command has exited.
+    drop(writer);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8(out.stderr).unwrap(),
+        "j: expression given both as arguments and on stdin\n");
+    assert_eq!(r.j(&["\\r -> show (focus r).message"]).ok().stdout, "\"\"\n");
+}
+
+#[test]
 fn an_expression_that_is_not_utf8_is_a_usage_error() {
     // §1: an argument that was not UTF-8 (a path with a Latin-1 byte)
     // panicked in `std::env::args` and exited 101, and such bytes on stdin
@@ -416,9 +450,26 @@ fn validate_catches_what_persistence_refuses() {
     let r = setup();
     r.write("a.txt", "x\n");
     r.j(&["describe \"work\""]).ok();
-    // tree . validate . squash is an honest dry run
+    let before = r.j(&["ops"]).ok().stdout.lines().count();
+    let preview = r.j(&["tree . validate . squash"]);
+    let persist = r.j(&["squash"]);
+    assert_eq!(preview.code, 1, "{}", preview.stdout);
+    assert_eq!(persist.code, 1, "{}", persist.stderr);
+    assert_eq!(preview.stderr.lines().next(), persist.stderr.lines().next());
+    assert!(preview.stderr.contains("the root commit cannot be changed"));
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), before);
+    assert_eq!(r.read("a.txt"), "x\n");
+
+    // Once the parent is an ordinary commit, both preview and persistence
+    // succeed, and the preview itself still records nothing.
+    r.j(&["new"]).ok();
+    r.write("b.txt", "y\n");
+    r.j(&["describe \"second\""]).ok();
+    let before = r.j(&["ops"]).ok().stdout.lines().count();
     let out = r.j(&["tree . validate . squash"]).ok();
     assert!(!out.stdout.is_empty());
+    assert_eq!(r.j(&["ops"]).ok().stdout.lines().count(), before);
+    r.j(&["squash"]).ok();
 }
 
 #[test]
@@ -649,7 +700,7 @@ fn review_says_no_changes_only_when_nothing_changed() {
     std::fs::write(&stub, "#!/bin/sh\nprintf '%s -> %s\\n' \"${1##*/}\" \"${2##*/}\"\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     r.write("g", "world\n");
-    assert_eq!(review(&bin).ok().stdout, "old-f -> new-f\nold-g -> new-g\n");
+    assert_eq!(review(&bin).ok().stdout, "f -> f\ng -> g\n");
 }
 
 #[test]
@@ -3266,6 +3317,33 @@ fn missing_config_is_created_editable() {
         assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777, 0o600);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unreadable_config_is_not_replaced_with_defaults() {
+    let r = setup();
+    let path = r.cfg.join("j/config.j");
+    let mut original = std::fs::read(&path).unwrap();
+    original.extend_from_slice(b"\n-- non-UTF-8 comment: \xff\n");
+    std::fs::write(&path, &original).unwrap();
+    let out = r.j(&["1 + 1"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.starts_with("j: cannot read config at "), "{}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn missing_config_symlink_target_is_not_created() {
+    let r = setup();
+    let path = r.cfg.join("j/config.j");
+    let target = r.cfg.join("missing-config.j");
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let out = r.j(&["1 + 1"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    assert!(!target.exists());
 }
 
 // ----------------------------------------------------------------------

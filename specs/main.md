@@ -40,7 +40,8 @@ echo EXPRESSION | j
    `::`, `or`, `.`, and the literals `%name`, `@id`, `./a/b` are all safe
    unquoted.
 3. If arguments are present and rule 1 also applies, exit 2 with
-   `j: expression given both as arguments and on stdin`.
+   `j: expression given both as arguments and on stdin`. One byte is
+   sufficient to reject the invocation; the pipe need not reach EOF.
 4. If neither is present, or the input is only whitespace, print a concise
    usage and getting-started guide to stderr and exit 2. The guide points to
    `j help`, `j commands`, and commands for starting or inspecting a repository.
@@ -491,7 +492,9 @@ negation. Ordering operators are defined on `Int` only and crash otherwise.
 
 `if`, `or`, `&&`, and `||` do not evaluate all operands. `&&` and `||`
 short-circuit. The interpreter recognises `&&` and `||` by name; `or` is a
-keyword.
+keyword. Like other builtins, `&&` and `||` must be declared. Their contracts
+check each evaluated operand and the final result; a skipped operand is
+neither evaluated nor checked.
 
 `a or b` evaluates `a`. If that crashes, the crash is discarded and `b` is
 evaluated and returned. Otherwise, if the value of `a` is a function, `b` is
@@ -567,7 +570,7 @@ as in §4.13.
 | `treeWith o r` | the history rendered as a tree with options record `o`; §7.11 |
 | `extract S v` | every subvalue of `v` that is an `S`; §4.12 |
 | `meta i` | `{ hash, author, email, time }` for the visible commit with change id `i`: its current git hash, author name and email, committer time. Crashes for an id with no stored commit (one minted in this program) |
-| `validate repo` | `repo` unchanged if persisting it would succeed; otherwise the crash persistence would raise (§7.5 steps 1–3 and 6). Persistence runs the same checks |
+| `validate repo` | `repo` unchanged if persisting it would succeed; otherwise the crash persistence would raise (§7.5 steps 1–3, the root invariant of 4, and 6). Persistence runs the same checks |
 
 ### 4.10 Ids: existing and new
 
@@ -795,13 +798,16 @@ j: crash: expected one revision, got 0
 
 ### 5.2 `show`
 
-`show v` renders `v` as an expression in the language, such that for every
-value except closures, unresolved blobs, and values nested past the parser's
-bound (§3.4: a list 40,000 deep, a record about 20,000), `show v` parses and
-evaluates to a value equal to `v` under the same `config.j`. It never uses
-colour and never truncates. A value holding a part the store cannot supply (a
-`files` list or a file's content, §7.2) crashes `show` as it crashes any other
-use: `show` writes no stand-in for the part.
+`show v` renders `v` as an expression in the language. Resolved blobs that
+are not UTF-8 regular files cannot be represented by `blob "…"`: `show`
+crashes on binary, executable, or symlink blobs, including inside other
+values, instead of substituting different contents or file types. For every
+value it renders except closures, unresolved blobs, and values nested past
+the parser's bound (§3.4: a list 40,000 deep, a record about 20,000), `show v`
+parses and evaluates to a value equal to `v` under the same `config.j`. It
+never uses colour and never truncates. A value holding a part the store
+cannot supply (a `files` list or a file's content, §7.2) crashes `show` as it
+crashes any other use: `show` writes no stand-in for the part.
 
 | kind | rendering |
 |---|---|
@@ -811,7 +817,7 @@ use: `show` writes no stand-in for the part.
 | list | `[v1 v2 …]` |
 | record | `{ a = v, b = w }`, fields in ascending lexicographic order |
 | `Id` | `@` followed by the full id, e.g. `@wqztkpqxmnrvyxskptlmzzzzabcd` |
-| resolved `Blob` | `blob "…"` |
+| resolved UTF-8 regular `Blob` | `blob "…"`; other resolved blobs crash |
 | unresolved `Blob` | `{- unresolved -} blob "…"` with the conflict-marker rendering |
 | builtin | its declared name, operators parenthesised: `map`, `(++)` |
 | selector | the selector itself: `.id` |
@@ -854,7 +860,10 @@ Expression evaluation, `push`, and `fetch` load the configuration; `init` and
 `user` is evaluated; `Id` literals are not resolved and no other definition
 is evaluated. `remote`, `undo`, `redo`, and `ops` do not load configuration.
 When a command needs configuration and none exists, the binary writes its
-embedded reference `config.j` (§9) to that path as an editable starting point.
+embedded reference `config.j` (§9) to that path as an editable starting point,
+readable and writable by its owner, and reports its path. An existing file is
+never overwritten, including when it cannot be read or contains invalid
+UTF-8; such errors exit 3.
 An existing user configuration is not updated when the binary changes. The
 reference file is also distributed at `<prefix>/share/j/config.j`.
 
@@ -1255,8 +1264,9 @@ language: `fetch` and `push` are the only things that change them.
 
   Duplicates are merged; two records with the same `name` and different
   effects are a crash. It is refused (exit 1, nothing pushed) if:
-  - a `name` is not a valid git branch name, an `id` is not a visible commit,
-    or a delete names a bookmark the remote does not have;
+  - a `name` is not a valid git branch name, an `id` is not a visible commit
+    or names the synthetic root (which has no Git commit), or a delete names
+    a bookmark the remote does not have;
   - any commit that would be sent has an unresolved file or an empty
     description (the commits that would be sent are the records' `id`s and
     their ancestors that no bookmark on `origin` reaches as of the last
@@ -1426,9 +1436,11 @@ configuration error.
 `difft p a b` runs difftastic. It is the only builtin that executes another
 program.
 
-1. Write the content of `a` and `b` to two temporary files whose names end in
-   the last component of `p` (so difftastic's language detection sees the
-   real filename), inside a fresh temporary directory.
+1. Write the content of `a` and `b` to files in separate `old` and `new`
+   subdirectories of a fresh temporary directory. Each file keeps the last
+   component of `p` unchanged, so valid names stay within the filesystem's
+   length limit and difftastic sees the real filename. A last component
+   that is not a filename is a crash; an empty path uses `file`.
 2. Run `difft OLD NEW` with the process's stdin closed and its environment
    inherited unchanged, except: if `DFT_COLOR` is unset and `j`'s stdout is a
    terminal, set `DFT_COLOR=always`; if `DFT_WIDTH` is unset and `j`'s stdout
@@ -1764,7 +1776,7 @@ subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
                                            -- crash for a commit not yet persisted
 validate   : Repo -> Repo                  -- the repo unchanged, or the crash persisting
-                                           -- it would produce (shape, labels, immutability,
+                                           -- it would produce (shape, root, labels, immutability,
                                            -- focus). `tree . validate . rebase trunk` is an
                                            -- honest dry run.
 diff       : Blob -> Blob -> Text          -- unified diff from the first to the second

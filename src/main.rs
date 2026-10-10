@@ -72,18 +72,22 @@ fn load_config_file() -> Result<(Config, String), u8> {
     let path = config_path();
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // No user config yet: materialise the default there, editable by
             // the current user, so they have a starting point to customise.
-            if let Err(e) = write_default_config(&path) {
-                return Err(fail(3, format!("cannot create config at {}: {}", path, e)));
+            match write_default_config(&path) {
+                Ok(()) => j::report!("j: created an editable default config at {}", path),
+                // Another invocation may have created it after our read.
+                // Read that file below, without overwriting it.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(fail(3, format!("cannot create config at {}: {}", path, e))),
             }
-            j::report!("j: created an editable default config at {}", path);
             match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => return Err(fail(3, format!("cannot read config at {}: {}", path, e))),
             }
         }
+        Err(e) => return Err(fail(3, format!("cannot read config at {}: {}", path, e))),
     };
     match config::load_config(&src) {
         Ok(c) => Ok((c, src)),
@@ -94,17 +98,19 @@ fn load_config_file() -> Result<(Config, String), u8> {
 /// Write the embedded default config to `path`, creating parent directories
 /// and making the file readable and writable by the current user.
 fn write_default_config(path: &str) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, DEFAULT_CONFIG)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     // user-read+write (0o600 on unix): the file is meant to be edited by them
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    options.open(path)?.write_all(DEFAULT_CONFIG.as_bytes())
 }
 
 const RESERVED: &[&str] = &[
@@ -227,7 +233,10 @@ fn run() -> ExitCode {
         if std::io::stdin().is_terminal() {
             false
         } else if args.is_empty() || stdin_is_ready(50) {
-            match std::io::stdin().read_to_end(&mut stdin_content) {
+            // With arguments, a single byte proves the invocation invalid.
+            // Waiting for EOF would hang while a pipe's writer remains open.
+            let limit = if args.is_empty() { u64::MAX } else { 1 };
+            match std::io::stdin().take(limit).read_to_end(&mut stdin_content) {
                 Ok(n) => n > 0,
                 Err(_) => false,
             }
@@ -536,4 +545,17 @@ fn is_repo_value(v: &Value) -> bool {
         .map(|s| s.to_string())
         .collect();
     root_fields == want_root
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_config_does_not_replace_a_file_created_since_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.j");
+        std::fs::write(&path, "user-owned configuration").unwrap();
+        let error = super::write_default_config(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned configuration");
+    }
 }

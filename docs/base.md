@@ -301,9 +301,11 @@ Defined on `Int` only; crash on anything else. Non-associative (cannot chain:
 show : a -> Text
 ```
 
-Renders any value in the language's literal syntax, such that (except for
+Renders values in the language's literal syntax, such that (except for
 closures and unresolved blobs) the text parses and evaluates back to an equal
-value. A top-level `Text` prints raw, so `j show …` is how you inspect values.
+value. Resolved binary, executable, and symlink blobs have no equal literal;
+`show` crashes on them, even inside other values. A top-level `Text` prints
+raw, so `j show …` is how you inspect values.
 See §5.2 of the spec for the exact rendering.
 
 ```
@@ -513,7 +515,7 @@ validate : Repo -> Repo
 ```
 
 Returns the repo unchanged if persisting it would succeed; otherwise crashes
-with exactly the error persistence would produce (shape, labels, immutability,
+with exactly the error persistence would produce (shape, root, labels, immutability,
 focus). `tree . validate . rebase trunk` is an honest dry run.
 
 ### `diff` and `difft` — rendering differences

@@ -974,6 +974,84 @@ fn push_refusals() {
 }
 
 #[test]
+fn push_refuses_the_root_without_deleting_a_bookmark() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "work\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    let refs = git(&env.remote, &["show-ref"]);
+    let ops = env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    // The synthetic root has an all-zero Git id. Sending it as a target
+    // deleted feature, then failed to record the deletion locally.
+    for expr in [
+        "push (label \"feature\" (here . top))",
+        "push (\\r -> label \"another\" here r ++ label \"root\" (here . top) r)",
+    ] {
+        let out = env.j(&dest, &[expr]);
+        assert_eq!(out.code, 1, "{}: {}", expr, out.stderr);
+        assert!(out.stderr.contains("root commit cannot be pushed"), "{}", out.stderr);
+        assert_eq!(git(&env.remote, &["show-ref"]), refs, "{} changed the remote", expr);
+        assert_eq!(env.j(&dest, &["ops"]).ok().stdout.lines().count(), ops);
+    }
+    assert!(env.j(&dest, &["labelled \"feature\""]).ok().stdout.contains("work"));
+}
+
+#[test]
+fn push_checks_every_branch_name_before_sending_updates() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "work\n").unwrap();
+    env.j(&dest, &["describe \"work\""]).ok();
+    let refs = git(&env.remote, &["show-ref"]);
+    let ops = env.j(&dest, &["ops"]).ok().stdout.lines().count();
+    // HEAD was created remotely before its local export failed. Dot and
+    // .lock components also escaped the partial hand-written validation.
+    for name in ["HEAD", "topic/.hidden", "topic.lock/child", "-topic", "/topic", ""] {
+        let expr = format!(
+            "push (\\r -> label \"valid\" here r ++ label {} here r)",
+            j::show::text_literal(name)
+        );
+        let out = env.j(&dest, &[&expr]);
+        assert_eq!(out.code, 1, "{}: {}", name, out.stderr);
+        assert!(out.stderr.contains("not a valid git branch name"), "{}", out.stderr);
+        assert_eq!(git(&env.remote, &["show-ref"]), refs, "{} changed the remote", name);
+        assert_eq!(env.j(&dest, &["ops"]).ok().stdout.lines().count(), ops);
+    }
+    // Git permits @ as a branch and HEAD below another path component.
+    for name in ["@", "topic/HEAD"] {
+        env.j(&dest, &[&format!("push (label {} here)", j::show::text_literal(name))]).ok();
+        git(&env.remote, &["rev-parse", "--verify", &format!("refs/heads/{name}")]);
+    }
+}
+
+#[test]
+fn user_control_characters_survive_init_clone_and_open() {
+    let env = setup();
+    let name = "Test\u{1b}User\u{7f}Name";
+    let email = "test\u{1f}user@example.com";
+    let path = env.cfg.join("j/config.j");
+    let config = std::fs::read_to_string(&path).unwrap()
+        .replace("Test User", name)
+        .replace("test@example.com", email);
+    std::fs::write(path, config).unwrap();
+    // These are valid Text values, but writing their controls literally
+    // into the generated TOML used to panic before opening a repository.
+    let init = env.dir.join("init");
+    std::fs::create_dir(&init).unwrap();
+    env.j(&init, &["init"]).ok();
+    let clone = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), clone.to_str().unwrap()]).ok();
+    for dir in [&init, &clone] {
+        env.j(dir, &["describe \"work\""]).ok();
+        assert_eq!(env.j(dir, &["\\r -> (meta r.root.id).author"]).ok().stdout, format!("{name}\n"));
+        assert_eq!(env.j(dir, &["\\r -> (meta r.root.id).email"]).ok().stdout, format!("{email}\n"));
+    }
+}
+
+#[test]
 fn push_of_an_empty_list_pushes_nothing() {
     // §7.6: an empty list of records sets and deletes no bookmark. It went to
     // git as a push with no refspecs, which git fills in from push.default:

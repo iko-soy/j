@@ -168,17 +168,21 @@ fn jj_undo_interop_marker() {
 #[test]
 fn jj_reads_conflicts_written_by_j() {
     let Some(t) = setup() else { return };
-    t.j(&["init"]);
+    let j_ok = |expr: &str| {
+        let (code, _, err) = t.j(&[expr]);
+        assert_eq!(code, 0, "{}: {}", expr, err);
+    };
+    j_ok("init");
     std::fs::write(t.dir.join("f.txt"), "base\n").unwrap();
-    t.j(&["describe \"base\""]);
+    j_ok("describe \"base\"");
     // side 1
-    t.j(&["new"]);
+    j_ok("new");
     std::fs::write(t.dir.join("f.txt"), "one\n").unwrap();
-    t.j(&["describe \"one\""]);
+    j_ok("describe \"one\"");
     // side 2 from the parent
-    t.j(&["new . goto (kids (top id))"]);
+    j_ok("new . prev");
     std::fs::write(t.dir.join("f.txt"), "two\n").unwrap();
-    t.j(&["describe \"two\""]);
+    j_ok("describe \"two\"");
     // rebase two onto one: conflicts
     let (code, _, err) = t.j(&["rebase (matching (\\c -> c.message == \"one\") all)"]);
     assert_eq!(code, 0, "{}", err);

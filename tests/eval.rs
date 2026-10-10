@@ -10,10 +10,14 @@ use std::rc::Rc;
 const CONFIG: &str = include_str!("../config.j");
 
 fn make_interp() -> (Interp, config::Config) {
-    let cfg = config::load_config(CONFIG).expect("reference config must load");
+    make_interp_from(CONFIG)
+}
+
+fn make_interp_from(src: &str) -> (Interp, config::Config) {
+    let cfg = config::load_config(src).expect("config must load");
     let backend = Rc::new(MemBackend::new());
     let mut interp = Interp::new(backend, cfg.shapes.clone(), Env::empty());
-    config::eval_config(&mut interp, &cfg).expect("reference config must evaluate");
+    config::eval_config(&mut interp, &cfg).expect("config must evaluate");
     (interp, cfg)
 }
 
@@ -125,6 +129,135 @@ fn short_circuit_booleans() {
     assert!(crash(&mut i, &cfg, "1 && true").contains("Bool"));
     // rhs of || is not evaluated when lhs is true; non-Bool rhs crashes when reached
     assert!(crash(&mut i, &cfg, "false || 1").contains("Bool"));
+}
+
+fn boolean_config(op: &str, signature: Option<&str>) -> String {
+    CONFIG
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with(&format!("({})", op)) {
+                signature.map(|ty| format!("({}) : {}", op, ty))
+            } else {
+                Some(line.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn short_circuit_operators_must_be_declared() {
+    for op in ["&&", "||"] {
+        let (mut i, cfg) = make_interp_from(&boolean_config(op, None));
+        for expr in [
+            format!("false {} true", op),
+            format!("true {} false", op),
+            format!("({}) true false", op),
+            format!("(true {}) false", op),
+            format!("({} false) true", op),
+        ] {
+            assert_eq!(crash(&mut i, &cfg, &expr), format!("crash: unbound name `{}`", op));
+        }
+    }
+}
+
+#[test]
+fn short_circuit_contracts_check_only_evaluated_arguments() {
+    for (op, skipped, reached) in [("&&", false, true), ("||", true, false)] {
+        let (mut i, cfg) = make_interp_from(&boolean_config(op, Some("Text -> Bool -> Bool")));
+        for lhs in [skipped, reached] {
+            let expr = format!("{} {} crash \"rhs must stay unevaluated\"", lhs, op);
+            assert_eq!(
+                crash(&mut i, &cfg, &expr),
+                format!("crash: contract: {} expected Text as argument 1, got Bool", op)
+            );
+        }
+
+        let (mut i, cfg) = make_interp_from(&boolean_config(op, Some("Bool -> Text -> Bool")));
+        for expr in [
+            format!("{} {} true", reached, op),
+            format!("({} {}) true", reached, op),
+            format!("({} true) {}", op, reached),
+        ] {
+            assert_eq!(
+                crash(&mut i, &cfg, &expr),
+                format!("crash: contract: {} expected Text as argument 2, got Bool", op)
+            );
+        }
+        for expr in [
+            format!("{} {} crash \"rhs must stay unevaluated\"", skipped, op),
+            format!("({} crash \"rhs must stay unevaluated\") {}", op, skipped),
+            format!("({} {}) true", skipped, op),
+        ] {
+            check!(i, cfg, &expr, Value::Bool(skipped));
+        }
+        // A declaration that allows every kind cannot remove the
+        // operator's own requirement that its operands are booleans.
+        let (mut i, cfg) = make_interp_from(&boolean_config(op, Some("a -> b -> c")));
+        assert!(crash(&mut i, &cfg, &format!("1 {} true", op)).contains("expected Bool"));
+        assert!(crash(&mut i, &cfg, &format!("{} {} 1", reached, op)).contains("expected Bool"));
+    }
+}
+
+#[test]
+fn short_circuit_contracts_check_results_including_aliases() {
+    for op in ["&&", "||"] {
+        for signature in ["Bool -> Bool -> Text", "Switch"] {
+            let src = format!(
+                "{}\nSwitch = Bool -> Outcome\nOutcome = Bool -> Text\n",
+                boolean_config(op, Some(signature))
+            );
+            let (mut i, cfg) = make_interp_from(&src);
+            for lhs in [true, false] {
+                for expr in [
+                    format!("{} {} true", lhs, op),
+                    format!("({} {}) true", lhs, op),
+                    format!("({} true) {}", op, lhs),
+                ] {
+                    assert_eq!(
+                        crash(&mut i, &cfg, &expr),
+                        format!("crash: contract: {}: result expected Text, got Bool", op)
+                    );
+                }
+            }
+            let skipped = op == "||";
+            let expr = format!("{} {} crash \"rhs must stay unevaluated\"", skipped, op);
+            assert_eq!(
+                crash(&mut i, &cfg, &expr),
+                format!("crash: contract: {}: result expected Text, got Bool", op)
+            );
+            check!(i, cfg, &format!("({}) or 9", expr), Value::int(9));
+        }
+        // A signature longer than the builtin's arity requires a
+        // function result on both the skipped and the evaluated paths.
+        let (mut i, cfg) = make_interp_from(&boolean_config(op, Some("Bool -> Bool -> Bool -> Bool")));
+        for lhs in [true, false] {
+            assert_eq!(
+                crash(&mut i, &cfg, &format!("{} {} true", lhs, op)),
+                format!("crash: contract: {} expected a function, got Bool", op)
+            );
+        }
+    }
+}
+
+#[test]
+fn short_circuit_contract_crashes_name_the_executing_definition() {
+    for op in ["&&", "||"] {
+        let src = format!(
+            "{}\nsigned : Bool -> Bool\nsigned = \\b -> b {} true\nplain = \\b -> b {} true\n",
+            boolean_config(op, Some("Bool -> Bool -> Text")), op, op
+        );
+        let (mut i, cfg) = make_interp_from(&src);
+        for lhs in [true, false] {
+            for name in ["signed", "plain"] {
+                let (msg, def) = crash_in(&mut i, &cfg, &format!("{} {}", name, lhs));
+                assert_eq!(def.as_deref(), Some(name), "{}", msg);
+                assert_eq!(msg, format!("contract: {}: result expected Text, got Bool", op));
+            }
+            let (_, def) = crash_in(&mut i, &cfg, &format!("{} {} true", lhs, op));
+            assert_eq!(def, None);
+        }
+    }
 }
 
 #[test]

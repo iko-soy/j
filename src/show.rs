@@ -1,7 +1,7 @@
 //! `show` (§5.2), unified diff (§4.9 `diff`), and the difftastic bridge (§7.10).
 
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobVal, Crash, FunVal, ThunkVal, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, Crash, FunVal, ThunkVal, Value};
 use num_bigint::BigInt;
 use unicode_width::UnicodeWidthChar;
 
@@ -85,23 +85,30 @@ fn render_int(n: &BigInt, out: &mut String) {
 
 #[inline(never)]
 fn render_blob(b: &BlobVal, out: &mut String) -> Result<(), Crash> {
-    match &b.content {
-        BlobContent::Resolved(bytes) => match std::str::from_utf8(bytes) {
-            Ok(s) => {
-                out.push_str("blob ");
-                push_text_literal(s, out);
-            }
-            Err(_) => out.push_str("blob \"<binary>\""),
-        },
-        BlobContent::Lazy(_) | BlobContent::Conflict(_) => {
-            let bytes = b.bytes()?;
-            if b.is_unresolved() {
-                out.push_str("{- unresolved -} ");
-            }
-            out.push_str("blob ");
-            push_text_literal(&String::from_utf8_lossy(&bytes), out);
-        }
+    // Conflicts deliberately show their markers, without promising a round
+    // trip (§5.2). Every resolved blob must instead have an equal literal:
+    // `blob` constructs only a regular UTF-8 file, so other kinds and bytes
+    // cannot be silently replaced by a different blob.
+    if b.is_unresolved() {
+        let bytes = b.bytes()?;
+        out.push_str("{- unresolved -} blob ");
+        push_text_literal(&String::from_utf8_lossy(&bytes), out);
+        return Ok(());
     }
+    match b.kind {
+        BlobKind::Regular => {}
+        BlobKind::Executable => return Err(Crash::new("show: cannot represent an executable blob")),
+        BlobKind::Symlink => return Err(Crash::new("show: cannot represent a symlink blob")),
+    }
+    let bytes = match &b.content {
+        BlobContent::Resolved(bytes) => bytes.clone(),
+        BlobContent::Lazy(lazy) => lazy.force()?,
+        BlobContent::Conflict(_) => unreachable!("handled above"),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Crash::new("show: cannot represent a non-UTF-8 blob"))?;
+    out.push_str("blob ");
+    push_text_literal(text, out);
     Ok(())
 }
 
@@ -436,6 +443,9 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
         .map(|c| c.as_text().map(|s| s.to_string()))
         .transpose()?
         .unwrap_or_else(|| "file".to_string());
+    if std::path::Path::new(&last).file_name().and_then(|n| n.to_str()) != Some(last.as_str()) {
+        return Err(Crash::new("difft: expected a filename as the last path component"));
+    }
     let a_bytes = match a {
         Value::Blob(bl) => bl.bytes()?,
         v => return Err(Crash::new(format!("difft: expected a Blob, got a {}", v.kind_name()))),
@@ -446,8 +456,14 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
     };
     let dir = tempfile::tempdir()
         .map_err(|e| Crash::new(format!("difft: cannot create temp dir: {}", e)))?;
-    let old = dir.path().join(format!("old-{}", last));
-    let new = dir.path().join(format!("new-{}", last));
+    // Keep the filename unchanged: adding a prefix can exceed NAME_MAX for
+    // a valid tracked path, and some languages are detected by exact name.
+    let old_dir = dir.path().join("old");
+    let new_dir = dir.path().join("new");
+    std::fs::create_dir(&old_dir).map_err(|e| Crash::new(format!("difft: {}", e)))?;
+    std::fs::create_dir(&new_dir).map_err(|e| Crash::new(format!("difft: {}", e)))?;
+    let old = old_dir.join(&last);
+    let new = new_dir.join(&last);
     std::fs::write(&old, &a_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
     std::fs::write(&new, &b_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
     let mut cmd = std::process::Command::new("difft");
