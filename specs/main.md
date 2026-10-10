@@ -216,10 +216,16 @@ values use stdout. Error prefixes are bright red, informational prefixes
 bright cyan, and interactive successful commands have a green checkmark.
 Color adds emphasis without replacing the text of errors or values.
 
-When both stdout and stderr are capable terminals, repository operations
+When both stdout and stderr are capable terminals, repository operations,
+configuration evaluation, and expression evaluation (including implicit application)
 may show a temporary, color-cycling progress line on stderr. It starts after
-140 ms, advances every 75 ms, and is cleared before the command reports its
-result. Fast operations never wait for a progress frame. It does not hide
+140 ms, advances every 75 ms, and names the current operation alongside a
+spinner, a bouncing activity bar, and elapsed time since that operation began.
+The bar is indeterminate and does not estimate completion. Each frame fits
+the current stderr terminal width with a spare column, omitting the bar and
+then the time before truncating the operation's name by display width. The
+line is cleared before the command reports its result.
+Fast operations never wait for a progress frame. It does not hide
 the cursor or change terminal modes. Signal behavior remains as in §1.3.
 Before an external renderer inherits stderr, progress is cleared and stopped
 for the remainder of the run so even an unterminated diagnostic stays visible.

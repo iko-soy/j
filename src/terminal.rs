@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 static ACTIVE_PROGRESS: Mutex<Option<Weak<ProgressWorker>>> = Mutex::new(None);
 static EXTERNAL_STDERR: AtomicBool = AtomicBool::new(false);
@@ -88,8 +90,10 @@ pub fn success(message: &str) {
     }
 }
 
-/// A delayed, color-cycling spinner. Stopping wakes the worker immediately,
-/// so short operations have no extra delay. Never hide or move the cursor
+/// A delayed spinner, activity bar, and elapsed time. The bar is deliberately
+/// indeterminate: elapsed time cannot tell us how much work remains.
+/// Stopping wakes the worker immediately, so short operations have no extra
+/// delay. Never hide or move the cursor
 /// between rows: even an abrupt signal leaves the terminal usable.
 struct Progress {
     worker: Option<Arc<ProgressWorker>>,
@@ -116,18 +120,18 @@ impl Progress {
         }
         stop_progress();
         let (send, receive) = mpsc::channel();
-        // Leave a spare column so the status line cannot wrap at the edge.
-        let width = stderr_width().saturating_sub(1);
+        let started = Instant::now();
         let worker = thread::Builder::new().name("j-progress".into()).spawn(move || {
             if receive.recv_timeout(Duration::from_millis(140)) != Err(mpsc::RecvTimeoutError::Timeout) {
                 return;
             }
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let colors = ["95", "96", "93", "92", "94"];
             let mut frame = 0;
             loop {
-                let line = format!("{} j · {}", frames[frame % frames.len()], label);
-                let line: String = line.chars().take(width).collect();
+                // Fit each new frame to the current terminal width, including
+                // after a resize. Leave one column spare at the edge.
+                let width = stderr_width().saturating_sub(1);
+                let line = progress_line(label, frame, started.elapsed(), width);
                 {
                     let mut out = io::stderr().lock();
                     if write!(
@@ -173,6 +177,39 @@ pub fn with_progress<T>(label: &'static str, operation: impl FnOnce() -> T) -> T
     operation()
 }
 
+fn progress_line(label: &str, frame: usize, elapsed: Duration, width: usize) -> String {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut line = format!("{} j · {}", FRAMES[frame % FRAMES.len()], label);
+    let seconds = elapsed.as_secs();
+    let time = if seconds < 60 {
+        format!("{}.{}s", seconds, elapsed.subsec_millis() / 100)
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    };
+    // Bounce a three-cell pulse across a ten-cell track. It never fills up
+    // or suggests a completion percentage for work with no known total.
+    let step = frame % 14;
+    let start = step.min(14 - step);
+    let bar: String = (0..10)
+        .map(|cell| if (start..start + 3).contains(&cell) { '━' } else { '·' })
+        .collect();
+    let details = format!(" [{bar}] {time}");
+    if line.width() + details.width() <= width {
+        line.push_str(&details);
+    } else if line.width() + 1 + time.width() <= width {
+        // On small terminals, keep the operation's name ahead of decoration.
+        line.push(' ');
+        line.push_str(&time);
+    }
+    let mut used = 0;
+    line.chars()
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= width
+        })
+        .collect()
+}
+
 fn stderr_width() -> usize {
     // The two streams can be attached to different terminals. Measure the
     // one that receives the progress line, rather than the tree's stdout.
@@ -211,4 +248,27 @@ pub fn write_output(out: &mut impl Write, text: &str) -> io::Result<()> {
     }
     out.write_all(text[start..].as_bytes())?;
     out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_fits_terminal_cells_and_keeps_the_operation_visible() {
+        let label = "Reading 仓库";
+        for width in 0..80 {
+            for frame in 0..20 {
+                let line = progress_line(label, frame, Duration::from_millis(1234), width);
+                assert!(line.width() <= width, "{width} columns: {line:?}");
+                if width >= 18 {
+                    assert!(line.contains(label), "operation name lost: {line:?}");
+                }
+            }
+        }
+        let line = progress_line("Reading repository", 0, Duration::from_millis(1234), 80);
+        assert!(line.contains("[━━━·······] 1.2s"), "{line:?}");
+        assert!(progress_line("Reading repository", 0, Duration::from_secs(65), 80)
+            .ends_with("1m 05s"));
+    }
 }

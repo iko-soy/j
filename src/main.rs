@@ -476,25 +476,27 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     };
 
     // §1.2.6: evaluate config definitions, then the expression
-    if let Err(c) = config::eval_config(&mut interp, &cfg) {
+    if let Err(c) = j::terminal::with_progress("Evaluating configuration", || {
+        config::eval_config(&mut interp, &cfg)
+    }) {
         return err(3, format!("config.j: {}", c.msg));
     }
     *interp.old_repo.borrow_mut() = Some(loaded_repo.clone());
     *interp.given_repo.borrow_mut() = Some(current_repo.clone());
     let env = interp.global_env();
     let expr_rc = Rc::new(expr);
-    let mut v = match interp.eval(&expr_rc, &env) {
+    let v = match j::terminal::with_progress("Evaluating expression", || {
+        let v = interp.eval(&expr_rc, &env)?;
+        // §1.2.7: apply a function result to the repo, once.
+        if matches!(v, Value::Fun(_)) {
+            interp.apply(v, current_repo.clone())
+        } else {
+            Ok(v)
+        }
+    }) {
         Ok(v) => v,
         Err(c) => return crash_err(&c, Some(text)),
     };
-
-    // §1.2.7: apply a function result to the repo, once
-    if matches!(v, Value::Fun(_)) {
-        v = match interp.apply(v, current_repo.clone()) {
-            Ok(v) => v,
-            Err(c) => return crash_err(&c, Some(text)),
-        };
-    }
 
     // §1.2.8: a Repo is persisted (unless unchanged)
     if is_repo_value(&v) {
