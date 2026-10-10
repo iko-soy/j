@@ -33,33 +33,46 @@ impl Palette {
         self.wrap("2", s)
     }
     pub fn bold_bg(&self, s: &str) -> String {
-        self.wrap("1;48;5;236", s)
+        self.wrap("1;97;48;5;17", s)
     }
     pub fn dim_italic(&self, s: &str) -> String {
         self.wrap("2;3", s)
     }
     pub fn cyan(&self, s: &str) -> String {
-        self.wrap("36", s)
+        self.wrap("96", s)
     }
     pub fn red(&self, s: &str) -> String {
-        self.wrap("31", s)
+        self.wrap("91", s)
     }
     pub fn blue(&self, s: &str) -> String {
-        self.wrap("34", s)
+        self.wrap("94", s)
     }
     pub fn green(&self, s: &str) -> String {
-        self.wrap("32", s)
+        self.wrap("92", s)
     }
     pub fn yellow(&self, s: &str) -> String {
-        self.wrap("33", s)
+        self.wrap("93", s)
+    }
+    fn id(&self, s: &str) -> String {
+        self.wrap("1;95", s)
+    }
+    fn label(&self, s: &str) -> String {
+        self.wrap("1;92", s)
+    }
+    fn field(&self, s: &str) -> String {
+        self.wrap("2;96", s)
+    }
+    fn rail(&self, lane: usize, s: &str) -> String {
+        let codes = ["95", "96", "93", "92"];
+        self.wrap(codes[lane.saturating_sub(1) % codes.len()], s)
     }
     pub fn grey(&self, bright: u8, s: &str) -> String {
         // grey scale: brighter when more recent
         self.wrap(&format!("38;5;{}", 245 + bright.min(10)), s)
     }
     pub fn accent(&self, level: u8, s: &str) -> String {
-        // size bar: one accent colour, brighter with size
-        let codes = ["38;5;240", "38;5;36", "38;5;32", "38;5;39", "38;5;87"];
+        // Size remains encoded by the bar's height, with a vivid cool-to-warm ramp.
+        let codes = ["96", "94", "95", "93", "1;93"];
         self.wrap(codes[level.min(4) as usize], s)
     }
     pub fn author(&self, name: &str, s: &str) -> String {
@@ -69,7 +82,7 @@ impl Palette {
             h = h.wrapping_mul(33).wrapping_add(b as u32);
         }
         let hue = (h % 6) as u8;
-        let code = ["31", "32", "33", "34", "35", "36"][hue as usize];
+        let code = ["91", "92", "93", "94", "95", "96"][hue as usize];
         self.wrap(code, s)
     }
     /// colour with a raw ANSI code (used for meaning-coloured glyphs)
@@ -101,7 +114,8 @@ pub fn color_enabled(mode: &str) -> bool {
     match mode {
         "always" => true,
         "never" => false,
-        _ => crate::show::stdout_is_tty(),
+        _ => std::env::var_os("TERM").map(|t| t != "dumb").unwrap_or(true)
+            && crate::show::stdout_is_tty(),
     }
 }
 
@@ -236,7 +250,7 @@ enum Block {
 fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
     let p = interp.unique_prefix(id);
     let n = p.len();
-    format!("{}{}", pal.bold(p.as_str()), pal.dim(&id[n..]))
+    format!("{}{}", pal.id(p.as_str()), pal.dim(&id[n..]))
 }
 
 fn display_line(
@@ -248,8 +262,8 @@ fn display_line(
     let v = &v.forced()?;
     match v {
         Value::Thunk(_) => unreachable!("forced never returns a thunk"),
-        Value::Int(n) => Ok(n.to_string()),
-        Value::Bool(b) => Ok(b.to_string()),
+        Value::Int(n) => Ok(pal.yellow(&n.to_string())),
+        Value::Bool(b) => Ok(if *b { pal.green("true") } else { pal.red("false") }),
         Value::Text(t) => Ok(first_line(t)),
         Value::Id(id) => Ok(display_id(interp, id, pal)),
         Value::Blob(b) => {
@@ -263,7 +277,7 @@ fn display_line(
         // a lambda renders as its source (§5.2), which may run over several
         // lines and hold comments; the line form keeps only the first
         Value::Fun(_) => Ok(first_line(&crate::show::show(interp, v)?)),
-        Value::Shape(s) => Ok(s.name.clone()),
+        Value::Shape(s) => Ok(pal.cyan(&s.name)),
         Value::Record(_) => {
             if let Some(shape) = shape_of_record(interp, v) {
                 match shape.as_str() {
@@ -335,14 +349,13 @@ fn list_line(_interp: &Interp, xs: &[Value], pal: &Palette) -> Result<String, Cr
         let parts: Vec<String> = xs
             .iter()
             .map(|x| match x {
-                Value::Int(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
+                Value::Int(n) => pal.yellow(&n.to_string()),
+                Value::Bool(b) => if *b { pal.green("true") } else { pal.red("false") },
                 _ => unreachable!(),
             })
             .collect();
         return Ok(parts.join(", "));
     }
-    let _ = pal;
     Ok(format!("{} items", xs.len()))
 }
 
@@ -355,9 +368,9 @@ fn entry_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Crash
     };
     let _ = interp;
     if unresolved {
-        Ok(format!("{} {}  {}", pal.red("✖"), path, size))
+        Ok(format!("{} {}  {}", pal.red("✖"), pal.cyan(&path), pal.red(&size)))
     } else {
-        Ok(format!("  {}  {}", path, size))
+        Ok(format!("  {}  {}", pal.cyan(&path), pal.yellow(&size)))
     }
 }
 
@@ -790,11 +803,18 @@ fn commit_line(
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
     let glyph = node_glyph(c, &id, standing)?;
-    let id_s = display_id(interp, &id, pal);
+    let id_s = if glyph == "⊗" {
+        pal.red(&display_id(interp, &id, &Palette { on: false }))
+    } else if standing.immutable {
+        pal.blue(&display_id(interp, &id, &Palette { on: false }))
+    } else {
+        display_id(interp, &id, pal)
+    };
+    let glyph = pal.code(node_ansi(&glyph), &glyph);
     let labels_s = if labels.is_empty() {
         String::new()
     } else {
-        pal.green(&labels.join("  "))
+        pal.label(&labels.join("  "))
     };
     Ok(if labels_s.is_empty() {
         format!("{} {}  {}", glyph, id_s, msg_first)
@@ -955,7 +975,7 @@ fn display_fields(
     let from = after.map_or(Bound::Unbounded, Bound::Excluded);
     for (k, x) in m.range::<str, _>((from, Bound::Unbounded)) {
         out.push_str(&pad);
-        out.push_str(&pal.dim(&pad_right(k, name_w)));
+        out.push_str(&pal.field(&pad_right(k, name_w)));
         out.push_str("  ");
         // lists print in block form under their key (§5.1)
         if matches!(x, Value::List(xs) if !xs.is_empty()) {
@@ -1274,7 +1294,7 @@ fn display_list_block(
                     // the glyph of its line form (§5.1)
                     let glyph = node_glyph(&c, &id, &loaded.line_standing(interp, &c)?)?;
                     let conflict = glyph == "⊗";
-                    let glyph = if conflict { pal.red(&glyph) } else { glyph };
+                    let glyph = pal.code(node_ansi(&glyph), &glyph);
                     let msg = c.field("message")?.as_text()?.to_string();
                     let msg_first = msg.lines().next().unwrap_or("");
                     let labels: Vec<String> = c
@@ -1296,7 +1316,7 @@ fn display_list_block(
                             glyph,
                             id_s,
                             msg_first,
-                            pal.green(&labels.join("  "))
+                            pal.label(&labels.join("  "))
                         ));
                     }
                 }
@@ -1355,16 +1375,18 @@ fn display_list_block(
                         _ => (String::new(), false),
                     };
                     out.push_str(&pad);
-                    let mark = if unresolved { "✖" } else { " " };
+                    let mark = if unresolved { pal.red("✖") } else { " ".into() };
                     let size_s = if unresolved {
                         pal.red(&size)
                     } else {
-                        size
+                        pal.yellow(&size)
                     };
                     // pad by display width, not by character count: `{:n$}`
                     // pads to n *chars*, so a wide (East Asian) path pushes
                     // the size column out of line
-                    out.push_str(&format!("{} {}  {}\n", mark, pad_right(&path, width_max), size_s));
+                    out.push_str(&format!(
+                        "{} {}  {}\n", mark, pal.cyan(&pad_right(&path, width_max)), size_s
+                    ));
                 }
                 return Ok(());
             }
@@ -1402,7 +1424,7 @@ fn display_table(
         let mut row = Vec::new();
         for f in &fields {
             let cell = match x.field(f)? {
-                Value::Bool(true) => "✓".to_string(),
+                Value::Bool(true) => pal.green("✓"),
                 Value::Bool(false) => String::new(),
                 other => display_line(interp, &other, pal, loaded)?,
             };
@@ -1431,7 +1453,7 @@ fn display_table(
         .zip(&widths)
         .map(|(&i, w)| pad_right(&fields[i], *w))
         .collect();
-    out.push_str(&pal.dim(&header.join("   ")));
+    out.push_str(&pal.field(&header.join("   ")));
     out.push('\n');
     for r in &rows {
         out.push_str(&pad);
@@ -2325,7 +2347,7 @@ fn build_row_text(
 ) -> RowText {
     let c = n.commit();
     let is_focus = c.map(|x| x.is_focus).unwrap_or(false);
-    let gutter = if is_focus && with_focus { "▶ " } else { "  " }.to_string();
+    let gutter = if is_focus && with_focus { pal.code("1;96", "▶ ") } else { "  ".into() };
     // id (blank on a run row, whose count `rail_row` draws: the part that
     // overflows the rails area runs on into the id column)
     let id = match n {
@@ -2339,8 +2361,10 @@ fn build_row_text(
                     pal.red(&format!("@{}", p))
                 } else if info.immutable {
                     pal.blue(&format!("@{}", p))
+                } else if info.is_focus {
+                    pal.code("1;96", &format!("@{}", p))
                 } else {
-                    format!("@{}", p)
+                    pal.id(&format!("@{}", p))
                 };
                 let plain = k + 1; // +1 for the @
                 let padded = if plain < id_w {
@@ -2561,7 +2585,7 @@ fn draw_rows(
         line.push_str(&t.msg);
         if label_col && !t.labels.is_empty() {
             pad_to(&mut line, lab_off);
-            line.push_str(&pal.green(&t.labels));
+            line.push_str(&pal.label(&t.labels));
         }
         if !metas[idx].is_empty() {
             pad_to(&mut line, meta_off);
@@ -2578,7 +2602,7 @@ fn draw_rows(
                 }
                 _ => line.clone(),
             };
-            lines.push(pal.bg_line("48;5;236", &padded));
+            lines.push(pal.bg_line("97;48;5;17", &padded));
         } else {
             lines.push(line);
         }
@@ -2897,8 +2921,9 @@ fn detail_rail_row(state: &[Option<bool>]) -> (Vec<char>, Vec<bool>) {
 }
 
 /// Colour the rails. Rail connectors are lane-coloured (lane 0 = immutable
-/// blue, others dim); the node glyph at `glyph` (its lane position and ANSI
-/// code) is meaning-coloured. A glyph two columns wide (`icons`) fills both
+/// bright blue, others rotating accent hues); the node glyph at `glyph`
+/// (its lane position and ANSI code) is meaning-coloured. A glyph two
+/// columns wide (`icons`) fills both
 /// characters of its lane, so the one after it is not drawn (§Glyphs).
 fn color_rails(
     chars: &[char],
@@ -2922,12 +2947,12 @@ fn color_rails(
             } else if lane0[i] {
                 s.push_str(&pal.blue(&t));
             } else {
-                s.push_str(&pal.dim(&t));
+                s.push_str(&pal.rail(i / 2, &t));
             }
         } else if lane0[i] {
             s.push_str(&pal.blue(&t));
         } else {
-            s.push_str(&pal.dim(&t));
+            s.push_str(&pal.rail(i / 2, &t));
         }
     }
     s
@@ -3048,20 +3073,18 @@ fn glyph_for(info: &CommitInfo, icons: bool) -> &'static str {
 /// The ANSI colour code for a node glyph, by meaning (§Colour: glyphs carry
 /// meaning; colour only adds emphasis). Mirrors the precedence of `glyph_for`.
 fn glyph_ansi(info: &CommitInfo) -> &'static str {
-    if info.id == ROOT_ID {
-        "1" // root: bold
-    } else if info.conflict {
-        "31" // conflict: red
-    } else if info.empty {
-        "2" // empty: dim
-    } else if info.immutable {
-        "34" // immutable: blue
-    } else if info.is_focus {
-        "1;36" // focus: bold cyan
-    } else if info.is_ancestor_of_focus {
-        "32" // ancestor of focus: green
-    } else {
-        "37" // other commit: light grey
+    node_ansi(glyph_for(info, false))
+}
+
+fn node_ansi(glyph: &str) -> &'static str {
+    match glyph {
+        "⌂" => "1;95", // root: bold magenta
+        "⊗" => "91", // conflict: bright red
+        "◌" => "2", // empty: dim
+        "◆" => "94", // immutable: bright blue
+        "◉" => "1;96", // focus: bold cyan
+        "●" => "92", // ancestor of focus: bright green
+        _ => "97", // other commit: bright white
     }
 }
 

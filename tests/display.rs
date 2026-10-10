@@ -191,6 +191,57 @@ fn text_of_blob() {
 }
 
 #[test]
+fn colour_preserves_raw_text_and_blob_contents() {
+    let (_, be) = sample_repo();
+    let (mut i, _) = make_interp(be);
+    let raw = "true 42 @wqzt\n日本語\n\x1b[31mexisting style\x1b[0m\n";
+    for value in [Value::text(raw), BlobVal::text_blob(raw)] {
+        assert_eq!(j::render::display(&mut i, &value, true).unwrap(), raw);
+    }
+}
+
+#[test]
+fn colour_preserves_structured_text_and_alignment() {
+    fn plain(s: &str) -> String {
+        let mut chars = s.chars();
+        let mut out = String::new();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' { break; }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    let (repo, be) = sample_repo();
+    let (mut i, _) = make_interp(be);
+    *i.old_repo.borrow_mut() = Some(repo.clone());
+    let rows = Value::list(vec![
+        Value::record(&[("name", Value::text("日本語")), ("n", Value::int(42)), ("ok", Value::bool(true))]),
+        Value::record(&[("name", Value::text("e\u{301}")), ("n", Value::int(-1)), ("ok", Value::bool(false))]),
+    ]);
+    for value in [
+        rows.clone(),
+        Value::record(&[("rows", rows), ("value", Value::int(7))]),
+        repo.field("root").unwrap(),
+        repo.field("root").unwrap().field("files").unwrap(),
+        Value::list(vec![Value::int(1), Value::bool(true), Value::bool(false)]),
+    ] {
+        let styled = j::render::display(&mut i, &value, true).unwrap();
+        let unstyled = j::render::display(&mut i, &value, false).unwrap();
+        assert!(styled.contains('\x1b'));
+        assert_eq!(plain(&styled), unstyled);
+        for (styled_line, plain_line) in styled.lines().zip(unstyled.lines()) {
+            assert_eq!(j::render::width(styled_line), j::render::width(plain_line));
+        }
+    }
+}
+
+#[test]
 fn dry_run_tree_after_squash() {
     let (repo, be) = sample_repo();
     // strip labels so abandon is allowed

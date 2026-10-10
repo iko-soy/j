@@ -464,6 +464,7 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
             cmd.env("DFT_WIDTH", w.to_string());
         }
     }
+    crate::terminal::external_stderr();
     let out = cmd
         .output()
         .map_err(|_| Crash::new("difft: cannot execute `difft` (not on PATH)"))?;

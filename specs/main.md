@@ -207,6 +207,31 @@ is in `goto`. A builtin is not a definition, so a crash in one is in
 whichever definition applied it, and with none executing the line is only
 `   from <expression>`.
 
+### 1.5 Terminal presentation
+
+Automatic colors are used only on a terminal, and disabled by `TERM=dumb`
+or a nonempty `NO_COLOR`. Diagnostics use the stderr terminal; displayed
+values use stdout. Error prefixes are bright red, informational prefixes
+bright cyan, and interactive successful commands have a green checkmark.
+Color adds emphasis without replacing the text of errors or values.
+
+When both stdout and stderr are capable terminals, repository operations
+may show a temporary, color-cycling progress line on stderr. It starts after
+140 ms, advances every 75 ms, and is cleared before the command reports its
+result. Fast operations never wait for a progress frame. It does not hide
+the cursor or change terminal modes. Signal behavior remains as in §1.3.
+Before an external renderer inherits stderr, progress is cleared and stopped
+for the remainder of the run so even an unterminated diagnostic stays visible.
+
+Colored multiline output is revealed in at most seven batches, with at
+most 96 ms of total pacing. Its bytes and row order are unchanged. Plain
+text is written directly. `J_ANIMATIONS=never` (also `off`, `false`, or `0`,
+case-insensitive) disables all motion while retaining colors. Motion is
+also disabled by nonempty `NO_COLOR` or `CI`, `TERM=dumb`, or either output
+stream being redirected. Interactive success messages are omitted in
+these noninteractive modes; `J_ANIMATIONS` alone does not suppress them.
+Broken pipes and failed writes keep the behavior in §1.4.
+
 ---
 
 ## 2. Values
@@ -1445,7 +1470,8 @@ run — have no metadata: their margin cells are blank, their size bar is
 computed from the value, and they sort last among their siblings. The same
 holds for a `Commit` block in display (§5.1).
 
-Missing fields crash. `color = "auto"` means colour iff stdout is a terminal.
+Missing fields crash. `color = "auto"` means colour iff stdout is a terminal
+and `TERM` is not `dumb`.
 If the environment variable `NO_COLOR` is set and non-empty, colour is never
 used regardless of `color`. `config.j` fixes the defaults by defining `tree`.
 

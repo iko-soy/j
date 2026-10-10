@@ -1479,13 +1479,13 @@ impl JjBackend {
         {
             Ok(f) => f,
             Err(e) => {
-                crate::report!("j: cannot create {}: {}", lock_path.display(), e);
+                crate::terminal::report_error(format_args!("j: cannot create {}: {}", lock_path.display(), e));
                 std::process::exit(2);
             }
         };
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            crate::report!("j: another j is running in this repository");
+            crate::terminal::report_error(format_args!("j: another j is running in this repository"));
             std::process::exit(2);
         }
         *self.inner.lock_guard.lock().unwrap() = Some(FileLock(file));
