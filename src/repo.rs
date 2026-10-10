@@ -382,7 +382,8 @@ pub fn same_repo(a: &Value, b: &Value) -> Result<bool, Crash> {
 }
 
 // ----------------------------------------------------------------------
-// validation (§7.5 steps 1–3 and 6), shared by `validate` and persistence
+// validation (§7.5 steps 1–3, the root invariant of 4, and 6), shared by
+// `validate` and persistence
 // ----------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -417,7 +418,27 @@ pub fn validate_repo(i: &mut Interp, new: &Value) -> Result<Validated, Crash> {
             "the focus must be a mutable commit; compose with new",
         ));
     }
+    validate_root(old.as_ref(), new)?;
     Ok(Validated { immutable })
+}
+
+/// The root is fixed even when the configured immutable set is empty.
+/// Compare with the loaded root, preserving synthetic backends' contents
+/// and the lazy files of a root that has not changed.
+fn validate_root(old: Option<&Value>, new: &Value) -> Result<(), Crash> {
+    let root = top_of(new)?.field("root")?;
+    if id_of(&root)? != ROOT_ID {
+        return Err(Crash::new("persistence: the root commit must be the top"));
+    }
+    if let Some(old) = old {
+        let stored = top_of(old)?.field("root")?;
+        if !value_eq(&stored.field("message")?, &root.field("message")?)?
+            || !same_files(&stored, &root)?
+        {
+            return Err(Crash::new("persistence: the root commit cannot be changed"));
+        }
+    }
+    Ok(())
 }
 
 fn check_repo_shape(v: &Value) -> Result<(), Crash> {

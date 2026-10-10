@@ -1,4 +1,4 @@
-//! Persistence validation tests (§7.5 steps 1–3, 6) and config validation (§6.2).
+//! Persistence validation tests (§7.5 steps 1–4, 6) and config validation (§6.2).
 
 use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
@@ -45,6 +45,10 @@ fn subtree(root: Value, kids: Vec<Value>) -> Value {
 /// root -> a, focused on a
 fn two_commit_repo(labels_a: &[&str]) -> Value {
     let root = commit(ROOT_ID, "", &[], vec![]);
+    two_commit_repo_with_root(root, labels_a)
+}
+
+fn two_commit_repo_with_root(root: Value, labels_a: &[&str]) -> Value {
     let a = commit("kaaaaaaa", "a", labels_a, vec![]);
     let frame = Value::record(&[
         ("left", Value::list(vec![])),
@@ -632,14 +636,71 @@ fn snapshots_left_as_stored_are_not_read() {
 }
 
 #[test]
-fn root_must_stay_on_top() {
-    // covered implicitly by navigation invariants; validate shape only here
+fn persistence_requires_a_repo() {
     let old = two_commit_repo(&[]);
     let not_repo = Value::record(&[("root", old.field("root").unwrap())]);
     let mut i = make_interp(backend_with(&[]));
     *i.old_repo.borrow_mut() = Some(old.clone());
     let e = j::repo::validate_repo(&mut i, &not_repo).unwrap_err();
     assert!(e.msg.contains("not a Repo"), "{}", e.msg);
+}
+
+#[test]
+fn root_must_stay_on_top() {
+    // With no remote labels the default immutable set is empty, but the
+    // root still cannot be abandoned, replaced, or placed below a commit.
+    let old = two_commit_repo(&[]);
+    let a = old.field("root").unwrap();
+    let root = old.field("context").unwrap().as_list().unwrap()[0]
+        .field("parent").unwrap();
+    for children in [vec![], vec![subtree(root, vec![])]] {
+        let new = Value::record(&[
+            ("children", Value::list(children)),
+            ("context", Value::list(vec![])),
+            ("root", a.clone()),
+        ]);
+        assert_eq!(
+            validate_with(&old, &new).unwrap_err(),
+            "persistence: the root commit must be the top",
+        );
+    }
+    let replaced = two_commit_repo_with_root(commit("kbbbbbbb", "", &[], vec![]), &[]);
+    assert_eq!(
+        validate_with(&old, &replaced).unwrap_err(),
+        "persistence: the root commit must be the top",
+    );
+}
+
+#[test]
+fn root_message_and_files_cannot_change() {
+    let old = two_commit_repo(&[]);
+    for root in [
+        commit(ROOT_ID, "edited", &[], vec![]),
+        commit(ROOT_ID, "", &[], vec![entry("a", "squashed into root")]),
+    ] {
+        let new = two_commit_repo_with_root(root, &[]);
+        assert_eq!(
+            validate_with(&old, &new).unwrap_err(),
+            "persistence: the root commit cannot be changed",
+        );
+    }
+}
+
+#[test]
+fn unchanged_synthetic_root_is_accepted_without_reading_its_tree() {
+    let loaded = || two_commit_repo_with_root(
+        commit_holding(ROOT_ID, "synthetic root", &[], unreadable_tree(ROOT_ID, "root-tree")),
+        &[],
+    );
+    // Each load has its own thunk, as a snapshot rebuilding the repo does.
+    assert_eq!(validate_with(&loaded(), &loaded()), Ok(()));
+    let listed = |entries| two_commit_repo_with_root(
+        commit(ROOT_ID, "synthetic root", &[], entries),
+        &[],
+    );
+    let old = listed(vec![entry("a", "1"), entry("b", "2")]);
+    let reordered = listed(vec![entry("b", "2"), entry("a", "1")]);
+    assert_eq!(validate_with(&old, &reordered), Ok(()));
 }
 
 // ------------------------------------------------------------------

@@ -696,10 +696,12 @@ unchecked except through the functions they call.
 
 ## 12. `show`: rendering values as text
 
-`show v` renders any value as an expression in the language, such that
+`show v` renders values as expressions in the language, such that
 (except for closures and unresolved blobs) the result parses and evaluates
-back to an equal value. Since `show` returns a `Text`, and a top-level `Text`
-prints raw, `j show …` is how you inspect values.
+back to an equal value. Resolved binary, executable, and symlink blobs have
+no equal literal, so `show` crashes on them, even inside lists or records.
+Since `show` returns a `Text`, and a top-level `Text` prints raw, `j show …`
+is how you inspect values.
 
 ```
 show 42                 => "42"

@@ -5,7 +5,7 @@ use j::domain::MemBackend;
 use j::eval::Interp;
 use j::parse::parse_expr;
 use j::show::{show, text_literal, unified_diff};
-use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Env, Value};
+use j::value::{value_eq, BlobContent, BlobKind, BlobVal, ConflictSide, Env, LazyBlob, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -232,6 +232,65 @@ fn show_unresolved_blob() {
     }));
     let s = show(&i, &v).unwrap();
     assert!(s.starts_with("{- unresolved -} blob"), "{}", s);
+}
+
+#[test]
+fn show_refuses_resolved_blobs_without_an_equal_literal() {
+    let (mut i, cfg) = make_interp();
+    let catcher = parse_expr("\\x -> show x or \"caught\"", Rc::new(cfg.global_names.clone())).unwrap();
+    let env = i.global_env();
+    let catcher = i.eval(&Rc::new(catcher), &env).unwrap();
+    for lazy in [false, true] {
+        for (kind, bytes, message) in [
+            (BlobKind::Regular, vec![0xff, 0xfe], "non-UTF-8"),
+            (BlobKind::Executable, b"echo hi\n".to_vec(), "executable"),
+            (BlobKind::Symlink, b"target".to_vec(), "symlink"),
+        ] {
+            let content = if lazy {
+                BlobContent::Lazy(Rc::new(LazyBlob::new("stored".into(), move || Ok(Rc::new(bytes)))))
+            } else {
+                BlobContent::Resolved(Rc::new(bytes))
+            };
+            let blob = Value::Blob(Rc::new(BlobVal { kind, content }));
+            // The failure propagates through nested snapshots and is caught
+            // by the language, instead of yielding a damaged replacement.
+            let snapshot = Value::list(vec![Value::record(&[
+                ("content", blob),
+                ("path", Value::list(vec![Value::text("file")])),
+            ])]);
+            let error = show(&i, &snapshot).unwrap_err();
+            assert!(error.msg.contains(message), "{}", error.msg);
+            let caught = i.apply(catcher.clone(), snapshot.clone()).unwrap();
+            assert_eq!(caught.as_text().unwrap(), "caught");
+            assert!(show(&i, &snapshot).is_err());
+        }
+    }
+    // A stored regular UTF-8 blob still has exactly the same representation
+    // as an eager one and round-trips, including embedded NUL bytes.
+    let regular = Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Regular,
+        content: BlobContent::Lazy(Rc::new(LazyBlob::new("text".into(), || {
+            Ok(Rc::new(b"hello\0\n".to_vec()))
+        }))),
+    }));
+    roundtrip(&mut i, &cfg, &regular);
+}
+
+#[test]
+fn show_keeps_the_unresolved_blob_fallback_for_binary_and_typed_conflicts() {
+    let (i, _cfg) = make_interp();
+    for kind in [BlobKind::Regular, BlobKind::Executable, BlobKind::Symlink] {
+        let v = Value::Blob(Rc::new(BlobVal {
+            kind: kind.clone(),
+            content: BlobContent::Conflict(vec![Some(ConflictSide {
+                kind,
+                bytes: Rc::new(vec![0xff, 0xfe]),
+                tree: None,
+            })]),
+        }));
+        let s = show(&i, &v).unwrap();
+        assert!(s.starts_with("{- unresolved -} blob"), "{}", s);
+    }
 }
 
 #[test]

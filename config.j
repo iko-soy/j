@@ -155,7 +155,7 @@ subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
                                            -- crash for a commit not yet persisted
 validate   : Repo -> Repo                  -- the repo unchanged, or the crash persisting
-                                           -- it would produce (shape, labels, immutability,
+                                           -- it would produce (shape, root, labels, immutability,
                                            -- focus). `tree . validate . rebase trunk` is an
                                            -- honest dry run.
 diff       : Blob -> Blob -> Text          -- unified diff from the first to the second

@@ -69,6 +69,7 @@ fn toml_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
             c => out.push(c),
         }
     }
@@ -3407,6 +3408,11 @@ fn parse_push_records(
                 let rec = vis.commits.get(&change_id).ok_or_else(|| {
                     (1, format!("push: `@{}` is not a visible commit", change_id))
                 })?;
+                // jj's root has no Git object: its all-zero commit id is
+                // interpreted by `git push` as a deletion, not a target.
+                if rec.commit.id() == repo.store().root_commit_id() {
+                    return Err((1, "push: the root commit cannot be pushed".to_string()));
+                }
                 out.push((name, Some(rec.commit.id().clone())));
             }
             None => {
@@ -3618,23 +3624,11 @@ fn ancestors_of_change_ids(vis: &VisibleRepo, seeds: &[String]) -> BTreeSet<Stri
 
 /// git-check-ref-format --branch rules
 fn is_valid_git_branch_name(name: &str) -> bool {
-    if name.is_empty()
-        || name.starts_with('-')
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.ends_with('/')
-        || name.ends_with(".lock")
-        || name.contains("..")
-        || name.contains("//")
-        || name.contains("@{")
-        || name == "@"
-    {
+    if name.starts_with('-') {
         return false;
     }
-    name.chars().all(|c| {
-        !(c.is_ascii_control()
-            || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
-    })
+    let full_name = format!("refs/heads/{name}");
+    gix::validate::reference::branch_name(full_name.as_str().into()).is_ok()
 }
 
 // ----------------------------------------------------------------------
@@ -4724,6 +4718,21 @@ mod tests {
         drop(bytes);
         assert!(weak_bytes.upgrade().is_none());
         assert!(cache.blobs.get(&id).is_none());
+    }
+
+    #[test]
+    fn user_settings_preserve_every_ascii_control_character() {
+        let identity: String = (0u8..=127).map(char::from).collect();
+        let text = format!(
+            "[user]\nname = {}\nemail = {}\n",
+            toml_string(&identity),
+            toml_string(&identity)
+        );
+        let mut config = StackedConfig::with_defaults();
+        config.add_layer(ConfigLayer::parse(ConfigSource::User, &text).unwrap());
+        let settings = UserSettings::from_config(config).unwrap();
+        assert_eq!(settings.user_name(), identity);
+        assert_eq!(settings.user_email(), identity);
     }
 
     #[test]
