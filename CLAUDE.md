@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`j` is a CLI for Jujutsu (jj) repositories whose interface is a small, pure, dynamically typed functional language. A repository is a value (`Repo`, a zipper over the commit tree), a command is a function `Repo -> Repo`, and the whole user-facing vocabulary (`new`, `describe`, `squash`, `tree`, …) is written *in the language* in `config.j`. The Rust binary supplies only the language, the builtins `config.j` declares, eight reserved commands, and the bridge to jj's on-disk format via `jj-lib` (no `jj` binary needed at runtime).
+`j` is a CLI for Jujutsu (jj) repositories whose interface is a small, pure, dynamically typed functional language. A repository is a value (`Repo`, a zipper over the commit tree), a command is a function `Repo -> Repo`, and the whole user-facing vocabulary (`new`, `describe`, `squash`, `tree`, …) is written *in the language* in `config.j`. The Rust binary supplies only the language, the builtins `config.j` declares, ten reserved commands, and the bridge to jj's on-disk format via `jj-lib` (no `jj` binary needed at runtime).
 
 ## Commands
 
@@ -28,7 +28,6 @@ There is no devShell in `flake.nix`; `cargo`/`rustc` come from the system. The N
 `specs/main.md` is the specification the implementation was written from, and the code cites it everywhere as `§N.M` (e.g. `§7.5` = persistence). When changing behaviour, find the section first, and keep code, spec, and tests agreeing. `specs/tree.md` is a newer, complete replacement for `§7.11` (the "rails" tree layout) and is what `render.rs` implements.
 
 Known drift to be aware of (not to copy):
-- `README.md` links to `SPEC.md`; the file is `specs/main.md`.
 - `§9` of the spec is a verbatim copy of `config.j`, but `config.j` is ahead of it (`touchedPaths`, the extra `treeWith` options, `treeCompact`, `treeData`). **`config.j` is the source of truth**; `docs/base.md` lags the same way.
 
 ## Architecture
@@ -42,6 +41,8 @@ Language pipeline, all in `src/`:
 - `shape.rs`: shapes from `config.j` type declarations, and runtime **contracts** compiled from signatures — checked at every call, one level deep (kind, list-ness, field names). Records are structural: a value *is* a `Commit` iff its field set matches.
 - `builtins.rs`: native implementations of the names `config.j` declares without defining.
 - `config.rs`: parses and validates `config.j`, orders definitions by dependency, resolves `@id` literals. Four definitions are read by the binary itself: `user`, `tree`, `immutable`, `labelled`.
+
+`help [NAME]` and `commands [QUERY]` are reserved discovery commands; `--help` and `-h` alias `help` only as the first word. They never open a repository or evaluate config definitions. General and reserved-command help work without config; the custom vocabulary reads config without writing it, using the embedded reference only when no file exists. Keep these paths usable outside a repository and when general help is needed to recover from a broken config.
 
 Repository side:
 - `domain.rs`: the `Backend` trait — everything repository-shaped the interpreter needs — plus `MemBackend` (the test double required by spec §10) and snapshot helpers shared by both backends.

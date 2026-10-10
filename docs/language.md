@@ -3,7 +3,8 @@
 `j` is a small, pure, functional language. Every `j` command evaluates one
 expression in this language against the current repository. The language is
 the whole interface: there are no subcommands beyond a handful of reserved
-words, and no flags.
+words, and no general flags. As the first word, `--help` and `-h` are aliases
+for `help`; use `j help` for a command guide or `j commands` to browse names.
 
 This document describes the language itself — its values, syntax, semantics,
 and the builtins — with examples throughout. Every example shows an expression

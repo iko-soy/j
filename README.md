@@ -27,6 +27,27 @@ The whole vocabulary — `new`, `describe`, `squash`, `tree`, `rebase`, … — 
 written *in the language* in `config.j`, and you extend it by writing more
 functions.
 
+## Find a command
+
+```
+j help                  -- a quick start, grouped commands, and examples
+j commands              -- browse the vocabulary in your config
+j commands rebase       -- search names, signatures, and descriptions
+j help describe         -- see a command's signature, documentation, and examples
+j help push             -- learn a reserved command's usage
+```
+
+`j --help` and `j -h` also open help. Help and command discovery work outside
+a repository and never change your files or configuration. The catalog includes
+your own definitions, even ones without a signature; when no config exists, it
+uses the embedded reference config. General help and help for reserved commands
+are available even if your config is broken.
+
+To start working, run `j init` in a directory or `j clone URL`, then try
+`j status` and `j tree`. Compose commands right to left:
+`j 'describe "first change" . new'` creates a commit, then describes it.
+Preview an edit with `j 'tree . validate . squash'`.
+
 ---
 
 ## Why `j`?
@@ -70,10 +91,11 @@ You'll want the reference `config.j` (see next section) and, for `review`/`difft
 
 ## Configuration
 
-`j` reads `~/.config/j/config.j` on every run (or `$XDG_CONFIG_HOME/j/config.j`).
+Expressions read `~/.config/j/config.j` (or `$XDG_CONFIG_HOME/j/config.j`).
 An expression can only use a name this file declares or defines. The reference
-[`config.j`](config.j) ships with the binary — copy it and edit at least the
-identity:
+[`config.j`](config.j) ships with the binary. Commands that execute against a
+repository create an editable copy there when it is missing; help and discovery
+use the embedded copy without writing it. Edit at least the identity:
 
 ```
 user = { name = "Your Name", email = "you@example.com" }
@@ -424,11 +446,13 @@ Then `j release` works like any built-in.
 
 ## Reserved commands
 
-A handful of commands are built in (not expressions): they create or connect
-repositories, move refs, and walk the operation log. None take flags.
+A handful of commands are built in (not expressions): they provide help,
+create or connect repositories, move refs, and walk the operation log.
 
 | command | what it does |
 |---|---|
+| `j help [NAME]` | show a quick start or help for a reserved command or config name |
+| `j commands [QUERY]` | list the current vocabulary, optionally searching names, signatures, and comments |
 | `j init` | create a colocated `.jj`/`.git` repository here (adopting an existing `.git`) |
 | `j clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name, as `git clone` picks it) |
 | `j remote URL` | set `origin`'s URL |
@@ -437,7 +461,10 @@ repositories, move refs, and walk the operation log. None take flags.
 | `j undo` / `j redo` | walk the operation log |
 | `j ops` | print the operation log |
 
-Everything else is an expression in the language.
+`--help` and `-h` are aliases for `help` only as the first word. For example,
+`j --help describe` opens help for `describe`; use `j help new` to learn about
+`new`. There are no general command flags: `j 'new --help'` remains an expression
+with a language comment. Everything else is an expression in the language.
 
 ---
 
@@ -449,7 +476,7 @@ Everything else is an expression in the language.
 | **[docs/language.md](docs/language.md)** | The `j` language in detail: values, syntax, semantics, builtins, contracts, `show`, the `Repo` zipper, and many examples. Start here to learn the language. |
 | **[docs/base.md](docs/base.md)** | The complete base vocabulary: every builtin and every `config.j` type and function, grouped logically, each with a description and examples, plus an alphabetical index. |
 | **[docs/comparison.md](docs/comparison.md)** | A structured three-way comparison of git, jj, and `j`: concept mappings, side-by-side command tables, and a full workflow in each. |
-| **[SPEC.md](SPEC.md)** | The normative specification of the language, the CLI, and repository semantics. |
+| **[specs/main.md](specs/main.md)** | The normative specification of the language, the CLI, and repository semantics. |
 | **[config.j](config.j)** | The reference configuration: the entire base vocabulary, written in the language. |
 
 ---
@@ -457,11 +484,11 @@ Everything else is an expression in the language.
 ## Project layout
 
 ```
-config.j      the reference base vocabulary (read on every run)
+config.j      the reference base vocabulary
 src/          the j implementation (Rust, on jj-lib)
 tests/        unit, property, and CLI end-to-end tests
 docs/         language.md, base.md, comparison.md
-SPEC.md       the specification
+specs/        the language, CLI, repository, and tree specifications
 flake.nix     Nix package: one binary, j, with difftastic as a runtime dep
 ```
 

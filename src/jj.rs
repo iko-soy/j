@@ -1423,7 +1423,7 @@ impl JjBackend {
         let root = find_repo_root().ok_or_else(|| {
             (
                 2,
-                "no jj repository found in this directory or any parent".to_string(),
+                "no jj repository found in this directory or any parent; run `j init` here, `j clone URL`, or `j help`".to_string(),
             )
         })?;
         let settings = user_settings(cfg);
