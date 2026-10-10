@@ -16,6 +16,7 @@ pub mod config;
 pub mod domain;
 pub mod eval;
 pub mod lex;
+mod lookup;
 pub mod parse;
 pub mod render;
 pub mod repo;

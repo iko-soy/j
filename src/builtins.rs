@@ -99,6 +99,8 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("blob", 1, b_blob),
         builtin("text", 1, b_text),
         builtin("by", 2, b_by),
+        builtin("lookupCommit", 2, b_lookup_commit),
+        builtin("lookupContent", 2, b_lookup_content),
         builtin("meta", 1, b_meta),
         builtin("validate", 1, b_validate),
         builtin("diff", 2, b_diff),
@@ -453,14 +455,11 @@ fn b_split_on(_i: &mut Interp, args: &[Value]) -> BResult {
 // ----------------------------------------------------------------------
 
 fn b_replay(i: &mut Interp, args: &[Value]) -> BResult {
-    let onto = args[0].as_list()?;
+    args[0].as_list()?;
     let ch = &args[1];
     let from = ch.field("from")?;
     let to = ch.field("to")?;
-    let from = from.as_list()?;
-    let to = to.as_list()?;
-    let out = i.backend.replay(onto, from, to)?;
-    Ok(Value::list(out))
+    i.backend.replay_snapshot(&args[0], &from, &to)
 }
 
 fn b_unresolved(_i: &mut Interp, args: &[Value]) -> BResult {
@@ -561,6 +560,18 @@ fn b_by(_i: &mut Interp, args: &[Value]) -> BResult {
         Some(r) => Ok(r),
         None => Err(Crash::new("by: no such commit")),
     }
+}
+
+fn b_lookup_commit(_i: &mut Interp, args: &[Value]) -> BResult {
+    let id = match &args[0] {
+        Value::Id(id) => id.as_str(),
+        v => return Err(Crash::new(format!("by: expected an Id, got a {}", v.kind_name()))),
+    };
+    crate::repo::commit_by_id(&args[1], id)?.ok_or_else(|| Crash::new("by: no such commit"))
+}
+
+fn b_lookup_content(_i: &mut Interp, args: &[Value]) -> BResult {
+    crate::lookup::content_at(&args[0], &args[1])
 }
 
 fn b_meta(i: &mut Interp, args: &[Value]) -> BResult {

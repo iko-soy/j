@@ -237,6 +237,95 @@ fn lexical_scoping() {
 }
 
 #[test]
+fn nonrecursive_local_helpers_release_their_captures() {
+    let (mut i, cfg) = make_interp();
+    for (src, want) in [
+        (
+            "foldl (\\a n -> let step = \\x -> if sentinel == sentinel then x + n else 0 in step a) 0 (range 0 100)",
+            Value::int(4950),
+        ),
+        (
+            "(let step = \\_ -> sentinel; fail = crash (step 0) in fail) or true",
+            Value::Bool(true),
+        ),
+    ] {
+        // No global can hold this later-added value. A let cell that owns a
+        // closure capturing itself used to keep the entire environment alive,
+        // even after its scalar result (or caught crash) was discarded.
+        let tracked = Rc::new("tracked environment".to_string());
+        let weak = Rc::downgrade(&tracked);
+        let env = i.global_env().extend(vec![("sentinel".into(), Value::Text(tracked))]);
+        let expr = Rc::new(parse_expr(src, Rc::new(cfg.global_names.clone())).unwrap());
+        let got = i.eval(&expr, &env).unwrap();
+        assert!(value_eq(&got, &want).unwrap());
+        drop(got);
+        drop(env);
+        assert!(weak.upgrade().is_none(), "local helper retained its environment: {}", src);
+    }
+}
+
+#[test]
+fn escaping_helpers_keep_their_captures_until_they_are_dropped() {
+    let (mut i, cfg) = make_interp();
+    let tracked = Rc::new("captured".to_string());
+    let weak = Rc::downgrade(&tracked);
+    let env = i.global_env().extend(vec![("sentinel".into(), Value::Text(tracked))]);
+    // The source's forward reference is put after its dependency; the
+    // returned function must still capture that earlier helper.
+    let src = "let second = \\x -> first x; first = \\x -> sentinel in second";
+    let expr = Rc::new(parse_expr(src, Rc::new(cfg.global_names.clone())).unwrap());
+    let f = i.eval(&expr, &env).unwrap();
+    drop(env);
+    assert!(weak.upgrade().is_some());
+    let got = i.apply(f.clone(), Value::int(0)).unwrap();
+    assert_eq!(got.as_text().unwrap(), "captured");
+    drop(got);
+    drop(f);
+    assert!(weak.upgrade().is_none());
+
+    // A genuinely recursive group still needs its frame after the block's
+    // body returns; clearing its cell at that point would break this call.
+    let f = ok(
+        &mut i,
+        &cfg,
+        "let even = \\n -> if n == 0 then true else odd (n - 1); odd = \\n -> if n == 0 then false else even (n - 1) in even",
+    );
+    assert!(value_eq(&i.apply(f, Value::int(11)).unwrap(), &Value::Bool(false)).unwrap());
+}
+
+#[test]
+fn shared_literal_buffers_preserve_caught_crashes_and_evaluation_order() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "[1 (head [] or 2) 3]", Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]));
+    check!(i, cfg, "[1 (crash \"late\") 3] or [9]", Value::list(vec![Value::int(9)]));
+    let record = Value::record(&[("a", Value::int(1)), ("b", Value::int(2)), ("c", Value::int(3))]);
+    check!(i, cfg, "{ a = 1, b = head [] or 2, c = 3 }", record.clone());
+    check!(i, cfg, "({ a = 1, b = 0, c = 0 }) { b = head [] or 2, c = 3 }", record);
+    check!(i, cfg, "({ a = 1, b = crash \"late\" }) or 9", Value::int(9));
+    check!(i, cfg, "(({ a = 0, b = 0 }) { a = 1, b = crash \"late\" }) or 9", Value::int(9));
+    for src in [
+        "[(crash \"first\") (crash \"second\")]",
+        "{ a = crash \"first\", b = crash \"second\" }",
+        "({ a = 0, b = 0 }) { a = crash \"first\", b = crash \"second\" }",
+    ] {
+        assert!(crash(&mut i, &cfg, src).ends_with("first"));
+    }
+}
+
+#[test]
+fn a_large_flat_let_releases_its_frames_without_native_recursion() {
+    on_stack(2, || {
+        use j::ast::Expr;
+        let bindings = (0..30_000)
+            .map(|n| (format!("binding{}", n), Rc::new(Expr::Bool(true))))
+            .collect();
+        let expr = Rc::new(Expr::Let(bindings, Rc::new(Expr::Bool(true))));
+        let got = Interp::dummy().eval(&expr, &Env::empty()).unwrap();
+        assert!(value_eq(&got, &Value::Bool(true)).unwrap());
+    });
+}
+
+#[test]
 fn unbound_names_crash() {
     let (mut i, cfg) = make_interp();
     let m = crash(&mut i, &cfg, "nosuchname");

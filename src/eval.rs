@@ -94,11 +94,12 @@ pub(crate) enum Cont {
     Arg(Rc<Expr>, Env, Rc<Cont>),
     Fun(Value, Rc<Cont>),
     If(Rc<Expr>, Rc<Expr>, Env, Rc<Cont>),
-    /// the bindings of a `let` block, in evaluation order, whose values so
-    /// far are in the block's frame
+    /// A block's bindings in evaluation order. Only recursive blocks need a
+    /// cell; acyclic ones extend the environment after each value is ready.
     LetRest {
-        exprs: Vec<Rc<Expr>>,
-        cell: Rc<RefCell<Vec<Value>>>,
+        bindings: Rc<[(String, Rc<Expr>)]>,
+        at: usize,
+        cell: Option<Rc<RefCell<Vec<Value>>>>,
         body: Rc<Expr>,
         env: Env,
         cont: Rc<Cont>,
@@ -122,25 +123,26 @@ pub(crate) enum Cont {
     /// apply the returned function to this argument: the `labelled "name"`
     /// of a Labelled to the real arg
     ApplyTo(Value, Rc<Cont>),
-    UpdateBase(Vec<(String, Rc<Expr>)>, Env, Rc<Cont>),
+    // Literal/update inputs and accumulators are shared across continuation
+    // clones. The trampoline keeps an active clone for crash unwinding; deep
+    // copying these buffers at every element made flat literals quadratic.
+    UpdateBase(Rc<[(String, Rc<Expr>)]>, Env, Rc<Cont>),
     UpdateFields {
         base: Value,
-        names: Vec<String>,
-        exprs: Vec<Rc<Expr>>,
-        acc: Vec<(String, Value)>,
+        fields: Rc<[(String, Rc<Expr>)]>,
+        acc: Rc<RefCell<Vec<(String, Value)>>>,
         env: Env,
         cont: Rc<Cont>,
     },
     RecordFields {
-        names: Vec<String>,
-        exprs: Vec<Rc<Expr>>,
-        acc: Vec<(String, Value)>,
+        fields: Rc<[(String, Rc<Expr>)]>,
+        acc: Rc<RefCell<Vec<(String, Value)>>>,
         env: Env,
         cont: Rc<Cont>,
     },
     ListElems {
-        exprs: Vec<Rc<Expr>>,
-        acc: Vec<Value>,
+        exprs: Rc<[Rc<Expr>]>,
+        acc: Rc<RefCell<Vec<Value>>>,
         env: Env,
         cont: Rc<Cont>,
     },
@@ -738,20 +740,29 @@ impl Interp {
                 }
                 // the bindings are evaluated in dependency order, not source
                 // order, and a cycle among them is a crash (§4.1)
-                let order = match crate::config::let_order(bs) {
-                    Some(order) => order,
+                let plan = match crate::config::let_plan(bs) {
+                    Some(plan) => plan,
                     None => return Run::Crash(Crash::new("let: a cycle among the bindings")),
                 };
-                let names: Rc<[String]> = order.iter().map(|&i| bs[i].0.clone()).collect();
-                let exprs: Vec<Rc<Expr>> = order.iter().map(|&i| bs[i].1.clone()).collect();
-                // one recursive frame shared by every binding and the body, so
-                // the block is mutually recursive (§4.1)
-                let (env2, cell) = env.extend_rec(names);
+                let bindings: Rc<[(String, Rc<Expr>)]> =
+                    plan.order.iter().map(|&i| bs[i].clone()).collect();
+                // A closure in a recursive block sees later bindings through
+                // the shared cell (§4.1). Acyclic bindings need only earlier
+                // values: immutable frames avoid a cell -> closure -> frame
+                // cycle for ordinary local helper functions.
+                let (env2, cell) = if plan.recursive {
+                    let names = bindings.iter().map(|(n, _)| n.clone()).collect();
+                    let (env, cell) = env.extend_rec(names);
+                    (env, Some(cell))
+                } else {
+                    (env, None)
+                };
                 Run::Step(State::Eval(
-                    exprs[0].clone(),
+                    bindings[0].1.clone(),
                     env2.clone(),
                     Cont::LetRest {
-                        exprs,
+                        bindings,
+                        at: 0,
                         cell,
                         body: body.clone(),
                         env: env2,
@@ -816,22 +827,19 @@ impl Interp {
             Expr::Update(base, fields) => Run::Step(State::Eval(
                 base.clone(),
                 env.clone(),
-                Cont::UpdateBase(fields.clone(), env, Rc::new(k)),
+                Cont::UpdateBase(fields.clone().into(), env, Rc::new(k)),
             )),
             Expr::Record(fields) => {
                 if fields.is_empty() {
                     let m = crate::value::RecordMap::new();
                     return Run::Step(State::Ret(Value::Record(Rc::new(m)), k));
                 }
-                let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-                let exprs: Vec<Rc<Expr>> = fields.iter().map(|(_, v)| v.clone()).collect();
                 Run::Step(State::Eval(
-                    exprs[0].clone(),
+                    fields[0].1.clone(),
                     env.clone(),
                     Cont::RecordFields {
-                        names,
-                        exprs,
-                        acc: Vec::new(),
+                        fields: fields.clone().into(),
+                        acc: Rc::new(RefCell::new(Vec::with_capacity(fields.len()))),
                         env,
                         cont: Rc::new(k),
                     },
@@ -845,8 +853,8 @@ impl Interp {
                     elems[0].clone(),
                     env.clone(),
                     Cont::ListElems {
-                        exprs: elems.clone(),
-                        acc: Vec::new(),
+                        exprs: elems.clone().into(),
+                        acc: Rc::new(RefCell::new(Vec::with_capacity(elems.len()))),
                         env,
                         cont: Rc::new(k),
                     },
@@ -872,26 +880,31 @@ impl Interp {
                 ))),
             },
             Cont::LetRest {
-                exprs,
+                bindings,
+                at,
                 cell,
                 body,
                 env,
                 cont,
             } => {
-                let filled = {
-                    let mut values = cell.borrow_mut();
-                    values.push(v);
-                    values.len()
+                let env = match &cell {
+                    Some(cell) => {
+                        cell.borrow_mut().push(v);
+                        env
+                    }
+                    None => env.extend(vec![(bindings[at].0.clone(), v)]),
                 };
-                if filled == exprs.len() {
+                let at = at + 1;
+                if at == bindings.len() {
                     Run::Step(State::Eval(body, env, (*cont).clone()))
                 } else {
-                    let next = exprs[filled].clone();
+                    let next = bindings[at].1.clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),
                         Cont::LetRest {
-                            exprs,
+                            bindings,
+                            at,
                             cell,
                             body,
                             env,
@@ -973,19 +986,16 @@ impl Interp {
                         v.kind_name()
                     )));
                 }
-                let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-                let exprs: Vec<Rc<Expr>> = fields.iter().map(|(_, e)| e.clone()).collect();
-                if exprs.is_empty() {
+                if fields.is_empty() {
                     return Run::Step(State::Ret(v, (*k).clone()));
                 }
                 Run::Step(State::Eval(
-                    exprs[0].clone(),
+                    fields[0].1.clone(),
                     env.clone(),
                     Cont::UpdateFields {
                         base: v,
-                        names,
-                        exprs,
-                        acc: Vec::new(),
+                        acc: Rc::new(RefCell::new(Vec::with_capacity(fields.len()))),
+                        fields,
                         env,
                         cont: k,
                     },
@@ -993,20 +1003,23 @@ impl Interp {
             }
             Cont::UpdateFields {
                 base,
-                names,
-                exprs,
-                mut acc,
+                fields,
+                acc,
                 env,
                 cont,
             } => {
-                let idx = acc.len();
-                acc.push((names[idx].clone(), v));
-                if acc.len() == names.len() {
+                let filled = {
+                    let mut values = acc.borrow_mut();
+                    let idx = values.len();
+                    values.push((fields[idx].0.clone(), v));
+                    values.len()
+                };
+                if filled == fields.len() {
                     let mut m = match &base {
                         Value::Record(m) => m.as_ref().clone(),
                         _ => unreachable!(),
                     };
-                    for (n, val) in acc {
+                    for (n, val) in acc.take() {
                         if !m.contains_key(&n) {
                             return Run::Crash(Crash::new(format!(
                                 "cannot update: record has no field `{}`",
@@ -1017,14 +1030,13 @@ impl Interp {
                     }
                     Run::Step(State::Ret(Value::Record(Rc::new(m)), (*cont).clone()))
                 } else {
-                    let next = exprs[acc.len()].clone();
+                    let next = fields[filled].1.clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),
                         Cont::UpdateFields {
                             base,
-                            names,
-                            exprs,
+                            fields,
                             acc,
                             env,
                             cont,
@@ -1033,25 +1045,27 @@ impl Interp {
                 }
             }
             Cont::RecordFields {
-                names,
-                exprs,
-                mut acc,
+                fields,
+                acc,
                 env,
                 cont,
             } => {
-                let idx = acc.len();
-                acc.push((names[idx].clone(), v));
-                if acc.len() == names.len() {
-                    let m: crate::value::RecordMap = acc.into_iter().collect();
+                let filled = {
+                    let mut values = acc.borrow_mut();
+                    let idx = values.len();
+                    values.push((fields[idx].0.clone(), v));
+                    values.len()
+                };
+                if filled == fields.len() {
+                    let m: crate::value::RecordMap = acc.take().into_iter().collect();
                     Run::Step(State::Ret(Value::Record(Rc::new(m)), (*cont).clone()))
                 } else {
-                    let next = exprs[acc.len()].clone();
+                    let next = fields[filled].1.clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),
                         Cont::RecordFields {
-                            names,
-                            exprs,
+                            fields,
                             acc,
                             env,
                             cont,
@@ -1061,15 +1075,19 @@ impl Interp {
             }
             Cont::ListElems {
                 exprs,
-                mut acc,
+                acc,
                 env,
                 cont,
             } => {
-                acc.push(v);
-                if acc.len() == exprs.len() {
-                    Run::Step(State::Ret(Value::list(acc), (*cont).clone()))
+                let filled = {
+                    let mut values = acc.borrow_mut();
+                    values.push(v);
+                    values.len()
+                };
+                if filled == exprs.len() {
+                    Run::Step(State::Ret(Value::list(acc.take()), (*cont).clone()))
                 } else {
-                    let next = exprs[acc.len()].clone();
+                    let next = exprs[filled].clone();
                     Run::Step(State::Eval(
                         next,
                         env.clone(),

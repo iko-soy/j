@@ -59,6 +59,11 @@ impl ListVal {
     pub fn identity(&self) -> (*const Vec<Value>, usize) {
         (Rc::as_ptr(&self.items), self.start)
     }
+
+    /// Observe the shared storage without keeping a cached list alive.
+    pub(crate) fn weak_storage(&self) -> std::rc::Weak<Vec<Value>> {
+        Rc::downgrade(&self.items)
+    }
 }
 
 impl std::ops::Deref for ListVal {
@@ -757,6 +762,22 @@ impl Crash {
 #[derive(Clone)]
 pub struct Env {
     frame: Option<Rc<Frame>>,
+}
+
+/// A large acyclic let can have one frame per binding. Release unique
+/// frames iteratively, keeping the next parent alive while its child's
+/// values drop, so closures capturing earlier frames cannot recurse down
+/// that chain either (§4.1).
+impl Drop for Env {
+    fn drop(&mut self) {
+        let mut next = self.frame.take();
+        while let Some(frame) = next {
+            match Rc::try_unwrap(frame) {
+                Ok(mut frame) => next = frame.parent.frame.take(),
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 pub struct Frame {

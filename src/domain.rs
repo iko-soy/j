@@ -82,6 +82,12 @@ pub trait Backend {
         to: &[Value],
     ) -> Result<Vec<Value>, Crash>;
 
+    /// Keep snapshot identity available to backends that can reuse stored
+    /// trees. Backends without a tree cache retain their slice-based merge.
+    fn replay_snapshot(&self, onto: &Value, from: &Value, to: &Value) -> Result<Value, Crash> {
+        Ok(Value::list(self.replay(onto.as_list()?, from.as_list()?, to.as_list()?)?))
+    }
+
     /// shortest prefix of `id` unique among visible ids, min length 4
     fn unique_prefix(&self, id: &str) -> String {
         let others: Vec<String> = self.visible_ids();

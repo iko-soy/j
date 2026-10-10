@@ -148,6 +148,8 @@ touchedPaths : Change -> [Path]            -- paths whose content differs, one p
 blob       : Text -> Blob                  -- a resolved regular file
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
+lookupCommit : Id -> Repo -> Commit       -- indexed commit lookup without moving the focus
+lookupContent : Path -> Snapshot -> Blob  -- indexed file content; an empty blob if absent
 subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one
                                            -- pass: what `commits` (below) is
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
@@ -362,7 +364,7 @@ goto = \rs repo ->
      else crash ("expected one revision, got " ++ show (length is))
 
 commitAt : Id -> Repo -> Commit
-commitAt = \i repo -> (by i repo).root
+commitAt = lookupCommit
 
 prev : Edit                                                     -- the parent
 prev = goto parents
@@ -535,7 +537,7 @@ entryAt = \p s -> filter (\e -> e.path == p) s
 
 -- The content at path p, or an empty file if absent.
 contentAt : Path -> Snapshot -> Blob
-contentAt = \p s -> (head (entryAt p s)).content or blob ""
+contentAt = lookupContent
 
 -- The paths a change touches.
 touched : Change -> [Path]

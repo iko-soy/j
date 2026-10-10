@@ -40,7 +40,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
     "replay", "unresolved", "blob", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
-    "extract", "touchedPaths", "subtreeCommits",
+    "extract", "touchedPaths", "subtreeCommits", "lookupCommit", "lookupContent",
 ];
 
 pub fn is_reserved_builtin(name: &str) -> bool {
@@ -312,8 +312,15 @@ fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     out
 }
 
-/// Evaluation order of the bindings of a `let` block (§4.1), as indices into
-/// them, or `None` when references outside lambdas form a cycle.
+pub(crate) struct LetPlan {
+    pub order: Vec<usize>,
+    /// Whether a closure needs to see its own or a later binding. Otherwise
+    /// completed bindings can be held in immutable, acyclic environments.
+    pub recursive: bool,
+}
+
+/// Plan the bindings of a `let` block (§4.1), or return `None` when references
+/// outside lambdas form a cycle.
 ///
 /// The rule is `dependency_order`'s, with ready bindings taken in source
 /// order: a binding follows every binding it refers to outside a lambda; the
@@ -323,7 +330,7 @@ fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// the source order when every reference is to an earlier binding, or from
 /// inside a lambda to its own, as in nearly every block, which is so taken
 /// without the sorting: this runs each time a block is evaluated.
-pub(crate) fn let_order(bs: &[(String, Rc<Expr>)]) -> Option<Vec<usize>> {
+pub(crate) fn let_plan(bs: &[(String, Rc<Expr>)]) -> Option<LetPlan> {
     let refs: Vec<Vec<(usize, bool)>> = bs
         .iter()
         .map(|(_, e)| {
@@ -332,6 +339,18 @@ pub(crate) fn let_order(bs: &[(String, Rc<Expr>)]) -> Option<Vec<usize>> {
             out
         })
         .collect();
+    let order = let_order(bs, &refs)?;
+    let mut position = vec![0; bs.len()];
+    for (p, &i) in order.iter().enumerate() {
+        position[i] = p;
+    }
+    let recursive = refs.iter().enumerate().any(|(i, refs)| {
+        refs.iter().any(|&(j, _)| position[j] >= position[i])
+    });
+    Some(LetPlan { order, recursive })
+}
+
+fn let_order(bs: &[(String, Rc<Expr>)], refs: &[Vec<(usize, bool)>]) -> Option<Vec<usize>> {
     let in_order =
         |i: usize, r: &[(usize, bool)]| r.iter().all(|&(j, outside)| j < i || (j == i && !outside));
     if refs.iter().enumerate().all(|(i, r)| in_order(i, r)) {

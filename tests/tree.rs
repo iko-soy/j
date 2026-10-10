@@ -1247,6 +1247,37 @@ fn minted_commits_come_after_stored_ones() {
 }
 
 #[test]
+fn equal_times_follow_preorder_when_a_descendant_becomes_ready() {
+    // The descendant becomes ready after the second sibling, but precedes
+    // it in preorder. Ties use that order, not queue insertion or commit id,
+    // including when both nodes have a minted commit's infinite time.
+    for stored in [false, true] {
+        let root = commit(ROOT_ID, "", &[], vec![]);
+        let base = own_commit("kppppppp", "base", &[]);
+        let first = subtree(
+            own_commit("kzzzzzzz", "first", &[]),
+            vec![subtree(own_commit("kyyyyyyy", "descendant", &[]), vec![])],
+        );
+        let second = subtree(own_commit("kaaaaaaa", "second", &[]), vec![]);
+        let repo = repo_of(root, vec![subtree(base, vec![first, second])], None);
+        let mut metas = vec![meta(ROOT_ID, "R", 1), meta("kppppppp", "A", 2)];
+        if stored {
+            metas.extend(["kzzzzzzz", "kyyyyyyy", "kaaaaaaa"].map(|id| meta(id, "A", 3)));
+        }
+        assert_eq!(
+            row_shapes(repo, metas),
+            shapes(&[
+                ("○", "@kppp base"),
+                ("├─○", "@kzzz first"),
+                ("│ ○", "@kyyy descendant"),
+                ("○", "@kaaa second"),
+            ]),
+            "stored: {}", stored,
+        );
+    }
+}
+
+#[test]
 fn lane_inheritance_follows_row_order_not_sibling_order() {
     // `rebase` appends the moved commit to its new parent's children but it
     // keeps its time, so the last child in the list need not be the last
