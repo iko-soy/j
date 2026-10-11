@@ -95,6 +95,7 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("replay", 2, b_replay),
         builtin("unresolved", 1, b_unresolved),
         builtin("touchedPaths", 1, b_touched_paths),
+        builtin("unrecorded", 1, b_unrecorded),
         builtin("subtreeCommits", 1, b_subtree_commits),
         builtin("blob", 1, b_blob),
         builtin("blobHex", 2, b_blob_hex),
@@ -497,6 +498,28 @@ fn b_touched_paths(_i: &mut Interp, args: &[Value]) -> BResult {
     Ok(Value::list(out))
 }
 
+/// Working-directory edits captured at the start of this invocation, compared
+/// with the recorded focus. Inspecting another commit or a hypothetical edit
+/// must not change this answer. No disk scan or persistence happens here.
+fn b_unrecorded(i: &mut Interp, _args: &[Value]) -> BResult {
+    let old = i.old_repo.borrow().clone();
+    let given = i.given_repo.borrow().clone();
+    let (Some(old), Some(given)) = (old, given) else {
+        // In-memory evaluations and reserved push expressions have no
+        // working-directory snapshot.
+        return Ok(Value::list(Vec::new()));
+    };
+    if matches!((&old, &given), (Value::Record(a), Value::Record(b)) if Rc::ptr_eq(a, b)) {
+        return Ok(Value::list(Vec::new()));
+    }
+    let from = old.field("root")?.field("files")?;
+    let to = given.field("root")?.field("files")?;
+    b_touched_paths(i, &[Value::record(&[
+        ("from", from),
+        ("to", to),
+    ])])
+}
+
 /// every commit of a tree in preorder (§4.9): the value of the recursive
 /// `\t -> t.root :: (concat (map subtreeCommits t.children) or [])`, which
 /// the reference config's `commits` was. `::` and `concat` build new lists,
@@ -611,6 +634,11 @@ fn b_meta(i: &mut Interp, args: &[Value]) -> BResult {
 
 fn b_validate(i: &mut Interp, args: &[Value]) -> BResult {
     crate::repo::validate_repo(i, &args[0])?;
+    if let Some(loaded) = i.old_repo.borrow().as_ref() {
+        if !crate::repo::same_repo(loaded, &args[0])? {
+            i.backend.validate_authoring()?;
+        }
+    }
     Ok(args[0].clone())
 }
 

@@ -316,8 +316,8 @@ fn parse_error_is_exit_3() {
 
 #[test]
 fn deep_nesting_is_a_parse_error() {
-    // §1.4: however deep the input, the process exits 3 with one `j:` line
-    // rather than aborting on a stack overflow in the parser
+    // §1.4: however deep the input, the process exits 3 with a diagnostic
+    // and bounded source excerpt rather than overflowing or dumping the input.
     let r = setup();
     let n = 100_000;
     // a left-associative chain too: the parser builds it in a loop, but its
@@ -330,7 +330,8 @@ fn deep_nesting_is_a_parse_error() {
     ] {
         let out = r.j_stdin(&src, &[]);
         assert_eq!(out.code, 3, "{}", out.stderr);
-        assert!(out.stderr.starts_with("j: ") && out.stderr.lines().count() == 1, "{}", out.stderr);
+        assert!(out.stderr.starts_with("j: ") && out.stderr.lines().count() <= 2, "{}", out.stderr);
+        assert!(out.stderr.len() < 1024, "diagnostic is not bounded: {} bytes", out.stderr.len());
     }
 }
 
@@ -720,8 +721,8 @@ fn text_result_prints_raw() {
 
 #[test]
 fn review_says_no_changes_only_when_nothing_changed() {
-    // `review` caught every crash of `diffs` with `or`, so without difft on
-    // PATH it printed "no changes" over a change it could not render
+    // A missing renderer must still display changes; an installed renderer's
+    // failures must remain visible instead of claiming "no changes".
     let r = setup();
     // a PATH holding nothing but what the test puts there (the config
     // directory is removed with the repository)
@@ -746,8 +747,9 @@ fn review_says_no_changes_only_when_nothing_changed() {
     assert_eq!(review(&bin).ok().stdout, "no changes\n");
     r.write("f", "hello\n");
     let out = review(&bin);
-    assert_eq!(out.code, 1, "stdout: {}", out.stdout);
-    assert!(out.stderr.contains("cannot execute `difft`"), "{}", out.stderr);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+hello\n");
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
     use std::os::unix::fs::PermissionsExt;
     // a difft that runs and fails renders what it printed, nothing here,
     // and its complaint reaches the terminal instead of being dropped (§7.10)

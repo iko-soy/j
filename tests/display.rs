@@ -95,6 +95,16 @@ fn make_interp(be: MemBackend) -> (Interp, config::Config) {
 }
 
 fn eval_and_display(interp: &mut Interp, cfg: &config::Config, src: &str, repo: Value) -> String {
+    eval_and_display_width(interp, cfg, src, repo, None)
+}
+
+fn eval_and_display_width(
+    interp: &mut Interp,
+    cfg: &config::Config,
+    src: &str,
+    repo: Value,
+    terminal: Option<usize>,
+) -> String {
     let outer = Rc::new(cfg.global_names.clone());
     let e = parse_expr(src, outer).unwrap();
     let e = config::resolve_ids(&e, interp).unwrap();
@@ -106,7 +116,7 @@ fn eval_and_display(interp: &mut Interp, cfg: &config::Config, src: &str, repo: 
     } else {
         v
     };
-    j::render::display(interp, &v, false).unwrap()
+    j::render::display_with_width(interp, &v, false, terminal).unwrap()
 }
 
 #[test]
@@ -1114,4 +1124,127 @@ fn an_unreadable_blob_crashes_every_time() {
     let (mut i, cfg) = make_interp(be);
     let src = "(\\repo -> show (contentAt [\"f.txt\"] (files repo)) or \"caught\")";
     assert_eq!(try_eval_and_display(&mut i, &cfg, src, repo), Ok("caught\n".to_string()));
+}
+
+
+#[test]
+fn log_shows_label_names_and_copyable_unique_ids() {
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "log", repo);
+    for expected in ["main", "feature", "@kpqx", "@wqzt", "@zzzz"] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+    assert!(!out.contains("items"), "{out}");
+    assert!(!out.contains("wqztbbbb"), "{out}");
+
+    // The backend may not yet know IDs created in an expression. The table
+    // itself must still distinguish shared prefixes (and duplicate rows).
+    let table = Value::list(vec![
+        Value::record(&[("id", Value::Id(Rc::new("abcd1111".into())))]),
+        Value::record(&[("id", Value::Id(Rc::new("abcd2222".into())))]),
+        Value::record(&[("id", Value::Id(Rc::new("abcd1111".into())))]),
+    ]);
+    let out = j::render::display(&mut i, &table, false).unwrap();
+    assert!(out.contains("@abcd1") && out.contains("@abcd2"), "{out}");
+}
+
+#[test]
+fn status_empty_states_are_readable_without_changing_values() {
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let expression = "status . describe \"\" . new";
+    let out = eval_and_display(&mut i, &cfg, expression, repo.clone());
+    for expected in ["No changes", "No conflicts", "No labels", "No description", "All edits recorded"] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+    let literal = eval_and_display(&mut i, &cfg, &format!("show . ({expression})"), repo.clone());
+    assert!(!literal.contains("No changes"), "{literal}");
+    let generic = eval_and_display(&mut i, &cfg, "{ changed = [], message = \"\" }", repo);
+    assert!(generic.contains("0 items") && !generic.contains("No description"), "{generic}");
+}
+
+#[test]
+fn tables_fit_terminal_width_but_pipes_retain_full_messages() {
+    let (repo, be) = sample_repo();
+    let (mut i, cfg) = make_interp(be);
+    let message = "Make authentication easier for keyboard users across all screens";
+    let expression = format!("log . describe \"{message}\"");
+    let pipe = eval_and_display(&mut i, &cfg, &expression, repo.clone());
+    assert!(pipe.contains(message), "{pipe}");
+    let terminal = eval_and_display_width(&mut i, &cfg, &expression, repo.clone(), Some(48));
+    assert!(terminal.lines().all(|line| j::render::width(line) <= 48), "{terminal}");
+    assert!(terminal.contains('…') && terminal.contains("@wqzt"), "{terminal}");
+    assert!(terminal.contains("feature"), "{terminal}");
+
+    // The vertical fallback keeps all text when headers and IDs cannot fit
+    // side by side; reconstruct wrapped rows to check that no text was lost.
+    let narrow = eval_and_display_width(&mut i, &cfg, &expression, repo, Some(12));
+    assert!(narrow.lines().all(|line| j::render::width(line) <= 12), "{narrow}");
+    assert!(narrow.lines().collect::<String>().contains(message), "{narrow}");
+    assert!(narrow.contains("id: @wqzt"), "{narrow}");
+}
+
+#[test]
+fn narrow_tables_preserve_unicode_and_close_ansi_styles() {
+    let (_, be) = sample_repo();
+    let (mut i, _) = make_interp(be);
+    let value = Value::list(vec![Value::record(&[
+        ("description", Value::text("键盘支持e\u{301}完成")),
+        ("identifier", Value::Id(Rc::new("wqztbbbb".into()))),
+    ])]);
+    let plain = j::render::display_with_width(&mut i, &value, false, Some(12)).unwrap();
+    let styled = j::render::display_with_width(&mut i, &value, true, Some(12)).unwrap();
+    assert!(plain.lines().all(|line| j::render::width(line) <= 12), "{plain}");
+    assert!(plain.lines().collect::<String>().contains("键盘支持e\u{301}完成"), "{plain}");
+    let mut escape = false;
+    let unstyled: String = styled.chars().filter(|&c| {
+        if c == '\x1b' { escape = true; return false; }
+        if escape { if c == 'm' { escape = false; } return false; }
+        true
+    }).collect();
+    assert_eq!(unstyled, plain);
+}
+
+
+#[test]
+fn nested_tables_keep_parent_context_without_exhausting_narrow_width() {
+    let (_, be) = sample_repo();
+    let (mut i, _) = make_interp(be);
+    let heading = "a_long_parent_field_for_the_rows";
+    let message = "Keyboard navigation is available";
+    let rows = Value::list(vec![Value::record(&[
+        ("name", Value::text("preferences")),
+        ("message", Value::text(message)),
+    ])]);
+    let value = Value::record(&[(heading, rows)]);
+    let output = j::render::display_with_width(&mut i, &value, false, Some(12)).unwrap();
+    let mut lines = output.lines();
+    assert_eq!(lines.next().unwrap().trim_end(), heading, "{output}");
+    let contents: Vec<&str> = lines.collect();
+    assert!(contents.iter().all(|line| line.starts_with("  ")), "{output}");
+    assert!(contents.iter().all(|line| j::render::width(line) <= 12), "{output}");
+    let reconstructed: String = contents.iter().map(|line| &line[2..]).collect();
+    assert!(reconstructed.contains(&format!("message: {message}")), "{output}");
+    assert!(reconstructed.contains("name: preferences"), "{output}");
+
+    let pipe = j::render::display_with_width(&mut i, &value, false, None).unwrap();
+    assert!(pipe.contains(message), "{pipe}");
+    assert!(pipe.lines().skip(1).all(|line| line.starts_with(&" ".repeat(heading.len() + 2))), "{pipe}");
+}
+
+#[test]
+fn long_label_cells_truncate_on_terminals_and_remain_complete_in_pipes() {
+    let (_, be) = sample_repo();
+    let (mut i, _) = make_interp(be);
+    let label = "release/very-long-descriptive-bookmark-for-keyboard-navigation";
+    let value = Value::list(vec![Value::record(&[
+        ("id", Value::Id(Rc::new("abcd1111".into()))),
+        ("labels", Value::list(vec![Value::text(label)])),
+    ])]);
+    let tty = j::render::display_with_width(&mut i, &value, false, Some(24)).unwrap();
+    assert!(tty.lines().all(|line| j::render::width(line) <= 24), "{tty}");
+    assert!(tty.contains("@abcd") && tty.contains('…'), "{tty}");
+    let pipe = j::render::display_with_width(&mut i, &value, false, None).unwrap();
+    assert!(pipe.contains(label) && !pipe.contains('…'), "{pipe}");
 }

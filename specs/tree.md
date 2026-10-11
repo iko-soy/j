@@ -137,10 +137,16 @@ always to the right of its source.
 If rule 5 or a reservation finds no empty lane in `0 < ℓ < lanes`, the
 subtree rooted at `n` is **flattened**: `n` and every descendant of it still
 get their rows, in row order, with their id, message, labels and margin, but
-they take no lane. Their rails area shows only the rails that pass through
-and `»` in the last column. Nothing is hidden — the focus in particular is
-always shown — only the shape beyond `lanes` is lost. Widen `lanes` (or
-enable `elide`) to see it.
+they take no lane. Their rails area preserves every rail that passes through.
+If any rendered node is flattened, a separate four-column status area
+is reserved between the rails and the id separator on every row. Flattened
+rows show `»`; on a commit row this is followed by a space and its normal
+node glyph (§Glyphs), padded to four display columns. Non-flattened rows
+leave the area blank. Neither the overflow marker nor a node glyph replaces
+a live rail. Nothing is hidden —
+the focus, conflicts, and empty commits in particular are always identifiable
+— only the shape beyond `lanes` is lost. Widen `lanes` (or enable `elide`) to
+see it.
 
 #### Step 4 — drawing a row
 
@@ -149,26 +155,28 @@ Columns, left to right, at fixed offsets:
 1. **Gutter**, 2 characters: `▶ ` on the focus row, blank otherwise.
 2. **Rails**, `2 · lanes` characters: lane `i` owns characters `2i` and
    `2i+1`.
-3. One space.
-4. **Id**: `@` followed by the shortest prefix unique among the commits of the
+3. **Overflow status**, 4 display columns when any rendered node is flattened;
+   absent otherwise (§Overflow).
+4. One space.
+5. **Id**: `@` followed by the shortest prefix unique among the commits of the
    display tree, minimum 4 — so the rendered id is itself a valid id literal
    (§3.1). Blank on a run row.
-5. **Size bar** (`detail ≥ 1`, focus and its parent and children only; all
+6. **Size bar** (`detail ≥ 1`, focus and its parent and children only; all
    commits at `detail = 2`): `▁ ▂ ▃ ▅ ▇`, as before. A row without a bar
    keeps the column blank; it is left out only when no row has a bar.
-6. **Message**: first line; nothing if empty; followed by `⋯ n` on a
+7. **Message**: first line; nothing if empty; followed by `⋯ n` on a
    collapsed node.
-7. **Labels**: left-aligned column, present only if any rendered commit has
+8. **Labels**: left-aligned column, present only if any rendered commit has
    a label; names separated by two spaces.
-8. **Margin** (`margin = true`): age and author initials, as before, each
+9. **Margin** (`margin = true`): age and author initials, as before, each
    right-aligned in its own column (a `9m` ends under a `13m`), so the margin
    ends at one column on every row.
-9. **Data columns** (off unless enabled): `date` shows the commit's absolute
+10. **Data columns** (off unless enabled): `date` shows the commit's absolute
    date `YYYY-MM-DD`; `files` shows the number of files changed as `n files`;
    `author` shows the full author name. They appear in that order, grey,
    immediately before the margin in the same right-aligned block.
 
-Columns 4–8 start at the same offset on every row. Labels start two columns
+Columns 5–9 start at the same offset on every row. Labels start two columns
 past the widest message, and the data columns and the margin start two
 columns past the widest label (past the widest message when there is no
 label column). Each data column, the age and the initials are as wide as
@@ -187,7 +195,6 @@ and the margin keep their columns; otherwise nothing is cut.
 | `i` lies between the two ends of a horizontal segment on this row and holds a rail | `┼` |
 | `i` lies between the two ends of a horizontal segment on this row | `─` |
 | `i` holds a rail passing through this row | `│` |
-| flattened rows only: `i = lanes − 1` | `»` |
 | otherwise | space |
 
 Character `2i+1` is `─` if it lies inside a horizontal segment (from a fork
@@ -199,12 +206,16 @@ rail. The count is never cut: what does not fit the rails area runs on,
 unbroken, through the space after it into the id column, which is widened if
 it cannot hold the rest.
 
-**Detail line** (`detail = 2`, focus only): one extra row directly under the
-focus. Its rails show `│` in every lane that holds a rail below the focus row
-(including the focus's own lane if it has children); the text starts two
-columns into the id column, under the focus's id, and lists the changed paths
-with a mark each:
-`+` added, `~` modified, `−` deleted, `✖` unresolved.
+**Detail lines** (`detail = 2`, focus only): changed paths appear directly
+under the focus, with a mark each: `+` added, `~` modified, `−` deleted,
+`✖` unresolved. Every detail row shows `│` in every lane that holds a rail
+below the focus row (including the focus's own lane if it has children), and
+leaves any overflow status column blank. The text starts two columns into the
+id column, under the focus's id, at the same offset on every continuation row.
+When stdout is a terminal, paths wrap onto continuation rows within the width
+available after this prefix. A path longer than that width may split across
+rows; wrapping does not discard any path content. Redirected output keeps
+the changed paths on a single detail row.
 
 #### Glyphs
 
@@ -226,7 +237,8 @@ its parent's in that history — not of the stored commit with the same id, so
 a dry run (§1.2) draws them as the edit would leave them.
 An `icons = true` glyph is two columns wide, so it fills both characters of
 its lane: character `2ℓ+1` of its row is not drawn.
-Rails use `│ ├ ╰ ─ ┼ ╮ ┬ ╎ »`.
+Rails use `│ ├ ╰ ─ ┼ ╮ ┬ ╎`; `»` belongs to the separate overflow status
+column.
 
 #### Elision (`elide = true`)
 
@@ -285,8 +297,10 @@ The legend covers the node glyphs present (§Glyphs), the focus gutter `▶`,
 run `╎ n` and collapsed `⋯ n` rows when shown, and the detail-line marks
 (`+` added, `~` modified, `−` deleted, `✖` unresolved) when a detail line is
 present. A collapsed node shows `⋯ n` only when `n > 0`, so the `⋯` legend
-entry appears only then. The rails characters are not itemised; they are
-structural (§Step 4).
+entry appears only then. When any rendered node is flattened, it also includes
+`» branch exceeds lane limit; increase lanes`. Node glyphs in the overflow
+status column contribute their normal legend entries. The rails characters
+are not itemised; they are structural (§Step 4).
 
 The legend text is faint (dim). Placement: when stdout is a terminal and the
 tree's widest line plus the legend fits the terminal width, the legend is set

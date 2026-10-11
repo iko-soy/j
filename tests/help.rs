@@ -35,6 +35,19 @@ impl HelpCli {
         std::fs::create_dir_all(self.config.path().join("j")).unwrap();
         std::fs::write(self.config.path().join("j/config.j"), source).unwrap();
     }
+
+    fn reference_config(&self) {
+        self.write_config(&include_str!("../config.j")
+            .replace("Your Name", "Help Test")
+            .replace("you@example.com", "help@example.com"));
+    }
+
+    fn operation_heads(&self) -> Vec<std::ffi::OsString> {
+        let mut heads: Vec<_> = std::fs::read_dir(self.dir.path().join(".jj/repo/op_heads/heads"))
+            .unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        heads.sort();
+        heads
+    }
 }
 
 fn stdout(output: Output) -> String {
@@ -78,7 +91,7 @@ fn overview_and_reserved_topics_survive_broken_config() {
     cli.write_config("broken =\n");
     stdout(cli.run(&["help"]));
     for name in [
-        "init", "clone", "remote", "fetch", "push", "undo", "redo", "ops", "help", "commands",
+        "init", "clone", "remote", "fetch", "push", "undo", "redo", "ops", "help", "commands", "setup",
     ] {
         assert!(stdout(cli.run(&["help", name])).contains(name));
     }
@@ -162,7 +175,7 @@ fn piped_help_and_expression_comments_preserve_input_rules() {
         stdout(cli.run(&["help", "push"]))
     );
 
-    cli.write_config(include_str!("../config.j"));
+    cli.reference_config();
     stdout(cli.run(&["init"]));
     assert_eq!(stdout(cli.run(&["\"--help\""])), "--help\n");
     assert_eq!(stdout(cli.run(&["(help) or 42"])), "42\n");
@@ -174,9 +187,9 @@ fn piped_help_and_expression_comments_preserve_input_rules() {
 fn help_does_not_take_repository_lock_or_snapshot_changes() {
     use std::os::fd::AsRawFd;
     let cli = HelpCli::new();
-    cli.write_config(include_str!("../config.j"));
+    cli.reference_config();
     stdout(cli.run(&["init"]));
-    let before = stdout(cli.run(&["ops"]));
+    let before = cli.operation_heads();
     std::fs::write(cli.dir.path().join("work.txt"), "unsaved work\n").unwrap();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -192,11 +205,47 @@ fn help_does_not_take_repository_lock_or_snapshot_changes() {
     stdout(cli.run(&["help", "new"]));
     stdout(cli.run(&["commands", "Edit"]));
     drop(lock);
-    assert_eq!(stdout(cli.run(&["ops"])), before);
+    assert_eq!(cli.operation_heads(), before);
     assert_eq!(
         std::fs::read_to_string(cli.dir.path().join("work.txt")).unwrap(),
         "unsaved work\n"
     );
+}
+
+#[test]
+fn separate_help_flags_never_execute_edits_or_take_the_repository_lock() {
+    use std::os::fd::AsRawFd;
+    let cli = HelpCli::new();
+    // Help also works without a repository, creating no config.
+    assert_eq!(stdout(cli.run(&["abandon", "--help"])), stdout(cli.run(&["help", "abandon"])));
+    assert!(stdout(cli.run(&["clone", "--help"])).contains("Clone"));
+    assert_eq!(std::fs::read_dir(cli.config.path()).unwrap().count(), 0);
+
+    cli.reference_config();
+    stdout(cli.run(&["init"]));
+    std::fs::write(cli.dir.path().join("draft.txt"), "valuable work\n").unwrap();
+    stdout(cli.run(&["describe \"valuable work\""]));
+    let before = cli.operation_heads();
+    std::fs::write(cli.dir.path().join("draft.txt"), "unrecorded edits\n").unwrap();
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+        .open(cli.dir.path().join(".jj/j.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    for command in ["abandon", "new", "squash", "describe"] {
+        for flag in ["--help", "-h"] {
+            assert_eq!(stdout(cli.run(&[command, flag])), stdout(cli.run(&["help", command])));
+        }
+    }
+    assert_eq!(cli.operation_heads(), before);
+    assert_eq!(std::fs::read_to_string(cli.dir.path().join("draft.txt")).unwrap(), "unrecorded edits\n");
+}
+
+#[test]
+fn config_help_is_available_when_configuration_is_broken() {
+    let cli = HelpCli::new();
+    cli.write_config("broken =\n");
+    let help = stdout(cli.run(&["help", "config"]));
+    assert!(help.contains("user ="));
+    assert!(help.contains(cli.config.path().join("j/config.j").to_str().unwrap()));
 }
 
 #[test]
@@ -207,4 +256,71 @@ fn help_read_failures_do_not_fall_back_to_reference_commands() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read config"));
     stdout(cli.run(&["help", "clone"]));
+}
+
+#[test]
+fn default_discovery_is_short_and_full_catalog_remains_available() {
+    let cli = HelpCli::new();
+    let common = stdout(cli.run(&["commands"]));
+    assert!(common.lines().count() <= 40, "{}", common);
+    for command in ["j setup", "j save", "j 'preview squash'", "j commands all"] {
+        assert!(common.contains(command), "{}", common);
+    }
+    assert!(!common.contains("(++) :"));
+    assert!(!common.contains("Subtree ="));
+    let all = stdout(cli.run(&["commands", "all"]));
+    assert!(all.contains("(++) :"));
+    assert!(all.contains("Subtree ="));
+    assert!(all.contains("save : Edit"));
+    assert_eq!(std::fs::read_dir(cli.config.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn discovery_understands_beginner_tasks_without_inventing_commands() {
+    let cli = HelpCli::new();
+    for (query, expected) in [("save", "save : Edit"), ("record", "save : Edit"),
+        ("commit", "describe : Text -> Edit"), ("branch", "new : Edit"),
+        ("checkout", "goto : Revset -> Edit")] {
+        let output = stdout(cli.run(&["commands", query]));
+        let first = output.lines().find(|line| line.starts_with("  ")).unwrap();
+        assert!(first.contains(expected), "{}", output);
+    }
+    let stash = stdout(cli.run(&["commands", "stash"]));
+    assert!(stash.contains("no direct stash command"));
+    assert!(stash.contains("j save") && stash.contains("j new"));
+    cli.write_config("user = {}\ntree = 0\nimmutable = []\nlabelled = 0\n-- Custom shelving command.\nstash = 42\n");
+    let stash = stdout(cli.run(&["commands", "stash"]));
+    assert!(stash.contains("stash (definition; no signature)"));
+    assert!(!stash.contains("no direct stash"));
+    let record = stdout(cli.run(&["commands", "record"]));
+    assert!(!record.contains("save :") && !record.contains("id :"));
+}
+
+#[test]
+fn command_help_leads_with_plain_explanations_and_setup_is_actionable() {
+    let cli = HelpCli::new();
+    let describe = stdout(cli.run(&["help", "describe"]));
+    assert!(describe.starts_with("Set the message"), "{}", describe);
+    assert!(describe.find("Example:").unwrap() < describe.find("Text -> Edit").unwrap());
+    let config = stdout(cli.run(&["help", "config"]));
+    assert!(config.contains("j setup 'Ada Lovelace' ada@example.org"));
+    assert!(config.contains("not a complete config"));
+    let clone = stdout(cli.run(&["help", "clone"]));
+    assert!(clone.contains("cd project"));
+    assert!(clone.contains("does not change your shell's directory"));
+}
+
+#[test]
+fn everyday_catalog_respects_custom_docs_and_missing_example_dependencies() {
+    let cli = HelpCli::new();
+    cli.write_config("user = {}\ntree = 0\nimmutable = []\nlabelled = 0\n-- Display my custom report.\npreview : Text -> Text\npreview = \\report -> report\n-- Open our custom dashboard.\nnew : Text -> Text\nnew = \\dashboard -> dashboard\n");
+    let common = stdout(cli.run(&["commands"]));
+    assert!(common.contains("Display my custom report."));
+    assert!(common.contains("Open our custom dashboard."));
+    assert!(common.contains("j help preview"));
+    assert!(!common.contains("preview squash"));
+    assert!(!common.contains("Start the next commit"));
+    assert!(!common.contains("j save"));
+    let all = stdout(cli.run(&["commands", "all"]));
+    assert!(!all.contains("squash :"));
 }

@@ -1,8 +1,10 @@
 //! j — a functional-programming-centered CLI for jj repositories (§1).
 
 mod help;
+mod setup;
 
 use j::config::{self, Config};
+use j::diagnostics;
 use j::jj::JjBackend;
 use j::parse::parse_expr;
 use j::value::{Crash, Value};
@@ -13,6 +15,7 @@ use std::rc::Rc;
 
 const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)
 
+Configure identity: j setup
 Start a repository:  j init   or   j clone URL
 Inspect your work:   j status   or   j tree
 Discover commands:  j help   or   j commands
@@ -43,13 +46,14 @@ fn print_output(s: &str) -> ExitCode {
     }
 }
 
-fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
+fn crash_err(c: &Crash, expr_text: &str, cfg: &Config) -> ExitCode {
     j::terminal::report_error(format_args!("j: crash: {}", c.msg));
-    match (&c.def, expr_text) {
-        (Some(d), Some(e)) => j::report!("   in {}, from {}", d, e),
-        (None, Some(e)) => j::report!("   from {}", e),
-        (Some(d), None) => j::report!("   in {}", d),
-        (None, None) => {}
+    match &c.def {
+        Some(d) => j::report!("   in {}, from {}", d, expr_text),
+        None => j::report!("   from {}", expr_text),
+    }
+    if let Some(hint) = diagnostics::expression_hint(expr_text, cfg, c) {
+        j::report!("   {}", hint);
     }
     ExitCode::from(1)
 }
@@ -91,7 +95,15 @@ fn load_config_file() -> Result<(Config, String), u8> {
     };
     match config::load_config(&src) {
         Ok(c) => Ok((c, src)),
-        Err(e) => Err(fail(3, e.message())),
+        Err(e) => {
+            let message = match e {
+                config::ConfigError::Parse(p) => {
+                    diagnostics::format_source_error(&path, &src, p.line, &p.msg)
+                }
+                config::ConfigError::Validation(message) => format!("{}: {}", path, message),
+            };
+            Err(fail(3, format!("{}\n   Edit this file to repair your config; see `j help config`.", message)))
+        }
     }
 }
 
@@ -114,7 +126,7 @@ fn write_default_config(path: &str) -> std::io::Result<()> {
 }
 
 const RESERVED: &[&str] = &[
-    "init", "clone", "remote", "fetch", "push", "undo", "redo", "ops", "help", "commands",
+    "init", "clone", "remote", "fetch", "push", "undo", "redo", "ops", "help", "commands", "setup",
 ];
 
 /// Discovery reads the user's vocabulary without creating or evaluating it.
@@ -131,11 +143,13 @@ fn read_help_config() -> Result<(String, String), u8> {
     }
 }
 
-fn run_help(text: &str) -> ExitCode {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    match words.as_slice() {
+fn run_help(words: &[&str]) -> ExitCode {
+    match words {
         [_] => print_output(help::OVERVIEW),
         [_, name] => {
+            if *name == "config" {
+                return print_output(&format!("{}\nConfig: {}\n", help::CONFIG_HELP, config_path()));
+            }
             if let Some(output) = help::reserved_help(name) {
                 return print_output(&output);
             }
@@ -179,6 +193,22 @@ fn command_result(result: Result<(), (u8, String)>, message: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => err(e.0, e.1),
+    }
+}
+
+fn setup_identity(cfg: &Config) -> Result<String, u8> {
+    j::jj::configured_identity(cfg).map_err(|(_, message)| {
+        fail(3, format!("{}: {}\n   Edit `user` in this file; see `j help config`.", config_path(), message.trim_start_matches("config.j: ")))
+    })
+}
+
+fn operation_result(result: Result<String, (u8, String)>) -> ExitCode {
+    match result {
+        Ok(message) => {
+            j::terminal::success(&message);
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => err(code, message),
     }
 }
 
@@ -246,6 +276,16 @@ fn run() -> ExitCode {
     if stdin_has_data && !args.is_empty() {
         return err(2, "expression given both as arguments and on stdin");
     }
+    // An argv help flag is a request for help, never an expression comment.
+    // Comments embedded in a single expression argument or stdin remain part
+    // of the language, including `j 'new --help'`.
+    if args.iter().skip(1).any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+        let topic = args.first().and_then(|arg| arg.split_whitespace().next());
+        return match topic {
+            Some("--help" | "-h" | "help") | None => run_help(&["help"]),
+            Some(name) => run_help(&["help", name]),
+        };
+    }
     let text = if stdin_has_data {
         match String::from_utf8(stdin_content) {
             Ok(text) => text,
@@ -265,29 +305,40 @@ fn run() -> ExitCode {
         return ExitCode::from(2);
     }
     let first = trimmed.split_whitespace().next().unwrap_or("");
+    // Preserve shell argument boundaries for literal reserved-command
+    // arguments. Single quoted commands and stdin still use text words.
+    let words: Vec<&str> = if args.first().is_some_and(|arg| arg == first) {
+        args.iter().map(String::as_str).collect()
+    } else {
+        trimmed.split_whitespace().collect()
+    };
     if matches!(first, "--help" | "-h") {
-        return run_help(trimmed);
+        return run_help(&words);
     }
     if RESERVED.contains(&first) {
-        return run_reserved(first, trimmed);
+        return run_reserved(first, trimmed, &words);
     }
 
     run_expression(trimmed, true)
 }
 
-fn run_reserved(cmd: &str, text: &str) -> ExitCode {
-    let words: Vec<&str> = text.split_whitespace().collect();
+fn run_reserved(cmd: &str, text: &str, words: &[&str]) -> ExitCode {
     match cmd {
-        "help" => run_help(text),
+        "help" => run_help(words),
         "commands" => run_commands(text),
+        "setup" => match setup::run(std::path::Path::new(&config_path()), DEFAULT_CONFIG, &words[1..]) {
+            Ok(output) => print_output(&output),
+            Err((code, message)) => err(code, message),
+        },
         "init" => {
             if words.len() != 1 {
                 return command_usage("init", "init");
             }
             let (cfg, _) = or_exit(load_config_file());
+            let identity = or_exit(setup_identity(&cfg));
             command_result(
                 j::terminal::with_progress("Creating repository", || j::jj::cmd_init(&cfg)),
-                "Repository created",
+                &format!("Repository created; identity {}", identity),
             )
         }
         "clone" => {
@@ -309,9 +360,10 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
                 }
             };
             let (cfg, _) = or_exit(load_config_file());
+            let identity = or_exit(setup_identity(&cfg));
             command_result(
                 j::terminal::with_progress("Cloning repository", || j::jj::cmd_clone(&cfg, words[1], &dir)),
-                "Repository cloned",
+                &format!("Repository cloned into {}; identity {}\n   Next: cd {} && j status", dir, identity, shell_word(&dir)),
             )
         }
         "remote" => {
@@ -342,19 +394,31 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             let (mut cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
             // evaluate EXPR against the recorded repository (no snapshot)
-            command_result(
-                j::terminal::with_progress("Pushing changes", || backend.cmd_push(&mut cfg, rest)),
-                "Push complete",
-            )
+            match j::terminal::with_progress("Pushing changes", || backend.cmd_push(&mut cfg, rest)) {
+                Err((3, message)) if message.starts_with("config.j:") => {
+                    err(3, format!("{}: {}\n   See `j help config` for configuration help.", config_path(), message.trim_start_matches("config.j: ")))
+                }
+                Ok(outcome) => {
+                    if outcome.published + outcome.deleted + outcome.unchanged == 0 {
+                        j::report!("j: No bookmarks selected; nothing published.\n   First publication: j 'push (label \"feature\" here)'\n   Inspect available commits with `j tree` and check your selector.");
+                    } else {
+                        j::terminal::success(&format!(
+                            "Push complete: {} published, {} deleted, {} unchanged bookmark(s)",
+                            outcome.published, outcome.deleted, outcome.unchanged,
+                        ));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err((code, message)) => err(code, message),
+            }
         }
         "undo" => {
             if words.len() != 1 {
                 return command_usage("undo", "undo");
             }
             let backend = or_exit(open_repo_noconfig());
-            command_result(
+            operation_result(
                 j::terminal::with_progress("Undoing operation", || backend.cmd_undo(false)),
-                "Undo complete",
             )
         }
         "redo" => {
@@ -362,9 +426,8 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
                 return command_usage("redo", "redo");
             }
             let backend = or_exit(open_repo_noconfig());
-            command_result(
+            operation_result(
                 j::terminal::with_progress("Redoing operation", || backend.cmd_undo(true)),
-                "Redo complete",
             )
         }
         "ops" => {
@@ -399,6 +462,13 @@ fn default_clone_dir(url: &str) -> Option<String> {
         "" | "." | ".." => None,
         name => Some(name.to_string()),
     }
+}
+
+/// A runnable shell word for literal clone destinations, including spaces and
+/// quotes. Prefix a leading dash so `cd` does not interpret it as an option.
+fn shell_word(path: &str) -> String {
+    let path = if path.starts_with('-') { format!("./{}", path) } else { path.to_string() };
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 fn or_exit<T>(r: Result<T, u8>) -> T {
@@ -445,7 +515,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     let outer = Rc::new(cfg.global_names.clone());
     let mut expr = match parse_expr(text, outer) {
         Ok(e) => e,
-        Err(p) => return err(3, format!("line {}: {}", p.line, p.msg)),
+        Err(p) => return err(3, diagnostics::format_source_error("expression", text, p.line, &p.msg)),
     };
 
     // §1.2.4: build the current repository value (with snapshot)
@@ -453,7 +523,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         match j::terminal::with_progress("Reading repository", || backend.build_interp(&mut cfg, text, snapshot)) {
             Ok(t) => t,
             Err((2, m)) => return err(2, m),
-            Err((3, m)) => return err(3, m),
+            Err((3, m)) => return err(3, format!("{}: {}\n   See `j help config` for configuration help.", config_path(), m.trim_start_matches("config.j: "))),
             Err((_, m)) => return err(1, m),
         };
 
@@ -479,7 +549,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     if let Err(c) = j::terminal::with_progress("Evaluating configuration", || {
         config::eval_config(&mut interp, &cfg)
     }) {
-        return err(3, format!("config.j: {}", c.msg));
+        return err(3, format!("{}: {}\n   See `j help config` for configuration help.", config_path(), c.msg));
     }
     *interp.old_repo.borrow_mut() = Some(loaded_repo.clone());
     *interp.given_repo.borrow_mut() = Some(current_repo.clone());
@@ -495,7 +565,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         }
     }) {
         Ok(v) => v,
-        Err(c) => return crash_err(&c, Some(text)),
+        Err(c) => return crash_err(&c, text, &cfg),
     };
 
     // §1.2.8: a Repo is persisted (unless unchanged)
@@ -503,20 +573,110 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
         match j::terminal::with_progress("Saving changes", || {
             backend.persist(&mut interp, &cfg, &loaded_repo, &current_repo, &v, text)
         }) {
-            Ok(()) => {
-                j::terminal::success("Expression complete");
+            Ok(changed) => {
+                if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                    let outcome = if changed { "Saved changes" } else { "No changes" };
+                    j::terminal::success(&format!("{}; {}", outcome, focus_summary(&v)));
+                }
+                if changed {
+                    report_conflicts(&interp, &loaded_repo, &v);
+                }
                 ExitCode::SUCCESS
             }
-            Err(c) => crash_err(&c, Some(text)),
+            Err(c) if c.msg.starts_with("config.j: user identity") => {
+                err(3, format!("{}: {}\n   Edit `user` in this file; see `j help config`.", config_path(), c.msg.trim_start_matches("config.j: ")))
+            }
+            Err(c) => crash_err(&c, text, &cfg),
         }
     } else {
         // §1.2.9: display
         let color = j::render::color_enabled("auto");
         match j::terminal::with_progress("Rendering output", || j::render::display(&mut interp, &v, color)) {
             Ok(s) => print_output(&s),
-            Err(c) => crash_err(&c, Some(text)),
+            Err(c) => crash_err(&c, text, &cfg),
         }
     }
+}
+
+/// Report newly introduced conflicts and conflicts in the checked-out focus.
+/// Stored, resolved trees are skipped without loading their entries or blobs.
+fn conflict_paths(interp: &j::eval::Interp, repo: &Value) -> Result<BTreeSet<(String, String)>, Crash> {
+    let mut paths = BTreeSet::new();
+    for commit in j::repo::all_commits(repo)? {
+        let Value::Id(id) = commit.field("id")? else { continue };
+        let Value::Record(fields) = &commit else { continue };
+        if let Some(Value::Thunk(files)) = fields.get("files") {
+            // `new` can inherit an unchanged snapshot from another commit.
+            // Its stored origin still answers for those files even when the
+            // new commit has a different id.
+            if files.origin().and_then(|origin| interp.backend.has_conflict(origin)) == Some(false) {
+                continue;
+            }
+        }
+        for entry in commit.field("files")?.as_list()? {
+            if matches!(entry.field("content")?, Value::Blob(blob) if blob.is_unresolved()) {
+                let path = entry.field("path")?.as_list()?.iter()
+                    .map(|part| part.as_text().map(str::to_owned))
+                    .collect::<Result<Vec<_>, _>>()?.join("/");
+                paths.insert((id.to_string(), path));
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn report_conflicts(interp: &j::eval::Interp, before: &Value, after: &Value) {
+    let summary = || -> Result<(), Crash> {
+        let old = conflict_paths(interp, before)?;
+        let new = conflict_paths(interp, after)?;
+        let Value::Id(focus) = after.field("root")?.field("id")? else { return Ok(()) };
+        let relevant: Vec<_> = new.iter()
+            .filter(|(id, path)| id == focus.as_str() || !old.contains(&(id.clone(), path.clone())))
+            .collect();
+        if relevant.is_empty() {
+            return Ok(());
+        }
+        j::report!("j: warning: {} unresolved file(s) remain:", relevant.len());
+        for (id, path) in relevant.iter().take(10) {
+            j::report!("   @{}  {}", interp.unique_prefix(id), path.escape_debug());
+        }
+        if relevant.len() > 10 {
+            j::report!("   … and {} more; inspect with `j conflicts`.", relevant.len() - 10);
+        }
+        j::report!("   Run `j conflicts` to inspect affected commits. In the focused commit, edit the conflict markers, run `j id` to record the resolution, then `j conflicts` to verify.\n   For another commit, first use `j by @ID`. See `j help conflicts`.");
+        Ok(())
+    };
+    // Saving has succeeded: an optional diagnostic must not turn that into a
+    // failed operation that the user might retry.
+    if let Err(c) = summary() {
+        j::report!("j: changes saved, but conflict details could not be read: {}", c.msg);
+    }
+}
+
+/// Summaries inspect only commit metadata, never force file blobs. Use the
+/// resulting tree's ids, including any commits created by this expression.
+fn focus_summary(repo: &Value) -> String {
+    let summary = || -> Result<String, Crash> {
+        let focus = repo.field("root")?;
+        let Value::Id(id) = focus.field("id")? else {
+            return Err(Crash::new("focus has no id"));
+        };
+        let mut ids: Vec<String> = j::repo::all_commits(repo)?
+            .into_iter()
+            .filter_map(|commit| match commit.field("id").ok()? {
+                Value::Id(id) => Some(id.to_string()),
+                _ => None,
+            })
+            .collect();
+        ids.sort();
+        let prefix = j::eval::unique_prefix_in(&ids, &id);
+        let message = focus.field("message")?.as_text()?.to_string();
+        let title: String = message.lines().next().unwrap_or("").chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch }).take(72).collect();
+        let title = if title.trim().is_empty() { "(no description)" } else { title.trim() };
+        Ok(format!("focus @{} {}", prefix, title))
+    };
+    summary().unwrap_or_else(|_| "repository saved".to_string())
 }
 
 fn is_repo_value(v: &Value) -> bool {

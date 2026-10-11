@@ -4,9 +4,17 @@ This is a guided first hour with `j`. It builds the mental model piece by
 piece — not just *what* to type, but *why it works* — so that by the end you
 can compose your own commands instead of memorizing them.
 
-You'll want `j` installed (`nix build` or `cargo build --release`) and a
-`config.j` with your identity (see the README's Configuration section). Every
-command shown here is run in a real repository, so you can follow along.
+You'll want `j` installed (`nix build` or `cargo build --release`). Set up
+your configuration with your own name and email:
+
+```
+j setup 'Ada Lovelace' ada@example.org
+```
+
+This creates the full reference configuration without overwriting an existing
+file. If you already have a config, `j help config` shows its location so you
+can edit the `user` definition. The remaining commands run in a real
+repository, so you can follow along.
 
 ---
 
@@ -20,11 +28,11 @@ j init
 ```
 
 `j init` makes a colocated `.jj`/`.git` repository and checks out a fresh
-working-copy commit. Now write a file and start your first change:
+working-copy commit: the commit you are currently editing. It already exists,
+so write a file and describe that commit:
 
 ```
 echo 'fn main() {}' > main.rs
-j 'new'
 j 'describe "start the project"'
 ```
 
@@ -36,34 +44,47 @@ j 'tree'
 
 ```
    ⌂ zzzz
-  └─  ● pnyz ▂
-▶    └─  ◌ psnq  start the project
+▶ └─  ◉ pnyz ▂  start the project
 ```
 
 Add a second change on top:
 
 ```
-echo 'lib' > lib.rs
 j 'new'
+echo 'lib' > lib.rs
 j 'describe "add a library"'
 j 'tree'
 ```
 
 ```
    ⌂ zzzz
-  └─  ● pnyz ▂
-     └─  ● psnq ▂  start the project
-▶       └─  ◌ trtq  add a library
+  └─  ● pnyz ▂  start the project
+▶    └─  ◉ psnq ▂  add a library
 ```
 
-That's the whole basic loop: **edit files, `new`, `describe`.** There is no
-`git add` step — the working directory is always already a commit, and `j`
-snapshots it on every run.
+That's the basic loop: **edit files, describe the current change, then `new`
+before editing the next change.** `new` opens an empty change with the same
+files as its parent; it does not move existing edits into that new change.
+There is no `git add` step. `describe` saves both the current files and their
+description; `j save` records file edits without changing the description.
 
-**What just happened, in the model:** each `j` run snapshots your working
-directory into the working-copy commit, builds a `Repo` value focused there,
+**What just happened, in the model:** each expression snapshots your working
+directory for evaluation, builds a `Repo` value focused on that commit,
 evaluates your expression, and — because `new` and `describe` are *edits*
 (functions `Repo -> Repo`) — persists the resulting repository.
+
+`j status` has two useful lists: `in commit` compares the current commit with
+its parent, while `unrecorded` lists file edits made since the last save.
+After `describe` or `save`, `unrecorded` is empty; `in commit` still shows the
+work in the commit. Inspecting status does not save anything.
+
+To join an existing project instead, clone it and enter its directory:
+
+```
+j clone URL project
+cd project
+j status
+```
 
 ---
 
@@ -133,21 +154,27 @@ function produces, so don't wrap it.
 Make a few commits to play with:
 
 ```
-echo a > a.txt; j 'new'; j 'describe "A"'
-echo b > b.txt; j 'new'; j 'describe "B"'
-echo c > c.txt; j 'new'; j 'describe "C"'
+j new; echo a > a.txt; j 'describe "A"'
+j new; echo b > b.txt; j 'describe "B"'
+j new; echo c > c.txt; j 'describe "C"'
 ```
 
-Navigation is edits too:
+Navigation changes the working-copy commit and checks out its files. Use
+these commands to edit another mutable commit:
 
 ```
 j 'prev'          -- to the parent
 j 'next'          -- to the only child
-j 'top'           -- to the top of history
 j 'tip'           -- to the end of the current line
 j 'by @vqok'      -- to a specific commit, by id (use a real id from j tree)
-j 'goto %main'    -- to what the remote calls main
 ```
+
+At a fork, choose an id from `j tree` with `j 'by @id'`; `next` only works
+when there is one child. Main and the root commit are protected from editing.
+Use `j 'new . goto trunk'` to start work on main, or
+`j 'tree . goto trunk'` to inspect it without moving your working copy.
+In a new local repository with no main bookmark, keep working from `j init`'s
+commit instead.
 
 After `j 'prev'` from C, the tree shows the focus (▶ and ◉) on B:
 
@@ -164,10 +191,15 @@ To see the focus's data, use the inspection functions:
 ```
 j 'files'         -- the focus's files
 j 'changed'       -- paths that differ from the parent
-j 'status'        -- id, message, labels, changed, conflicts
+j 'status'        -- focus, changes in the commit, unrecorded edits, conflicts
 j 'log'           -- a table of every commit, ✓ on the focus
 j 'review'        -- the focus's changes as diffs (difftastic)
 ```
+
+These inspections include current file edits without recording them. Use
+`j save` to record file edits on their own (`id` is the same edit). `status` spells out empty states
+such as `No changes` and `No conflicts`; `log` shows label names and short
+ids and adapts to narrow terminals.
 
 ### Composition order, made concrete
 
@@ -194,11 +226,10 @@ operates on the repository the previous step produced.
 
 ## Part 4 — Dry runs: seeing before doing
 
-Because inspections persist nothing, you can preview any edit by composing it
-with `tree`:
+Use `preview` to validate an edit and show its resulting tree without saving:
 
 ```
-j 'tree . squash'
+j 'preview squash'
 ```
 
 From the A → B history, this *shows* the tree as `squash` would leave it (B
@@ -221,17 +252,20 @@ because `tree` returns a `Text`, not a `Repo`:
 ▶       └─  ◌ nknz  B
 ```
 
-For a stronger guarantee, insert `validate`. `validate repo` returns the repo
-unchanged if persisting would succeed, and crashes with the exact error
-otherwise:
+`preview` combines `tree` and `validate`. For an edit that takes arguments,
+put that edit in parentheses:
 
 ```
-j 'tree . validate . rebase %main'
+j 'preview (rebase %main)'
 ```
 
 This renders the post-rebase tree **and** crashes (without touching anything)
 if that rebase couldn't actually happen — for instance, if `%main` doesn't
 exist yet. That's an *honest* dry run.
+
+The longer form is `j 'tree . validate . rebase %main'`. `validate` alone
+does not make an edit a dry run: `j 'validate . squash'` returns a repository
+and saves it. The final inspection (`tree`) is what prevents persistence.
 
 ---
 
@@ -290,13 +324,35 @@ Two things make these safe to use freely:
 
 1. **The change id survives.** A commit keeps its `@wqzt…` id across
    `describe`, `squash`, `rebase`. You're never tracking a moving sha.
-2. **`j undo` always works.** Every operation is recorded.
+2. **Saved operations are undoable.** Use `j undo` and `j redo` to walk them.
 
 ```
 j undo            -- revert the last thing
 j redo            -- reapply it
 j ops             -- see the operation log
 ```
+
+Undo and redo stop when files have unrecorded edits. Recording those edits
+with `j id` adds an operation, so the next undo removes that recording;
+another undo reaches the preceding edit. Recording also clears pending
+redos. Read `j ops` to choose how far to go back. Successful interactive
+undo/redo messages identify the affected operation and restored focus.
+
+### Resolve a conflict
+
+A successful rebase can leave conflicts in the working-copy commit. The edit
+is saved; there is no separate continuation command. Resolve it in four steps:
+
+1. Run `j status` to find conflicted paths, and `j review` to inspect changes.
+2. Edit those files, choosing the intended content and removing conflict markers.
+3. Run `j save` to record the resolution.
+4. Run `j status` again and check for `No conflicts` and `All edits recorded`.
+
+`j conflicts` lists conflicted commits throughout the repository. If a
+conflict is on another mutable commit, use its id from `j tree` with
+`j 'by @id'`, then follow the same steps. Run `j conflicts` again to check
+the whole history. `review` uses difftastic when
+installed and falls back to a unified diff when it is unavailable.
 
 ### `split` and `contract`: moving changes by fileset
 
@@ -341,8 +397,11 @@ Most commands that take a "which commits" argument take a revset. `goto` is
 the one place a revset must name *exactly one* commit:
 
 ```
-j 'goto %main'        -- crash if %main names 0 or 2+ commits
+j 'new . goto %main'  -- select one main commit and start a mutable child
 ```
+
+A missing label reports how to fetch and inspect remote labels. An ambiguous
+selector lists candidate ids and descriptions so you can choose with `by`.
 
 Revsets combine like sets:
 
@@ -387,9 +446,9 @@ Everything `j` knows is defined in `config.j`. Any definition whose value is
 an `Edit` is a new command. Add this to your `~/.config/j/config.j`:
 
 ```
--- fold the whole stack into one commit called "release"
+-- squash into the parent and name the combined commit "release"
 release : Edit
-release = describe "release" . (contract everything)
+release = describe "release" . prev . squash
 ```
 
 Now `j release` works exactly like `squash` or `new`. The signature (`: Edit`)
@@ -432,8 +491,8 @@ echo 'fn parse() {}' > parser.rs
 j 'describe "add the parser"'
 
 # second part
-echo 'mod parser;' > lib.rs
 j 'new'
+echo 'mod parser;' > lib.rs
 j 'describe "wire up the parser"'
 
 # look at it
@@ -442,16 +501,23 @@ j 'tree'
 # the second commit was really part of the first; fold it in
 j squash
 
+# squash leaves an empty child focused; move to the combined commit
+j prev
+
 # rename the combined commit
 j 'describe "add the parser"'
 
 # preview the rebase, then do it
-j 'tree . validate . rebase %main'
+j 'preview (rebase %main)'
 j 'rebase %main'
 
 # share it
 j 'push (label "parser" here)'
 ```
+
+Push sends recorded commits. If you edit files after the last saved edit,
+push warns that those edits are omitted. Run `j save`, then push again to
+include them. Looking at `j status` does not save the edits.
 
 And if any step goes wrong:
 

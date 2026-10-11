@@ -13,19 +13,23 @@ Usage:
   j EXPRESSION…                 Evaluate an expression
   printf '%s\n' 'tree' | j      Read an expression from stdin
   j help [NAME]                 Explain a command or config name
-  j commands [QUERY]            Search names, signatures, and documentation
+  j commands [QUERY]            Find everyday commands by task
+  j commands all                Browse the complete vocabulary
+  j help config                Set your identity or repair configuration
 
 Start a repository:
+  j setup 'Ada Lovelace' ada@example.org  Create config with your identity
   j init                        Create a repository in the current directory
   j clone URL [DIR]             Clone a repository
 
 Inspect (default config):
   j tree                        Show the history and current focus
   j status                      Show the focused commit and changed paths
-  j review                      Show changes with difftastic (difft on PATH)
+  j review                      Show changes (unified diff if difft is absent)
   j log                         List commits
 
 Edit (default config):
+  j save                        Record current file edits
   j 'describe "add a feature"'   Set the focused commit's message
   j new                         Start an empty child and move to it
   j prev                        Move to the parent commit
@@ -34,7 +38,7 @@ Edit (default config):
   j 'rebase trunk'              Move the focused subtree onto the main line
 
 Preview and recover:
-  j 'tree . squash'             Preview a squash without saving the edit
+  j 'preview squash'            Check and preview a squash without saving
   j undo                        Undo the last operation
   j redo                        Reapply an undone operation
   j ops                         Show the operation log
@@ -45,6 +49,9 @@ Sync:
   j 'push (label "feature" here)'  Publish the focus as a remote bookmark
   j push relabel                Update existing remote bookmarks
 
+Push sends recorded commits. After editing files, run `j save` to record them
+before pushing; `j status` and other inspections do not save those edits.
+
 Expressions compose right to left: `describe "wip" . new` runs new first.
 A function result receives the current repository. A Repo result saves the
 edit; other results print. Quote the whole expression with shell single
@@ -53,6 +60,34 @@ quotes to preserve text's double quotes and operators such as *, <, and >.
 Your config.j defines the vocabulary: edits (Repo -> Repo), inspections,
 revsets, filesets, types, and custom names. Search with `j commands rebase`
 or `j commands Edit`; use `j help squash` or `j help commands` for details.
+"#;
+
+pub const CONFIG_HELP: &str = r#"Configuration and identity
+
+For a new installation, create the complete config with your identity:
+
+  j setup 'Ada Lovelace' ada@example.org
+
+Use your own name and email. Then run `j init` or `j clone URL`.
+To create the complete default and edit identity yourself, run `j setup`.
+Setup never replaces an existing config.
+
+If the file already exists, edit its existing `user` definition:
+
+  user = { name = "Ada Lovelace", email = "ada@example.org" }
+
+Keep the rest of the file: it defines your commands. The example above is
+one definition, not a complete config. Set both fields before saving changes.
+The shipped "Your Name" / "you@example.com" placeholders cannot author commits.
+An existing configuration is never overwritten or upgraded automatically.
+
+If configuration is broken, repair the reported line in this file. General
+help and reserved-command help remain available without loading config.
+`j commands` checks the vocabulary without evaluating it or changing a repo.
+
+Configuration lives at $XDG_CONFIG_HOME/j/config.j when XDG_CONFIG_HOME is
+set, otherwise at ~/.config/j/config.j. `j setup` creates an editable default;
+help never creates or changes files.
 "#;
 
 struct Reserved {
@@ -67,13 +102,13 @@ const RESERVED: &[Reserved] = &[
         name: "clone",
         usage: "j clone URL [DIR]",
         summary: "Clone a repository.",
-        detail: "Clone URL into DIR, or into a directory named after the repository.\n\nExample:\n  j clone https://example.com/team/project.git project\n",
+        detail: "Clone URL into DIR, or into a directory named after the repository.\nFor first-time setup, run `j setup NAME EMAIL`. Shell-quote paths containing spaces.\nCloning does not change your shell's directory; enter the new folder afterward.\n\nExamples:\n  j clone https://example.com/team/project.git project\n  cd project\n  j status\n\n  j clone '/path/to/source repo' 'my project'\n  cd 'my project'\n",
     },
     Reserved {
         name: "commands",
         usage: "j commands [QUERY]",
-        summary: "List and search the commands and config vocabulary.",
-        detail: "List CLI commands and the names declared or defined in config.j, including\ncustom definitions, builtins, operators, and types. QUERY matches names,\nsignatures, and source comments, ignoring case.\n\nThe config is parsed and validated without evaluating definitions or opening\na repository. No config file is created; when absent, defaults are shown.\n\nExamples:\n  j commands\n  j commands rebase\n  j commands Edit\n  j commands 'remote bookmark'\n  j help squash\n",
+        summary: "Find everyday commands by task, or browse the full vocabulary.",
+        detail: "Without a query, show common tasks and a few custom definitions.\n`j commands all` lists every configured definition, builtin, operator, and type.\nSearch by task (save, record, commit, branch, checkout), name, signature, or\nsource comments. Search ignores case and puts direct matches and everyday\ncommands first. Use `j help NAME` for examples and types.\n\nThe config is parsed and validated without evaluating definitions or opening\na repository. No config file is created; when absent, defaults are shown.\n\nExamples:\n  j commands\n  j commands save\n  j commands rebase\n  j commands Edit\n  j commands all\n",
     },
     Reserved {
         name: "fetch",
@@ -91,7 +126,7 @@ const RESERVED: &[Reserved] = &[
         name: "init",
         usage: "j init",
         summary: "Create a repository in the current directory.",
-        detail: "Create a colocated .jj/.git repository and a working-copy commit. An\nexisting .git repository is adopted. Set your identity in config.j's `user`\ndefinition before creating commits.\n\nExample:\n  mkdir project\n  cd project\n  j init\n",
+        detail: "Create a colocated .jj/.git repository and a working-copy commit. An\nexisting .git repository is adopted. On a new installation, first run\n`j setup NAME EMAIL`; use `j help config` to update an existing identity.\nThe shipped placeholder identity cannot author commits.\n\nExample:\n  j setup 'Ada Lovelace' ada@example.org\n  mkdir project\n  cd project\n  j init\n",
     },
     Reserved {
         name: "ops",
@@ -103,13 +138,13 @@ const RESERVED: &[Reserved] = &[
         name: "push",
         usage: "j push EXPRESSION",
         summary: "Publish or delete bookmarks on origin.",
-        detail: "Evaluate EXPRESSION to a list of Push and Drop records, then update origin.\nA function result receives the recorded repository; working-copy changes\nare not snapshotted by push. The default config provides label, unlabel,\nrename, and relabel helpers.\n\nExamples (default config):\n  j 'push (label \"feature\" here)'\n  j push relabel\n  j 'push (unlabel \"feature\")'\n  j 'push (rename \"old\" \"new\")'\n\nThe unlabel example deletes the remote bookmark.\n",
+        detail: "Evaluate EXPRESSION to a list of Push and Drop records, then update origin.\nA function result receives the recorded repository; working-copy changes\nare not snapshotted by push. Unrecorded edits produce a warning before sending.\nRun `j id` to record them, then push again to include them; `j status` does not\nrecord edits. The default config provides label, unlabel, rename, and relabel.\n\nExamples (default config):\n  j 'push (label \"feature\" here)'\n  j push relabel\n  j 'push (unlabel \"feature\")'\n  j 'push (rename \"old\" \"new\")'\n\nThe unlabel example deletes the remote bookmark.\n",
     },
     Reserved {
         name: "redo",
         usage: "j redo",
         summary: "Reapply an undone operation.",
-        detail: "Reapply the operation removed by undo. Refuses if there is nothing to redo\nor if restoring the working copy would overwrite unsnapshotted changes.\n\nExample:\n  j redo\n\nRelated: j help undo, j help ops\n",
+        detail: "Reapply the operation removed by undo. Refuses if there is nothing to redo\nor if restoring the working copy would overwrite unsnapshotted changes.\nRecording new edits with `j id` creates an operation and clears pending redos.\nInspect `j ops` before choosing how to preserve or discard those edits.\n\nExample:\n  j redo\n\nRelated: j help undo, j help ops\n",
     },
     Reserved {
         name: "remote",
@@ -118,10 +153,16 @@ const RESERVED: &[Reserved] = &[
         detail: "Add origin or replace its URL. Fetch and push use this remote.\n\nExample:\n  j remote https://example.com/team/project.git\n  j fetch\n",
     },
     Reserved {
+        name: "setup",
+        usage: "j setup [NAME EMAIL]",
+        summary: "Create your complete config before starting a repository.",
+        detail: "With NAME and EMAIL, create the full default config with your identity.\nWithout arguments, create the default and print the exact definition to edit.\nAn existing config is never overwritten: edit its `user` definition directly.\nSetup does not create or open a repository.\n\nExamples:\n  j setup 'Ada Lovelace' ada@example.org\n  j init\n\n  j setup\n  j help config\n",
+    },
+    Reserved {
         name: "undo",
         usage: "j undo",
         summary: "Undo the last operation.",
-        detail: "Restore the repository state before the last operation. Repeat to walk\nback through history. Refuses if restoring the working copy would overwrite\nunsnapshotted changes. Undo does not reverse changes already sent to a remote.\n\nExample:\n  j undo\n\nRelated: j help redo, j help ops\n",
+        detail: "Restore the repository state before the last operation. Repeat to walk\nback through history. Refuses if restoring the working copy would overwrite\nunsnapshotted changes. `j id` preserves edits as a new operation: the next\nundo reverses that recording before reaching the earlier operation. Use\n`j ops` to inspect history; `j redo` can restore the undone recording.\nUndo does not reverse changes already sent to a remote.\n\nExample:\n  j undo\n\nRelated: j help redo, j help ops\n",
     },
 ];
 
@@ -164,43 +205,154 @@ impl Entry {
     }
 }
 
+struct Task {
+    group: &'static str,
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+}
+
+const TASKS: &[Task] = &[
+    Task { group: "Start", name: "setup", usage: "j setup NAME EMAIL", summary: "Set your name and email." },
+    Task { group: "Start", name: "init", usage: "j init", summary: "Create a repository here." },
+    Task { group: "Start", name: "clone", usage: "j clone URL [DIR]", summary: "Clone a repository, then cd into it." },
+    Task { group: "Inspect", name: "status", usage: "j status", summary: "See your current change and files." },
+    Task { group: "Inspect", name: "tree", usage: "j tree", summary: "See history and your current commit." },
+    Task { group: "Inspect", name: "review", usage: "j review", summary: "Review changed file contents." },
+    Task { group: "Work", name: "save", usage: "j save", summary: "Record current file edits." },
+    Task { group: "Work", name: "id", usage: "j id", summary: "Record current file edits." },
+    Task { group: "Work", name: "describe", usage: "j 'describe \"message\"'", summary: "Name the current commit." },
+    Task { group: "Work", name: "new", usage: "j new", summary: "Start the next commit before editing." },
+    Task { group: "Work", name: "preview", usage: "j 'preview squash'", summary: "Check an edit without saving it." },
+    Task { group: "Work", name: "prev", usage: "j prev", summary: "Move to the parent commit." },
+    Task { group: "Share", name: "remote", usage: "j remote URL", summary: "Set your remote repository." },
+    Task { group: "Share", name: "fetch", usage: "j fetch", summary: "Get remote commits and bookmarks." },
+    Task { group: "Share", name: "push", usage: "j help push", summary: "Learn how to publish a bookmark." },
+    Task { group: "Recover", name: "undo", usage: "j undo", summary: "Undo the last operation." },
+    Task { group: "Recover", name: "redo", usage: "j redo", summary: "Reapply an undone operation." },
+    Task { group: "Recover", name: "ops", usage: "j ops", summary: "Inspect the operation history." },
+];
+
+fn everyday_list(entries: &[Entry]) -> String {
+    let mut out = String::from("Everyday commands:\n");
+    let reference = config::load_config(include_str!("../config.j")).expect("embedded config is valid");
+    let mut group = "";
+    for task in TASKS {
+        let entry = entries.iter().find(|entry| entry.name == task.name);
+        let reserved = RESERVED.iter().any(|command| command.name == task.name);
+        if !reserved && entry.is_none() {
+            continue;
+        }
+        if task.name == "id" && entries.iter().any(|entry| entry.name == "save") {
+            continue;
+        }
+        if task.group != group {
+            out.push_str(&format!("\n{}:\n", task.group));
+            group = task.group;
+        }
+        let custom_summary;
+        let summary = match entry {
+            Some(entry) if !entry.docs.is_empty() => entry.docs[0].as_str(),
+            Some(entry) if entry.signature.is_none() && entry.docs.is_empty() => {
+                custom_summary = format!("Custom definition; see `j help {}`.", entry.name);
+                custom_summary.as_str()
+            }
+            _ => task.summary,
+        };
+        let changed_signature = entry.is_some_and(|entry| entry.signature.as_ref() != reference.sigs.get(task.name));
+        let usage = if changed_signature || (task.name == "preview" && !entries.iter().any(|entry| entry.name == "squash")) {
+            format!("j help {}", task.name)
+        } else {
+            task.usage.to_string()
+        };
+        out.push_str(&format!("  {:<29} {}\n", usage, truncate(summary, 47)));
+    }
+    // Surface a few additions without letting a large custom vocabulary turn
+    // the starting guide into the complete catalog again.
+    let custom: Vec<_> = entries.iter().filter(|entry| {
+        matches!(entry.kind, Kind::Definition)
+            && !reference.defs.iter().any(|(name, _)| name == &entry.name)
+    }).collect();
+    if !custom.is_empty() {
+        out.push_str("\nYour custom definitions:\n");
+        for entry in custom.iter().take(6) {
+            let docs = entry.docs.first().map(String::as_str).unwrap_or("Use j help for details.");
+            out.push_str(&format!("  {:<29} {}\n", entry.name, truncate(docs, 55)));
+        }
+        if custom.len() > 6 {
+            out.push_str("  More custom definitions are listed by `j commands all`.\n");
+        }
+    }
+    out.push_str("\nUse `j help NAME` for examples. Search by task: `j commands save`.\nUse `j commands all` for every definition, builtin, operator, and type.\n");
+    out
+}
+
+fn intent_names(query: &str) -> &'static [&'static str] {
+    match query {
+        "save" | "record" | "snapshot" | "save changes" | "record changes" => &["save", "id"],
+        "commit" | "git commit" => &["describe", "new", "save", "id"],
+        "branch" | "git branch" => &["new", "label", "push", "goto"],
+        "checkout" | "switch" | "switch branch" | "git checkout" => &["goto", "prev", "next"],
+        "diff" | "changes" | "git diff" => &["review", "status", "changed", "diff"],
+        _ => &[],
+    }
+}
+
 pub fn command_list(src: &str, query: &str) -> Result<String, String> {
     let entries = entries(src)?;
     let query = query.trim().to_lowercase();
-    let matches = |text: &str| text.to_lowercase().contains(&query);
-    let mut out = String::new();
-    let mut count = 0;
+    if query.is_empty() {
+        return Ok(everyday_list(&entries));
+    }
+    let all = query == "all";
+    let intents = intent_names(&query);
+    let matches = |text: &str| all || text.to_lowercase().contains(&query);
+    let mut results = Vec::new();
     for cmd in RESERVED {
-        if matches(&format!("{} {} {}", cmd.usage, cmd.summary, cmd.detail)) {
-            if count == 0 {
-                out.push_str("CLI commands:\n");
-            }
-            out.push_str(&format!("  {:<24} {}\n", cmd.usage, cmd.summary));
-            count += 1;
+        let intent = intents.iter().position(|name| *name == cmd.name);
+        if matches(&format!("{} {} {}", cmd.usage, cmd.summary, cmd.detail)) || intent.is_some() {
+            let rank = if all || query == cmd.name { 0 } else { intent.map(|i| i + 1).unwrap_or(40) };
+            results.push((rank, cmd.name.to_string(), format!("  {:<24} {}\n", cmd.usage, cmd.summary)));
         }
     }
-    let mut config_count = 0;
-    for entry in entries {
+    for entry in &entries {
         let declaration = entry.declaration();
-        if !matches(&format!("{} {}", declaration, entry.docs.join(" "))) {
+        let intent = intents.iter().position(|name| *name == entry.name);
+        if !matches(&format!("{} {}", declaration, entry.docs.join(" "))) && intent.is_none() {
             continue;
         }
-        if config_count == 0 {
-            if count > 0 {
-                out.push('\n');
-            }
-            out.push_str("Config vocabulary (definitions, builtins, operators, and types):\n");
-        }
-        out.push_str(&format!("  {}\n", declaration));
+        let everyday = TASKS.iter().any(|task| task.name == entry.name);
+        let exact = query == entry.name.to_lowercase() && (!matches!(entry.kind, Kind::Type) || intents.is_empty());
+        let rank = if all { 1 } else if exact { 0 }
+            else { intent.map(|i| i + 1).unwrap_or(if everyday { 20 } else { 30 }) };
+        let mut description = format!("  {}\n", declaration);
         if let Some(doc) = entry.docs.first() {
-            out.push_str(&format!("    {}\n", truncate(doc, 110)));
+            description.push_str(&format!("    {}\n", truncate(doc, 110)));
         }
-        config_count += 1;
+        results.push((rank, entry.name.clone(), description));
     }
-    if count + config_count == 0 {
-        out.push_str("No matching commands or config names. Try `j commands` to list all names.\n");
+    results.sort_by(|a, b| (&a.0, a.1.to_lowercase(), &a.1).cmp(&(&b.0, b.1.to_lowercase(), &b.1)));
+    let mut out = String::new();
+    if matches!(query.as_str(), "stash" | "git stash") && !entries.iter().any(|entry| entry.name == "stash") {
+        out.push_str("There is no direct stash command in this config.\n");
+        let save = if entries.iter().any(|entry| entry.name == "save") { Some("save") }
+            else if entries.iter().any(|entry| entry.name == "id") { Some("id") } else { None };
+        if let Some(save) = save {
+            out.push_str(&format!("`j {}` records file edits in the current commit.\n", save));
+        }
+        if entries.iter().any(|entry| entry.name == "new") {
+            out.push_str("`j new` starts a child commit; the recorded work remains in its parent.\n");
+        }
+        out.push_str("\n");
+    }
+    if results.is_empty() {
+        out.push_str("No matching commands or config names. Try `j commands` for common tasks or `j commands all` for every name.\n");
     } else {
-        out.push_str("\nUse `j help NAME` for details; `j commands QUERY` to narrow the list.\n");
+        out.push_str(if all { "All commands and config vocabulary:\n" } else { "Matching commands and config names:\n" });
+        for (_, _, description) in results {
+            out.push_str(&description);
+        }
+        out.push_str("\nUse `j help NAME` for examples and details; `j commands QUERY` to search.\n");
     }
     Ok(out)
 }
@@ -219,14 +371,8 @@ pub fn command_help(src: &str, name: &str) -> Result<Option<String>, String> {
             Kind::Builtin => "Builtin declared in config",
             Kind::Type => "Type declared in config",
         };
-        let mut out = format!(
-            "{}\n\n{}\nSource: line {}\n",
-            entry.declaration(),
-            kind,
-            entry.line
-        );
+        let mut out = String::new();
         if !entry.docs.is_empty() {
-            out.push('\n');
             for doc in entry.docs.iter().take(24) {
                 out.push_str(doc);
                 out.push('\n');
@@ -234,7 +380,9 @@ pub fn command_help(src: &str, name: &str) -> Result<Option<String>, String> {
             if entry.docs.len() > 24 {
                 out.push_str("… See the source for the remaining comments.\n");
             }
+            out.push('\n');
         }
+        out.push_str(&format!("{}\n\n{}\nSource: line {}\n", entry.declaration(), kind, entry.line));
         out
     }))
 }
