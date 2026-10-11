@@ -75,21 +75,27 @@ about: a commit keeps its identity (`@wqzt…`) across `describe`, `squash`,
 `j push` takes an *expression* rather than flags: `j 'push (label "feature"
 here)'` labels the focused commit, `j 'push relabel'` re-points the remote's
 bookmarks after a rewrite.
+Push sends recorded commits and warns before sending if files have
+unrecorded edits. Run `j id`, then push again to include those edits.
 
 ### 3.2 Recording work
 
 | Task | git | jj | j |
 |---|---|---|---|
-| Save current state | `git add … && git commit` | automatic (`jj st` shows it) | automatic; `j id` to record *only* the snapshot |
+| Save current state | `git add … && git commit` | automatic (`jj st` shows it) | an edit records the snapshot; `j save` records *only* the snapshot |
 | Set the message | `git commit -m "…"` | `jj describe -m "…"` or `jj describe` | `j 'describe "…"'` |
 | Start the next change | (just keep editing) | `jj new` | `j new` |
 | Amend the current commit | `git commit --amend` | `jj describe` + edit files in `@` | edit files + `j 'describe "…"'` |
 | See what changed | `git diff` / `git show` | `jj diff` / `jj show` | `j review` (via difftastic) / `j status` |
 
-In git, "commit" is a deliberate act with a staging step. In jj and `j`, the
-snapshot is continuous; `describe` sets a message and `new` opens the next
-change. `j` has one deliberate-snapshot command, `j id`, for when you want to
-record the working directory and nothing else.
+In git, "commit" is a deliberate act with a staging step. jj snapshots the
+working copy automatically. In `j`, expressions see current file edits,
+but only a changed `Repo` result records them: `describe` saves a message
+and `new` opens the next change. `j status` and other inspections save
+nothing. Use `j save` (an alias for `id`) to record the working directory and
+nothing else. Status displays the `changed` field as `in commit`, comparing
+the current commit with its parent; `unrecorded` shows file edits made since
+the last save.
 
 ### 3.3 Looking around
 
@@ -116,7 +122,7 @@ zipper with edits.
 |---|---|---|---|
 | To the parent | `git checkout HEAD~1` | `jj prev` *(≈, opens a new empty commit there)* | `j prev` |
 | To the child | `git checkout <sha>` (manual) | `jj next` *(≈, opens a new empty commit there)* | `j next` |
-| To a named commit | `git checkout <branch>` | `jj new <rev>` | `j 'goto %main'` |
+| Start work on a named commit | `git checkout <branch>` | `jj new <rev>` | `j 'new . goto %main'` |
 | To a specific change | `git checkout <sha>` | `jj new <change-id>` | `j 'by @wqzt'` |
 | Back to your branch | `git checkout main` | `jj new main` | `j 'new . goto trunk'` |
 
@@ -201,14 +207,16 @@ the remote's state explicit and impossible to mutate by accident.
 | When do conflicts appear? | During merge/rebase, blocking it | Recorded *in* the commit, non-blocking | Recorded in the commit (unresolved `Blob`s) |
 | Where do they live? | The working tree + index | In the commit itself | In the commit's `files`, as conflict blobs |
 | How do you see them? | `git status` | `jj st`, `jj resolve` | `j conflicts`, `j status` |
-| How do you resolve? | Edit files, `git add`, continue | Edit files; conflict is gone from `@` | Edit files, then any persisting expression (`j id`) |
+| How do you resolve? | Edit files, `git add`, continue | Edit files; conflict is gone from `@` | Edit files, then `j save` and check `j status` |
 
 git stops the world on a conflict: a merge or rebase halts until you resolve
 and `git add`. jj and `j` treat a conflict as *data* — a commit can simply
 *contain* conflicted files, you can keep working, and you resolve whenever you
 like. `j conflicts` lists the commits that have conflicts; checking one out
-writes the markers to disk; editing the files and running `j id` records the
-resolution.
+writes the markers to disk; editing the files and running `j save` records
+the resolution. Check `j status` for `No conflicts` and `All edits recorded`.
+There is no separate continuation command. `j review` uses a unified diff
+when difftastic is not installed.
 
 ---
 
@@ -226,6 +234,12 @@ to it, but there's no structured undo. jj and `j` record *every* operation as
 a first-class, marked operation, so `undo`/`redo` are safe and precise. In
 `j`, undoing a `push` restores the local labels (and leaves the remote
 untouched).
+
+`j undo` and `j redo` require no unrecorded working-copy edits. Recording
+edits with `j id` adds an operation, so the next undo removes that recording
+before another undo reaches the preceding edit. A new recording also clears
+pending redos. Interactive confirmations identify the affected operation and
+restored focus; `j ops` shows the history.
 
 ---
 
@@ -296,6 +310,8 @@ j new
 # …edit…
 j 'describe "part two"'
 j squash
+j prev                        # squash leaves an empty child; return to the combined commit
+j 'describe "complete feature"'
 j 'rebase %main'
 j 'push (label "feature" here)'
 ```

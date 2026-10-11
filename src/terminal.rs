@@ -39,12 +39,12 @@ fn capable_terminal() -> bool {
 fn interactive() -> bool {
     io::stdout().is_terminal()
         && io::stderr().is_terminal()
-        && capable_terminal()
         && !nonempty_env("CI")
 }
 
 fn motion_enabled() -> bool {
     interactive()
+        && capable_terminal()
         && !matches!(
             std::env::var("J_ANIMATIONS")
                 .unwrap_or_default()
@@ -83,10 +83,12 @@ fn report_with_color(args: fmt::Arguments<'_>, code: &str) {
 pub fn success(message: &str) {
     stop_progress();
     if interactive() {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "\x1b[1;92m✓\x1b[0m \x1b[1;96mj:\x1b[0m {message}"
-        );
+        let mut out = io::stderr().lock();
+        if capable_terminal() {
+            let _ = writeln!(out, "\x1b[1;92m✓\x1b[0m \x1b[1;96mj:\x1b[0m {message}");
+        } else {
+            let _ = writeln!(out, "j: {message}");
+        }
     }
 }
 

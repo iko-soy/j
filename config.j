@@ -76,6 +76,10 @@ Drop     = { delete : Label }         -- delete the remote's bookmark
 ------------------------------------------------------------------------------
 
 (.)     : (b -> c) -> (a -> b) -> a -> c   -- composition, right to left
+-- Return a value unchanged. As a repository command, `j id` records the
+-- snapshotted working-copy edits in the focused commit. `j save` is the
+-- descriptive alias in this reference config; inspections such as `j status`
+-- and `j tree` do not record those edits.
 id      : a -> a
 const   : a -> b -> a
 crash   : Text -> a                        -- abort the program with a message
@@ -143,6 +147,11 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 -- file ./a would, crashes, naming the path (§7.3).
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
+
+-- Paths edited in the working copy since the last recorded repository state.
+-- `j status` includes this list; `j save` records it in the focused commit.
+-- This measures the working copy, even when composed after an in-memory edit.
+unrecorded : Repo -> [Path]
 touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;
                                            -- blobs compared by content id, bytes never read
 blob       : Text -> Blob                  -- a resolved regular file
@@ -160,8 +169,9 @@ validate   : Repo -> Repo                  -- the repo unchanged, or the crash p
                                            -- focus). `tree . validate . rebase trunk` is an
                                            -- honest dry run.
 diff       : Blob -> Blob -> Text          -- unified diff from the first to the second
-difft      : Path -> Blob -> Blob -> Text  -- difftastic's rendering; needs difft on PATH.
-                                           -- Options via DFT_* environment variables.
+difft      : Path -> Blob -> Blob -> Text  -- difftastic when difft is on PATH; otherwise
+                                           -- unified diff with path headers and 3 context lines,
+                                           -- or a binary-files summary. DFT_* configures difft.
 treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text
              , lanes : Int, author : Bool, date : Bool, files : Bool }
              -> Repo -> Text              -- the history as a tree; see the spec
@@ -249,6 +259,9 @@ restrict = \m -> filter (\e -> m e.path)
 select : Fileset -> Snapshot -> Snapshot -> Snapshot            -- m from a, the rest from b
 select = \m a b -> restrict m a ++ restrict (neg m) b
 
+-- Unresolved paths in a snapshot. For the focus, inspect `j status` or
+-- `j conflicted . files`, edit the listed files to remove conflict markers,
+-- then run `j save` and inspect `j status` again. See `j help conflicts`.
 conflicted : Snapshot -> [Path]
 conflicted = \s -> map (.path) (filter (\e -> unresolved e.content) s)
 
@@ -333,6 +346,11 @@ minus = \a b repo -> let ys = b repo in filter (\i -> not (member i ys)) (a repo
 matching : (Commit -> Bool) -> Revset -> Revset
 matching = \p rs repo -> filter (\i -> p (commitAt i repo)) (rs repo)
 
+-- Find every commit with unresolved files. `j conflicts` lists candidates;
+-- use `j by @ID` to focus a mutable one, then `j status` to find its paths.
+-- Edit each conflicted file, remove the conflict markers, and run `j save`.
+-- Check `j status` again; `j clean` means the focus has no unresolved files,
+-- not that the working copy has no unrecorded edits. `j review` shows the diff.
 conflicts : Revset
 conflicts = matching (\c -> not (null (conflicted c.files))) all
 
@@ -341,7 +359,10 @@ firstOf : [Revset] -> Revset
 firstOf = \rss repo -> foldl (\acc rs -> if null acc then rs repo else acc) [] rss
 
 -- The main line: whichever of these names the remote has, first one wins.
--- Empty in a repository with no remote, in which case nothing is immutable.
+-- Empty when no fetched remote label is named main, master, or trunk;
+-- nothing is then immutable. Configure `j remote URL`, run `j fetch`, and
+-- inspect `j tree` to see remote labels. A remote with another default label
+-- needs this definition adjusted. Start work with j 'new . goto trunk'.
 trunk : Revset
 trunk = firstOf [%main %master %trunk]
 
@@ -362,9 +383,15 @@ immutable = ancestorsOf trunk
 goto : Revset -> Edit
 goto = \rs repo ->
   let is = rs repo
+      candidate = \i ->
+        let c = commitAt i repo
+            message = head (splitOn "\n" c.message)
+        in "  " ++ show i ++ "  " ++ (if message == "" then "(no description)" else message) ++ "\n"
   in if length is == 1
      then by (head is) repo
-     else crash ("expected one revision, got " ++ show (length is))
+     else if null is
+          then crash "expected one revision, got 0; no matching revision. Run `j tree` to inspect available revisions. For a missing remote label such as %main or trunk, configure `j remote URL`, run `j fetch`, and check the label names in `j tree`."
+          else crash ("expected one revision, got " ++ show (length is) ++ "\nCandidates:\n" ++ concat (map candidate (take 8 is)) ++ (if length is > 8 then "  More candidates: run `j tree`.\n" else "") ++ "Choose a mutable commit with `j by @ID`, or start a child with `j 'new . by @ID'`; replace @ID with a candidate above.")
 
 commitAt : Id -> Repo -> Commit
 commitAt = lookupCommit
@@ -372,8 +399,12 @@ commitAt = lookupCommit
 prev : Edit                                                     -- the parent
 prev = goto parents
 
-next : Edit                                                     -- the only child
-next = goto kids
+-- Move to the only child. At a tip, `j new` starts a child; when there are
+-- several children, choose one of the candidates with `j by @ID`.
+next : Edit
+next = \repo -> if null (kids repo)
+                then crash "next: this commit has no children; run `j new` to start a new child, or `j tree` to inspect the history"
+                else goto kids repo
 
 tip : Edit                                                      -- end of the line of only-children
 tip = \repo -> tip (next repo) or repo
@@ -399,6 +430,8 @@ eachChild = forEach kids
 guard : (Repo -> Bool) -> Edit                                  -- crash unless p holds
 guard = \p repo -> if p repo then repo else crash "guard"
 
+-- Whether the focused commit has no unresolved files. This says nothing
+-- about unrecorded working-copy edits; inspect those with `j unrecorded`.
 clean : Repo -> Bool
 clean = \repo -> null (conflicted repo.root.files)
 
@@ -437,6 +470,21 @@ rewrite = \f repo ->
 -- Commands
 ------------------------------------------------------------------------------
 
+-- Record the current working-copy edits in the focused commit.
+-- Example: j save; use j status first to inspect unrecorded paths.
+-- This is id restricted to a Repo: the final Repo result triggers recording.
+-- It does not publish anything. `j new` starts a child; `j id` records too.
+save : Edit
+save = id
+
+-- Preview an edit and validate that its result could be recorded, then show
+-- the resulting tree. This returns Text, so it records nothing.
+-- Examples: j 'preview squash'; j 'preview (rebase trunk)'.
+-- This helper is in the reference config. Existing custom configs are not
+-- upgraded automatically; add it there or use `tree . validate . EDIT`.
+preview : Edit -> Repo -> Text
+preview = \edit -> tree . validate . edit
+
 -- Set the message of the focused commit.
 -- Example: j 'describe "fix login"'
 describe : Text -> Edit
@@ -451,7 +499,7 @@ new = \repo -> addChild (newCommit repo.root.files) repo
 -- new empty commit on that parent becomes the focus (the parent may be
 -- immutable, and the focus never is). Refused for a commit the remote has a
 -- name for: push something else under that name first, or forget the name.
--- Example: j abandon; preview first with j 'tree . abandon'.
+-- Example: j abandon; validate a preview first with j 'preview abandon'.
 abandon : Edit
 abandon = \repo ->
   let c = repo.root
@@ -467,7 +515,7 @@ contract = \m repo -> let a = repo.root
                       in at parents (rewrite (\q -> q { files = select m a.files q.files })) repo
 
 -- Fold the focus entirely into its parent; a new empty commit becomes the focus.
--- Example: j squash; preview first with j 'tree . validate . squash'.
+-- Example: j squash; preview first with j 'preview squash'.
 squash : Edit
 squash = abandon . contract everything
 
@@ -484,7 +532,7 @@ split = \m repo ->
   in by x.id (repo { root = a', children = [{ root = x, children = repo.children }] })
 
 -- Move the focused subtree onto another commit. Returns to the moved commit.
--- Example: j 'rebase trunk'; preview with j 'tree . validate . rebase trunk'.
+-- Example: j 'rebase trunk'; preview with j 'preview (rebase trunk)'.
 rebase : Revset -> Edit
 rebase = \rs repo ->
   let d = (goto rs repo).root
@@ -555,13 +603,16 @@ contentAt = lookupContent
 touched : Change -> [Path]
 touched = touchedPaths
 
--- Paths whose content differs between the focus and its parent.
+-- Paths changed by the focused commit compared with its parent, including
+-- the working-copy snapshot. These can remain nonempty after `j save`;
+-- `j unrecorded` shows only working-copy edits not yet recorded.
 -- Example: j changed
 changed : Repo -> [Path]
 changed = \repo -> touched (changeOf repo)
 
--- What the focus changes, rendered by difftastic, one record per changed path.
--- Replace difft with (\p -> diff) to use the built-in unified diff instead.
+-- What the focus changes, one record per changed path. Uses difftastic when
+-- installed; a missing difft falls back to a unified diff with path headers
+-- and 3 context lines, or a binary-files summary.
 diffs : Repo -> [{ path : Path, diff : Text }]
 diffs = \repo ->
   let ch = changeOf repo
@@ -569,23 +620,27 @@ diffs = \repo ->
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
 -- readable in the terminal. A focus that changes nothing reads "no changes";
--- a difft that cannot be run (not on PATH) is a crash saying so, and
--- otherwise whatever difft prints, even nothing, is the page.
--- Example: j review (requires difftastic's difft on PATH).
+-- missing difft uses the built-in unified diff (path headers, 3 context lines)
+-- or a binary-files summary. Other execution errors remain visible; an
+-- installed difft's output, even nothing, is the page.
+-- Example: j review; difftastic is optional.
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo
   in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
--- A summary of the focus.
+-- A summary of the focus. `changed` lists changes in the commit compared
+-- with its parent; `unrecorded` lists working-copy edits not yet recorded.
+-- Inspection does not record anything. Run `j save` to record those edits.
 -- Example: j status
-status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }
+status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path], unrecorded : [Path] }
 status = \repo ->
   { id        = repo.root.id
   , message   = repo.root.message
   , labels    = repo.root.labels
   , changed   = changed repo
-  , conflicts = conflicted repo.root.files }
+  , conflicts = conflicted repo.root.files
+  , unrecorded = unrecorded repo }
 
 -- A summary of every commit, top first, in preorder.
 -- Example: j log

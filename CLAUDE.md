@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`j` is a CLI for Jujutsu (jj) repositories whose interface is a small, pure, dynamically typed functional language. A repository is a value (`Repo`, a zipper over the commit tree), a command is a function `Repo -> Repo`, and the whole user-facing vocabulary (`new`, `describe`, `squash`, `tree`, …) is written *in the language* in `config.j`. The Rust binary supplies only the language, the builtins `config.j` declares, ten reserved commands, and the bridge to jj's on-disk format via `jj-lib` (no `jj` binary needed at runtime).
+`j` is a CLI for Jujutsu (jj) repositories whose interface is a small, pure, dynamically typed functional language. A repository is a value (`Repo`, a zipper over the commit tree), a command is a function `Repo -> Repo`, and the whole user-facing vocabulary (`new`, `describe`, `squash`, `tree`, …) is written *in the language* in `config.j`. The Rust binary supplies only the language, the builtins `config.j` declares, eleven reserved commands, and the bridge to jj's on-disk format via `jj-lib` (no `jj` binary needed at runtime).
 
 ## Commands
 
@@ -21,18 +21,17 @@ There is no devShell in `flake.nix`; `cargo`/`rustc` come from the system. The N
 - `tests/cli.rs`, `tests/remote.rs`, `tests/interop.rs` run the built binary (`CARGO_BIN_EXE_j`) against real repos in temp dirs, each with its own `XDG_CONFIG_HOME`. They need `git` on `PATH`; `interop.rs` also uses the real `jj` binary and skips itself if it is absent.
 - Everything else runs the interpreter over the in-memory `MemBackend` — no repository involved.
 - `tests/laws.rs` and `tests/showprop.rs` are proptest suites; their `*.proptest-regressions` files are checked in on purpose.
-- `difft` is only needed at runtime for `review`/`difft`. `J_GIT` overrides the `git` executable used for fetch.
+- `difft` optionally enhances `review`/`difft`; an absent executable falls back to unified diffs with path headers (binary summaries for non-text content). Other launch errors still fail. `J_GIT` overrides the `git` executable used for fetch.
 
 ## The spec is normative
 
 `specs/main.md` is the specification the implementation was written from, and the code cites it everywhere as `§N.M` (e.g. `§7.5` = persistence). When changing behaviour, find the section first, and keep code, spec, and tests agreeing. `specs/tree.md` is a newer, complete replacement for `§7.11` (the "rails" tree layout) and is what `render.rs` implements.
 
-Known drift to be aware of (not to copy):
-- `§9` of the spec is a verbatim copy of `config.j`, but `config.j` is ahead of it (`touchedPaths`, the extra `treeWith` options, `treeCompact`, `treeData`). **`config.j` is the source of truth**; `docs/base.md` lags the same way.
+`§9` of the spec is a verbatim copy of `config.j`; keep it synchronized when the reference vocabulary changes. **`config.j` is the source of truth** for runnable definitions, and `docs/base.md` documents the same vocabulary.
 
 ## Architecture
 
-One run of `j EXPR` (`src/main.rs::run_expression`, mirroring spec §1.2): load + validate `config.j` → open the repo and take the lock → parse the expression → build the `Repo` value, snapshotting the working directory → resolve `@id` literals → evaluate the config's definitions, then the expression → if the result is a function, apply it to the repo **once** → if the final value is a `Repo` that differs from the one loaded, persist it; otherwise display it and persist nothing. Exit codes: 1 crash, 2 usage/no repo/locked, 3 config or parse error. All work happens on a thread with a 512 MB stack (`main`).
+One run of `j EXPR` (`src/main.rs::run_expression`, mirroring spec §1.2): load + validate `config.j` → open the repo and take the lock → parse the expression → build the `Repo` value, snapshotting the working directory → resolve `@id` literals → evaluate the config's definitions, then the expression → if the result is a function, apply it to the repo **once** → if the final value is a `Repo`, persist only if it differs from the one loaded; display other values without persisting. Exit codes: 1 crash, 2 usage/no repo/locked, 3 config or parse error. All work happens on a thread with a 512 MB stack (`main`).
 
 Language pipeline, all in `src/`:
 - `lex.rs` → `parse.rs` → `ast.rs`: the parser implements the two layout rules and needs the set of global names (`Config::global_names`) so expressions cannot shadow them.
@@ -43,13 +42,18 @@ Language pipeline, all in `src/`:
 - `builtins.rs`: native implementations of the names `config.j` declares without defining.
 - `config.rs`: parses and validates `config.j`, orders definitions by dependency, resolves `@id` literals. Four definitions are read by the binary itself: `user`, `tree`, `immutable`, `labelled`.
 
-`help [NAME]` and `commands [QUERY]` are reserved discovery commands; `--help` and `-h` alias `help` only as the first word. They never open a repository or evaluate config definitions. General and reserved-command help work without config; the custom vocabulary reads config without writing it, using the embedded reference only when no file exists. Keep these paths usable outside a repository and when general help is needed to recover from a broken config.
+`help [NAME]` and `commands [QUERY]` are reserved discovery commands. `--help` and `-h` open help as the first word or as separate argv entries after a command, before evaluation; comments within a single expression argument or stdin retain language semantics. Discovery never opens a repository or evaluates config definitions. General help, reserved-command help, and `help config` work without loading config; the custom vocabulary reads config without writing it, using the embedded reference only when no file exists. Keep these paths usable outside a repository and when help is needed to recover from a broken config. Literal reserved-command arguments retain separate shell argument boundaries; a whole command supplied as one string or stdin is whitespace-split.
+
+Identity validation rejects blank and shipped placeholder values at init, clone, and commit-authoring boundaries. Inspections remain usable without a configured identity. Push never records the working directory: it warns about unrecorded edits before sending recorded content. Undo/redo refuse dirty working copies and explain that `j id` adds an operation before the previously intended undo. Interactive success messages report saved/no-change status and focus, setup identity, or the affected undo/redo operation; plain terminals keep confirmations, while redirected output and CI remain quiet on success.
 
 Repository side:
+- `setup.rs` (binary): explicit first-run configuration, optionally with a supplied identity, using exclusive atomic publication. It never replaces an existing config or opens a repository.
 - `domain.rs`: the `Backend` trait — everything repository-shaped the interpreter needs — plus `MemBackend` (the test double required by spec §10) and snapshot helpers shared by both backends.
 - `jj.rs`: `JjBackend` on `jj-lib`/`gix`: locating the repo, building the `Repo` value, `persist`, the lock, and the reserved commands (`init`, `clone`, `remote`, `fetch`, `push`, `undo`, `redo`, `ops`). Reserved commands are matched on the first word in `main.rs` before any parsing and are not part of the language.
 - `repo.rs`: zipper navigation (`by`) and the persistence validation shared by the `validate` builtin and `JjBackend::persist`, which is what makes `tree . validate . EDIT` an honest dry run.
 - `render.rs`: value display (§5.1) and tree rendering. `show.rs`: `show` (must round-trip through the parser — property-tested), unified diff, and the `difft` subprocess bridge.
+
+The reference `save` is `id`; `preview edit` is `tree . validate . edit`. Validation alone still returns a `Repo` and can persist changes. `unrecorded : Repo -> [Path]` is a native inspection of the invocation's loaded/snapshotted files, independent of later expression edits; status exposes it alongside `changed` (displayed as `in commit`). Help's default catalog shows everyday tasks and a few custom definitions; `commands all` shows every configured name, and queries recognize common Git/task synonyms without presenting unavailable config names as commands. A push with no selected bookmarks records no operation and reports that nothing was published; nonempty pushes report published/deleted/unchanged counts interactively. Saved edits report conflict recovery guidance even when output is redirected.
 
 ### `config.j` is code, and it is embedded
 

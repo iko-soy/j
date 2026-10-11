@@ -29,6 +29,12 @@ pub struct ImmutabilityInfo {
 }
 
 pub trait Backend {
+    /// Refuse an edit that cannot be authored with the backend's current
+    /// configuration. In-memory repositories have no authoring requirement.
+    fn validate_authoring(&self) -> Result<(), Crash> {
+        Ok(())
+    }
+
     /// All visible change ids (full), for resolving `@prefix` literals.
     fn visible_ids(&self) -> Vec<String>;
     /// All visible ids beginning with `prefix`.

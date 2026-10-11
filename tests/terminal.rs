@@ -1,5 +1,5 @@
-//! Interactive presentation uses real terminal descriptors; pipes and opt-outs
-//! must keep the CLI suitable for scripts (§1.4).
+//! Interactive presentation uses real terminal descriptors; pipes stay quiet,
+//! and color opt-outs preserve useful plain confirmations (§1.4–1.5).
 
 #![cfg(unix)]
 
@@ -428,6 +428,176 @@ fn terminal_motion_respects_environment_opt_outs() {
         } else if key == "J_ANIMATIONS" {
             assert!(out.stderr.contains("\x1b["), "motion opt-out also disabled color");
         }
+    }
+}
+
+#[test]
+fn color_opt_outs_keep_plain_success_confirmations() {
+    for (key, value) in [("NO_COLOR", "1"), ("TERM", "dumb")] {
+        let fixture = Fixture::new();
+        let mut command = fixture.slow_clone(false);
+        command.env(key, value);
+        let out = capture(command, true, true);
+        assert_eq!(out.code, 0, "{key}={value}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "unexpected stdout: {:?}", out.stdout);
+        assert!(out.stderr.contains("j: Repository cloned"), "missing success confirmation: {:?}", out.stderr);
+        assert!(!out.stderr.contains('\x1b'), "{key}={value}: {:?}", out.stderr);
+        assert_no_motion(&out);
+        assert!(fixture.dir.join("clone/.jj").is_dir());
+    }
+}
+
+#[test]
+fn noninteractive_runs_keep_success_confirmations_quiet() {
+    let fixture = Fixture::new();
+    fixture.init();
+    for (stdout_tty, stderr_tty) in [(false, true), (true, false), (false, false)] {
+        let out = capture(fixture.command(&["id"]), stdout_tty, stderr_tty);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.is_empty(), "unexpected stdout: {:?}", out.stdout);
+        assert!(out.stderr.is_empty(), "unexpected confirmation: {:?}", out.stderr);
+    }
+    let mut command = fixture.command(&["id"]);
+    command.env("CI", "1");
+    let out = capture(command, true, true);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "unexpected stdout: {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "unexpected CI confirmation: {:?}", out.stderr);
+}
+
+#[test]
+fn edit_confirmations_identify_changes_and_the_resulting_focus() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let confirmation = |expression: &str, expected: &str, description: &str| {
+        let mut command = fixture.command(&[expression]);
+        command.env("NO_COLOR", "1");
+        let out = capture(command, true, true);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.is_empty(), "unexpected stdout: {:?}", out.stdout);
+        assert_no_motion(&out);
+        assert!(out.stderr.starts_with(&format!("j: {expected}; focus @")), "{}", out.stderr);
+        assert!(out.stderr.ends_with(&format!(" {description}\n")), "{}", out.stderr);
+        let focus = out.stderr.split("; focus ").nth(1).unwrap()
+            .split_whitespace().next().unwrap().to_owned();
+        assert!(focus.len() >= 5, "focus prefix is too short: {focus}");
+        let full = fixture.command(&["\\r -> show r.root.id"]).output().unwrap();
+        assert!(full.status.success(), "{}", String::from_utf8_lossy(&full.stderr));
+        assert!(String::from_utf8(full.stdout).unwrap().starts_with(&focus));
+        focus
+    };
+    let initial = confirmation("describe \"Fix login\"", "Saved changes", "Fix login");
+    assert_eq!(confirmation("describe \"Fix login\"", "No changes", "Fix login"), initial);
+    let next = confirmation("new", "Saved changes", "(no description)");
+    assert_ne!(next, initial, "new did not report the resulting focus");
+    std::fs::write(fixture.dir.join("file.txt"), "a working-copy change\n").unwrap();
+    assert_eq!(confirmation("id", "Saved changes", "(no description)"), next);
+    assert_eq!(confirmation("id", "No changes", "(no description)"), next);
+}
+
+#[test]
+fn conflicting_edits_report_paths_and_a_working_recovery_sequence() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let run = |expr: &str| {
+        let out = fixture.command(&[expr]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    std::fs::write(fixture.dir.join("settings.txt"), "base\n").unwrap();
+    run("describe \"base\"");
+    run("new");
+    std::fs::write(fixture.dir.join("settings.txt"), "left\n").unwrap();
+    run("describe \"left\"");
+    run("new . prev");
+    std::fs::write(fixture.dir.join("settings.txt"), "right\n").unwrap();
+    run("describe \"right\"");
+
+    let mut command = fixture.command(&["rebase siblings"]);
+    command.env("NO_COLOR", "1");
+    let out = capture(command, true, true);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for expected in ["Saved changes", "1 unresolved file(s)", "settings.txt", "j conflicts", "j id"] {
+        assert!(out.stderr.contains(expected), "missing {expected}: {}", out.stderr);
+    }
+    assert!(std::fs::read_to_string(fixture.dir.join("settings.txt")).unwrap().contains("<<<<<<<"));
+    assert_no_motion(&out);
+
+    std::fs::write(fixture.dir.join("settings.txt"), "resolved\n").unwrap();
+    let out = run("save");
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(run("show . conflicts").stdout).unwrap().trim(), "[]");
+}
+
+#[test]
+fn empty_push_explains_that_nothing_was_published() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let mut command = fixture.command(&["push relabel"]);
+    command.env("NO_COLOR", "1");
+    let out = capture(command, true, true);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("No bookmarks selected; nothing published"), "{}", out.stderr);
+    assert!(out.stderr.contains("push (label \"feature\" here)"), "{}", out.stderr);
+    assert!(!out.stderr.contains("Push complete"), "{}", out.stderr);
+    assert_no_motion(&out);
+}
+
+#[test]
+fn push_confirmations_count_published_unchanged_and_deleted_bookmarks() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let remote = fixture.root.path().join("origin.git");
+    let output = Command::new("git").args(["init", "--bare", "-q"])
+        .arg(&remote).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    for args in [vec!["describe \"feature\""], vec!["remote", remote.to_str().unwrap()]] {
+        let output = fixture.command(&args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    for (expression, counts) in [
+        ("push (label \"feature\" here)", "1 published, 0 deleted, 0 unchanged"),
+        ("push (label \"feature\" here)", "0 published, 0 deleted, 1 unchanged"),
+        ("push (unlabel \"feature\")", "0 published, 1 deleted, 0 unchanged"),
+    ] {
+        let mut command = fixture.command(&[expression]);
+        command.env("NO_COLOR", "1");
+        let out = capture(command, true, true);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stderr.contains(counts), "{}", out.stderr);
+        assert_no_motion(&out);
+    }
+}
+
+#[test]
+fn undo_redo_confirmations_name_the_affected_edit_and_restored_focus() {
+    let fixture = Fixture::new();
+    fixture.init();
+    let focus_id = || {
+        let out = fixture.command(&["\\r -> show r.root.id"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let original_id = focus_id();
+    let expression = "describe \"Next task\" . new";
+    let edit = fixture.command(&[expression]).output().unwrap();
+    assert!(edit.status.success(), "{}", String::from_utf8_lossy(&edit.stderr));
+    let next_id = focus_id();
+    assert_ne!(original_id, next_id);
+    for (command, action, id, title) in [
+        ("undo", "Undid", &original_id, "(no description)"),
+        ("redo", "Redid", &next_id, "Next task"),
+        ("undo", "Undid", &original_id, "(no description)"),
+        ("redo", "Redid", &next_id, "Next task"),
+    ] {
+        let mut command = fixture.command(&[command]);
+        command.env("NO_COLOR", "1");
+        let out = capture(command, true, true);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.is_empty(), "unexpected stdout: {:?}", out.stdout);
+        assert_eq!(out.stderr, format!("j: {action} `{expression}`; restored focus {id} {title}\n"));
+        assert_eq!(&focus_id(), id);
+        assert_no_motion(&out);
     }
 }
 

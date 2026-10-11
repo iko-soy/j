@@ -12,6 +12,7 @@ macro_rules! report {
 pub mod ast;
 pub mod builtins;
 pub mod config;
+pub mod diagnostics;
 pub mod domain;
 pub mod eval;
 pub mod lex;

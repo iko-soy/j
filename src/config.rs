@@ -40,7 +40,7 @@ const RESERVED_BUILTINS: &[&str] = &[
     ">=", "show", "::", "map", "filter", "length", "null", "head", "tail", "last", "nth", "take",
     "drop", "member", "range", "foldl", "concat", "++", "startsWith", "endsWith", "splitOn",
     "replay", "unresolved", "blob", "blobHex", "text", "by", "meta", "validate", "diff", "difft", "treeWith",
-    "extract", "touchedPaths", "subtreeCommits", "lookupCommit", "lookupContent",
+    "extract", "touchedPaths", "unrecorded", "subtreeCommits", "lookupCommit", "lookupContent",
 ];
 
 pub fn is_reserved_builtin(name: &str) -> bool {

@@ -197,6 +197,16 @@ pub fn is_commit(interp: &Interp, v: &Value) -> bool {
 // ----------------------------------------------------------------------
 
 pub fn display(interp: &mut Interp, v: &Value, color: bool) -> Result<String, Crash> {
+    display_with_width(interp, v, color, tty_width())
+}
+
+/// Display column tables as if stdout had this width; `None` preserves full cells.
+pub fn display_with_width(
+    interp: &mut Interp,
+    v: &Value,
+    color: bool,
+    term_w: Option<usize>,
+) -> Result<String, Crash> {
     let pal = Palette { on: color };
     let mut out = String::new();
     let mut loaded = None;
@@ -204,7 +214,7 @@ pub fn display(interp: &mut Interp, v: &Value, color: bool) -> Result<String, Cr
     while let Some(block) = todo.pop() {
         match block {
             Block::Of(v, indent) => {
-                display_block(interp, &v, &pal, indent, &mut out, &mut loaded, &mut todo)?
+                display_block(interp, &v, &pal, indent, &mut out, &mut loaded, &mut todo, term_w)?
             }
             Block::Items { xs, next, indent } => {
                 if let Some(x) = xs.get(next).cloned() {
@@ -861,6 +871,7 @@ fn has_conflict(c: &Value) -> Result<bool, Crash> {
 }
 
 /// `v` in block form, the blocks it holds left on `todo` (see `Block`)
+#[allow(clippy::too_many_arguments)]
 fn display_block(
     interp: &mut Interp,
     v: &Value,
@@ -869,6 +880,7 @@ fn display_block(
     out: &mut String,
     loaded: &mut Option<Loaded>,
     todo: &mut Vec<Block>,
+    term_w: Option<usize>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
     let v = &v.forced()?;
@@ -899,7 +911,7 @@ fn display_block(
             }
             return Ok(());
         }
-        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out, loaded, todo),
+        Value::List(xs) => return display_list_block(interp, xs, pal, indent, out, loaded, todo, term_w),
         Value::Record(_) => {}
     }
     if let Some(shape) = shape_of_record(interp, v) {
@@ -921,7 +933,7 @@ fn display_block(
                     ("children", v.field("children")?),
                     ("context", Value::list(vec![])),
                 ]);
-                let text = tree_render(interp, &opts, &repo, pal, false, tty_width())?;
+                let text = tree_render(interp, &opts, &repo, pal, false, term_w)?;
                 out.push_str(&indent_multiline(&text, indent));
                 return Ok(());
             }
@@ -977,11 +989,37 @@ fn display_fields(
     todo: &mut Vec<Block>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
+    let status = (m.len() == 5
+        || (m.len() == 6 && matches!(m.get("unrecorded"), Some(Value::List(_)))))
+        && matches!(m.get("id"), Some(Value::Id(_)))
+        && matches!(m.get("message"), Some(Value::Text(_)))
+        && ["changed", "conflicts", "labels"].iter()
+            .all(|key| matches!(m.get(*key), Some(Value::List(_))));
     let from = after.map_or(Bound::Unbounded, Bound::Excluded);
     for (k, x) in m.range::<str, _>((from, Bound::Unbounded)) {
         out.push_str(&pad);
-        out.push_str(&pal.field(&pad_right(k, name_w)));
+        let label = if status && m.contains_key("unrecorded") && k == "changed" {
+            "in commit"
+        } else {
+            k.as_str()
+        };
+        out.push_str(&pal.field(&pad_right(label, name_w)));
         out.push_str("  ");
+        if status {
+            let empty = match (k.as_str(), x) {
+                ("changed", Value::List(xs)) if xs.is_empty() => Some("No changes"),
+                ("unrecorded", Value::List(xs)) if xs.is_empty() => Some("All edits recorded"),
+                ("conflicts", Value::List(xs)) if xs.is_empty() => Some("No conflicts"),
+                ("labels", Value::List(xs)) if xs.is_empty() => Some("No labels"),
+                ("message", Value::Text(s)) if s.is_empty() => Some("No description"),
+                _ => None,
+            };
+            if let Some(text) = empty {
+                out.push_str(&pal.dim(text));
+                out.push('\n');
+                continue;
+            }
+        }
         // lists print in block form under their key (§5.1)
         if matches!(x, Value::List(xs) if !xs.is_empty()) {
             out.push('\n');
@@ -1258,6 +1296,7 @@ fn top_of(interp: &Interp, _x: &Value) -> Result<Value, Crash> {
 }
 
 /// `list` in block form, the blocks it holds left on `todo` (see `Block`)
+#[allow(clippy::too_many_arguments)]
 fn display_list_block(
     interp: &mut Interp,
     list: &ListVal,
@@ -1266,6 +1305,7 @@ fn display_list_block(
     out: &mut String,
     loaded: &mut Option<Loaded>,
     todo: &mut Vec<Block>,
+    term_w: Option<usize>,
 ) -> Result<(), Crash> {
     let xs: &[Value] = list;
     let pad = " ".repeat(indent);
@@ -1395,7 +1435,7 @@ fn display_list_block(
                 }
                 return Ok(());
             }
-            return display_table(interp, xs, pal, indent, out, loaded);
+            return display_table(interp, xs, pal, indent, out, loaded, term_w);
         }
     }
     // list of other scalars
@@ -1420,17 +1460,36 @@ fn display_table(
     indent: usize,
     out: &mut String,
     loaded: &mut Option<Loaded>,
+    term_w: Option<usize>,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
     let fields: Vec<String> = field_set(&xs[0]).unwrap().into_iter().collect();
+    // IDs must distinguish both stored commits and IDs created by this expression.
+    let mut ids: Vec<String> = xs.iter().flat_map(|x| fields.iter().filter_map(|f| {
+        match x.field(f) { Ok(Value::Id(id)) => Some(id.to_string()), _ => None }
+    })).collect();
+    ids.sort();
+    ids.dedup();
+    let mut fixed = vec![false; fields.len()];
     // cells
     let mut rows: Vec<Vec<String>> = Vec::new();
     for x in xs {
         let mut row = Vec::new();
-        for f in &fields {
+        for (column, f) in fields.iter().enumerate() {
             let cell = match x.field(f)? {
                 Value::Bool(true) => pal.green("✓"),
                 Value::Bool(false) => String::new(),
+                Value::Id(id) => {
+                    fixed[column] = true;
+                    let stored = interp.unique_prefix(&id);
+                    let shown = crate::eval::unique_prefix_in(&ids, &id);
+                    let prefix = if stored.len() > shown.len() { stored } else { shown };
+                    pal.id(&format!("@{}", prefix))
+                }
+                Value::List(values) if values.iter().all(|v| matches!(v, Value::Text(_))) => {
+                    values.iter().map(|v| v.as_text().map(first_line))
+                        .collect::<Result<Vec<_>, _>>()?.join(", ")
+                }
                 other => display_line(interp, &other, pal, loaded)?,
             };
             row.push(cell);
@@ -1441,7 +1500,7 @@ fn display_table(
     let keep: Vec<usize> = (0..fields.len())
         .filter(|&i| rows.iter().any(|r| !r[i].is_empty()))
         .collect();
-    let widths: Vec<usize> = keep
+    let mut widths: Vec<usize> = keep
         .iter()
         .map(|&i| {
             rows.iter()
@@ -1451,6 +1510,40 @@ fn display_table(
                 .max(width(&fields[i]))
         })
         .collect();
+    if let Some(terminal) = term_w {
+        let available = terminal.saturating_sub(indent);
+        let gaps = keep.len().saturating_sub(1) * 3;
+        let minimum: Vec<usize> = keep.iter().zip(&widths).map(|(&i, &w)| {
+            if fixed[i] { w } else { w.min(width(&fields[i]).max(6)) }
+        }).collect();
+        if minimum.iter().sum::<usize>() + gaps > available {
+            // A narrow terminal cannot hold the headers and identifiers side by
+            // side. Keep a small nesting inset below the parent key, instead of
+            // letting a long parent field name consume the entire line width.
+            let inset = indent.min(2).min(terminal / 4);
+            let pad = " ".repeat(inset);
+            let available = terminal.saturating_sub(inset);
+            for (n, row) in rows.iter().enumerate() {
+                if n > 0 { out.push('\n'); }
+                for &i in &keep {
+                    let text = format!("{}: {}", pal.field(&fields[i]), row[i]);
+                    for line in wrap_display_text(&text, available.max(1)) {
+                        out.push_str(&pad);
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mut excess = (widths.iter().sum::<usize>() + gaps).saturating_sub(available);
+        while excess > 0 {
+            let column = (0..widths.len()).filter(|&i| widths[i] > minimum[i])
+                .max_by_key(|&i| widths[i]).expect("minimum widths fit");
+            widths[column] -= 1;
+            excess -= 1;
+        }
+    }
     // header
     out.push_str(&pad);
     let header: Vec<String> = keep
@@ -1465,7 +1558,7 @@ fn display_table(
         let cells: Vec<String> = keep
             .iter()
             .zip(&widths)
-            .map(|(&i, w)| pad_right(&r[i], *w))
+            .map(|(&i, w)| pad_right(&cut_to_width(&r[i], *w), *w))
             .collect();
         out.push_str(&cells.join("   "));
         out.push('\n');
@@ -2459,6 +2552,7 @@ fn draw_rows(
     term_w: Option<usize>,
 ) -> Result<String, Crash> {
     let rail_chars = 2 * lanes_n;
+    let overflow = placements.iter().any(|p| p.flattened);
     // each row's rails, drawn once; a run row's go on past the rails area
     // when its count does not fit
     let mut rail_state = vec![None; lanes_n];
@@ -2491,7 +2585,7 @@ fn draw_rows(
     for (i, n) in rows.iter().enumerate() {
         texts.push(build_row_text(n, index.focus_adjacent[i], opts, pal, with_focus, prefix_len, id_w));
     }
-    // Columns 4–8 start at the same offset on every row (§Step 4). The size
+    // Columns 5–9 start at the same offset on every row (§Step 4). The size
     // bar's column is there when any row draws a bar — ` ▅`, two columns —
     // and blank on the rows that draw none, so a bar never shifts a message.
     let bar_col = texts.iter().any(|t| !t.bar.is_empty());
@@ -2509,6 +2603,17 @@ fn draw_rows(
             _ => None,
         };
         line.push_str(&color_rails(chars, lane0, pal, glyph));
+        if overflow {
+            let status = if pl.flattened {
+                let glyph = n.commit().map(|c| {
+                    pal.code(glyph_ansi(c), glyph_for(c, opts.icons))
+                }).unwrap_or_default();
+                format!("» {}", glyph)
+            } else {
+                String::new()
+            };
+            line.push_str(&pad_right(&status, 4));
+        }
         line.push(' ');
         line.push_str(&t.id);
         if bar_col {
@@ -2596,6 +2701,8 @@ fn draw_rows(
             pad_to(&mut line, meta_off);
             line.push_str(&metas[idx]);
         }
+        // Remove layout padding, while preserving spaces in detail paths below.
+        while line.ends_with(' ') { line.pop(); }
         // the whole focus row is highlighted with a background band across the
         // full terminal width (§Colour; colour only — the ▶ gutter still marks
         // the focus when colour is off)
@@ -2621,6 +2728,7 @@ fn draw_rows(
             let mut dline = String::new();
             dline.push_str("  ");
             dline.push_str(&color_rails(&dchars, &dlane0, pal, None));
+            if overflow { dline.push_str("    "); }
             dline.push(' ');
             // the marks start two columns into the id column (§Step 4)
             dline.push_str("  ");
@@ -2639,19 +2747,18 @@ fn draw_rows(
                     format!("{} {}", colored, p)
                 })
                 .collect();
-            dline.push_str(&marks.join("   "));
-            lines.push(dline);
-        }
-    }
-    // no trailing whitespace on any row
-    for l in lines.iter_mut() {
-        while l.ends_with(' ') {
-            l.pop();
+            let detail_lines = match term_w {
+                Some(w) => wrap_detail_items(&marks, w.saturating_sub(width(&dline)).max(1)),
+                None => vec![marks.join("   ")],
+            };
+            for text in detail_lines {
+                lines.push(format!("{}{}", dline, text));
+            }
         }
     }
     // Legend (§Legend): explain the symbols that actually appear, faintly, on
     // the right of the tree if it fits the terminal width, else at the bottom.
-    append_legend(&mut lines, rows, opts, pal, term_w);
+    append_legend(&mut lines, rows, opts, pal, term_w, overflow);
     let mut out = lines.join("\n");
     out.push('\n');
     Ok(out)
@@ -2664,10 +2771,11 @@ struct UsedSymbols {
     run: bool,                 // a ╎ n run row
     collapsed: bool,           // a ⋯ n collapsed node
     focus_gutter: bool,        // ▶ present (a focus row exists)
+    overflow: bool,            // separate » status column
     detail_marks: Vec<char>,   // + ~ − ✖ present in the focus's detail line
 }
 
-fn collect_used(rows: &[&Display], opts: &TreeOptions, icons: bool) -> UsedSymbols {
+fn collect_used(rows: &[&Display], opts: &TreeOptions, icons: bool, overflow: bool) -> UsedSymbols {
     let mut present: BTreeSet<&'static str> = BTreeSet::new();
     let mut run = false;
     let mut collapsed = false;
@@ -2706,6 +2814,7 @@ fn collect_used(rows: &[&Display], opts: &TreeOptions, icons: bool) -> UsedSymbo
         collapsed,
         focus_gutter,
         detail_marks: marks.into_iter().collect(),
+        overflow,
     }
 }
 
@@ -2741,6 +2850,9 @@ fn legend_lines(used: &UsedSymbols) -> Vec<String> {
     if used.focus_gutter {
         out.push("▶ current commit".to_string());
     }
+    if used.overflow {
+        out.push("» branch exceeds lane limit; increase lanes".to_string());
+    }
     if used.run {
         out.push("╎ n run of n commits".to_string());
     }
@@ -2763,8 +2875,9 @@ fn append_legend(
     opts: &TreeOptions,
     pal: &Palette,
     tty_width: Option<usize>,
+    overflow: bool,
 ) {
-    let used = collect_used(rows, opts, opts.icons);
+    let used = collect_used(rows, opts, opts.icons, overflow);
     let entries = legend_lines(&used);
     if entries.is_empty() {
         return;
@@ -2874,8 +2987,6 @@ fn rail_row(
             }
         } else if state[i].is_some() {
             '│'
-        } else if pl.flattened && i == lanes_n - 1 {
-            '»'
         } else {
             ' '
         };
@@ -2961,6 +3072,61 @@ fn color_rails(
         }
     }
     s
+}
+
+/// Wrap without dropping text or splitting ANSI sequences. Close and reopen
+/// active styles at row boundaries so continuation prefixes stay unstyled.
+fn wrap_display_text(text: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    let mut active = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            let mut escape = String::from(c);
+            for e in chars.by_ref() {
+                escape.push(e);
+                if e == 'm' { break; }
+            }
+            if escape == "\x1b[0m" { active.clear(); } else { active.push_str(&escape); }
+            line.push_str(&escape);
+            continue;
+        }
+        let cells = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > 0 && used + cells > limit {
+            if !active.is_empty() { line.push_str("\x1b[0m"); }
+            lines.push(line);
+            line = active.clone();
+            used = 0;
+        }
+        line.push(c);
+        used += cells;
+    }
+    if !active.is_empty() { line.push_str("\x1b[0m"); }
+    lines.push(line);
+    lines
+}
+
+/// Keep whole detail items together when possible; split only an item that
+/// cannot fit on an otherwise empty continuation row.
+fn wrap_detail_items(items: &[String], limit: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for item in items {
+        if !line.is_empty() && width(&line) + 3 + width(item) <= limit {
+            line.push_str("   ");
+            line.push_str(item);
+            continue;
+        }
+        if !line.is_empty() { lines.push(std::mem::take(&mut line)); }
+        let mut parts = wrap_display_text(item, limit);
+        line = parts.pop().unwrap_or_default();
+        lines.extend(parts);
+    }
+    if !line.is_empty() { lines.push(line); }
+    lines
 }
 
 /// `s` cut to display width `w`, ending with `…` when anything is cut (and

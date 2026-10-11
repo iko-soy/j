@@ -1124,7 +1124,7 @@ fn a_run_count_runs_on_into_the_id_column() {
             let ctx = format!("lanes {}\n{}", lanes, text);
             assert_eq!(text.lines().next(), Some("  ╎ 123"), "{}", ctx);
             // the rest of the count fits the id column as it is
-            assert_eq!(id_cols(&text), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "{}", ctx);
+            assert_eq!(id_cols(&text), vec![2 + 2 * lanes + 1 + if lanes < 3 { 4 } else { 0 }; WORKED_ROWS.len()], "{}", ctx);
             assert!(row_of(&text, "@aaaa").contains("@aaaa ▅  add parser"), "{}", ctx);
         }
     });
@@ -1165,7 +1165,7 @@ fn an_icons_glyph_fills_both_columns_of_its_lane() {
         let plain = tree_text(&mut i, &cfg, &src(false), repo.clone());
         let icons = tree_text(&mut i, &cfg, &src(true), repo);
         assert_eq!(id_cols(&icons), id_cols(&plain), "lanes {}\n{}\n{}", lanes, plain, icons);
-        assert_eq!(id_cols(&icons), vec![2 + 2 * lanes + 1; WORKED_ROWS.len()], "lanes {}\n{}", lanes, icons);
+        assert_eq!(id_cols(&icons), vec![2 + 2 * lanes + 1 + if lanes < 3 { 4 } else { 0 }; WORKED_ROWS.len()], "lanes {}\n{}", lanes, icons);
     }
 }
 
@@ -1408,17 +1408,17 @@ fn a_flattened_last_child_of_the_trunk_head_ends_lane_0() {
     let want = [
         (1, shapes(&[
             ("◆", "@khhh head main"),
-            ("│", "@kxxx older"),
-            ("│", "@kyyy newer"),
-            ("»", "@kvvv on-older"),
-            ("»", "@kwww on-newer"),
+            ("│", "» ○ @kxxx older"),
+            ("│", "» ○ @kyyy newer"),
+            ("", "» ○ @kvvv on-older"),
+            ("", "» ○ @kwww on-newer"),
         ])),
         (2, shapes(&[
             ("◆", "@khhh head main"),
             ("├─○", "@kxxx older"),
-            ("│ │", "@kyyy newer"),
+            ("│ │", "» ○ @kyyy newer"),
             ("  ○", "@kvvv on-older"),
-            ("  »", "@kwww on-newer"),
+            ("", "» ○ @kwww on-newer"),
         ])),
     ];
     for (lanes, want) in want {
@@ -1447,7 +1447,7 @@ fn the_worked_example_ends_lane_0_at_ptlm_on_fewer_lanes() {
     // `wqzt`'s) and at lanes = 1, and lane 0 went on past it to the bottom.
     // It ends on `ptlm`'s row, "and then empty", as at lanes = 3.
     let want: [(usize, [&str; 9]); 2] = [
-        (1, ["  ╎", "  ◆", "  ◆", "  │", "▶ │", "  │", "  │", "  »", "  »"]),
+        (1, ["  ╎", "  ◆", "  ◆", "  │", "▶ │", "  │", "  │", "", ""]),
         (2, ["  ╎ 14", "  ◆─╮", "  ◆ │", "  │ ○", "▶ ├─⊗", "  │ │", "  │ │", "    │", "    ○"]),
     ];
     for (lanes, want) in want {
@@ -1513,7 +1513,7 @@ fn a_run_count_never_covers_a_rail() {
         assert_eq!(lines[2], run, "lanes {}\n{}", lanes, text);
         // the id column is where it is without the count
         let id = col_of(row_of(&text, "@kggg"), "@kggg");
-        assert_eq!(id, 2 + 2 * lanes + 1, "lanes {}\n{}", lanes, text);
+        assert_eq!(id, 2 + 2 * lanes + 1 + if lanes <= 3 { 4 } else { 0 }, "lanes {}\n{}", lanes, text);
     }
 }
 
@@ -1693,4 +1693,73 @@ fn truncation_survives_mixed_scripts() {
             assert!(row.contains("  lbl"), "msg={:?} w={} -> {:?}", msg, w, row);
         }
     }
+}
+
+
+#[test]
+fn overflow_preserves_state_even_when_every_rail_is_occupied() {
+    // At two lanes the worked example's empty ptlm overflows while the
+    // conflict's branch is still live. Neither state nor rails may vanish.
+    for icons in [false, true] {
+        let (repo, be) = worked_example();
+        let (mut i, cfg) = make_interp(be);
+        let text = tree_text(&mut i, &cfg, &format!("treeWith ({})", lanes_opts(2, icons)), repo);
+        let row = row_of(&text, "@ptlm");
+        assert!(row.contains(if icons { "» 🫙" } else { "» ◌" }), "{text}");
+        assert_eq!(upto_col(row, 6), "  │ │ ", "{text}");
+        assert!(text.contains("» branch exceeds lane limit; increase lanes"), "{text}");
+        assert!(id_cols(&text).iter().all(|&column| column == 11), "{text}");
+    }
+    // At one lane the conflicting focus itself overflows; it must retain
+    // both the monochrome conflict glyph and the focus gutter.
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let text = tree_text(&mut i, &cfg, &format!("treeWith ({})", lanes_opts(1, false)), repo);
+    let row = row_of(&text, "@wqzt");
+    assert!(row.starts_with("▶ │ ") && row.contains("» ⊗"), "{text}");
+}
+
+#[test]
+fn terminal_detail_paths_wrap_without_losing_paths_or_live_rails() {
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let paths = ["src/123456789012 long_filename.rs", "src/第二个很长的文件名.rs"];
+    let focus = commit("kaaaaaaa", "focus", &[], paths.iter().map(|&p| (p, "x")).collect());
+    let child = commit("kbbbbbbb", "child", &[], paths.iter().map(|&p| (p, "x")).collect());
+    let repo = repo_of(root, vec![subtree(focus, vec![subtree(child, vec![])])], Some(0));
+    let (mut i, cfg) = make_interp(backend_with(vec![
+        meta(ROOT_ID, "R", 1), meta("kaaaaaaa", "A", 2), meta("kbbbbbbb", "A", 3),
+    ]));
+    let options = ONE_ROW_OPTS.replace("detail = 1", "detail = 2");
+    let rows = rows_on_terminal(&mut i, &cfg, &options, &repo, 32);
+    let start = rows.iter().position(|line| line.contains("@kaaa")).unwrap() + 1;
+    let end = rows.iter().position(|line| line.contains("@kbbb")).unwrap();
+    let detail = &rows[start..end];
+    assert!(detail.len() > 2, "{rows:?}");
+    assert!(detail.iter().all(|line| j::render::width(line) <= 32), "{rows:?}");
+    let prefix = upto_col(&detail[0], 13);
+    assert!(prefix.contains('│'), "{rows:?}");
+    assert!(detail.iter().all(|line| upto_col(line, 13) == prefix), "{rows:?}");
+    let contents: String = detail.iter().map(|line| between_cols(line, 13, usize::MAX)).collect();
+    for path in paths { assert!(contents.contains(path), "{contents}"); }
+    let pipe = tree_text(&mut i, &cfg, &format!("treeWith ({options})"), repo);
+    assert!(pipe.lines().any(|line| paths.iter().all(|path| line.contains(path))), "{pipe}");
+}
+
+
+#[test]
+fn default_four_lanes_explain_overflow_without_hiding_empty_state() {
+    let mut branch = subtree(commit("kzaaaaaa", "end", &[], vec![]), vec![]);
+    for depth in (0..6).rev() {
+        let letter = (b'a' + depth) as char;
+        branch = subtree(
+            commit(&format!("k{letter}aaaaaa"), &format!("level {depth}"), &[], vec![]),
+            vec![branch, subtree(commit(&format!("l{letter}aaaaaa"), "sibling", &[], vec![]), vec![])],
+        );
+    }
+    let repo = repo_of(commit(ROOT_ID, "", &[], vec![]), vec![branch], None);
+    let (mut i, cfg) = make_interp(MemBackend::new());
+    let text = tree_text(&mut i, &cfg, "tree", repo);
+    let row = row_of(&text, "@keaa");
+    assert!(row.starts_with("  │ │ │ │ » ◌"), "{text}");
+    assert!(text.contains("» branch exceeds lane limit; increase lanes"), "{text}");
 }

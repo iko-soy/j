@@ -47,6 +47,13 @@ user = { name = "Your Name", email = "you@example.com" }
 
 This is a plain value, not a function. Its signature is checked once, at load
 (§4.13): if you write `user = 5`, `j` refuses to start (exit 3).
+Creating a repository or saving changes also rejects empty fields and the
+reference placeholders. Use your own name and email before `j init`,
+`j clone`, or an edit that saves changes. `j help config` shows your actual
+config path and an example, even if the config is broken.
+For a new installation, `j setup 'Your actual name' you@your-domain.example`
+creates the complete config with that identity. It never overwrites an
+existing file.
 
 ### 1.2 Paths, labels, entries, snapshots
 
@@ -177,6 +184,34 @@ id 42                 => 42
 (id . id) 7           => 7
 edit or id                          -- run edit, keep the repository if it crashes
 ```
+
+### `save` — record file edits
+
+```
+save : Edit
+```
+
+The identity edit, with a name for the everyday action: `j save` records the
+working-directory snapshot without changing the commit's description or
+focus. It creates no operation when nothing changed. `j id` does the same.
+
+### `preview` — validate an edit without saving
+
+```
+preview : Edit -> Repo -> Text
+```
+
+Apply the edit, validate its result, and render the resulting tree. Because
+the final value is text, no edit or working-directory snapshot is recorded.
+Validation errors report why the edit could not be saved.
+
+```
+j 'preview squash'
+j 'preview (rebase trunk)'
+```
+
+This is the convenient form of `tree . validate . EDIT`. `validate . EDIT`
+alone returns a repository and saves it.
 
 ### `const` — constant function
 
@@ -522,7 +557,7 @@ meta @wqzt      =>  { hash = "74bee64e…", author = "Test User",
                       email = "test@example.com", time = 1789457265 }
 ```
 
-### `validate` — dry-run persistence
+### `validate` — check whether persistence would succeed
 
 ```
 validate : Repo -> Repo
@@ -530,7 +565,12 @@ validate : Repo -> Repo
 
 Returns the repo unchanged if persisting it would succeed; otherwise crashes
 with exactly the error persistence would produce (shape, root, labels, immutability,
-focus). `tree . validate . rebase trunk` is an honest dry run.
+focus). A changed repository also checks that the author identity is configured;
+an unchanged repository can still be inspected with the default identity.
+`tree . validate . rebase trunk` is an honest dry run.
+`validate . rebase trunk` alone saves the result: `validate` returns the same
+repository it was given, not the repository from before the edit. Prefer
+`preview (rebase trunk)` for the complete safe-preview expression.
 
 ### `diff` and `difft` — rendering differences
 
@@ -548,26 +588,33 @@ diff (blob "a\nb\n") (blob "a\nc\n")
 ```
 
 `difft p a b` renders the comparison with **difftastic**, treating the input
-as the file `p` (its last component guides language detection). Needs `difft`
-on `PATH` (the Nix package provides it); options via `DFT_*` environment
-variables. Crashes naming the tool if absent. A `difft` that runs and fails
-is not an error: what it printed, even nothing, is the result, and what it
-says on stderr reaches the terminal.
+as the file `p` (its last component guides language detection), using options
+from `DFT_*` environment variables. The Nix package provides `difft`.
+When the executable is missing, the builtin returns a unified diff with
+`a/` and `b/` path headers and three lines of context; binary content receives
+a difference summary. Other launch failures are crashes naming the tool and
+OS error. A `difft` that runs and fails is not an error: what it printed,
+even nothing, is the result, and what it says on stderr reaches the terminal.
 
 ### `treeWith` — the history tree
 
 ```
-treeWith : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text }
+treeWith : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text,
+             lanes : Int, author : Bool, date : Bool, files : Bool }
            -> Repo -> Text
 ```
 
 Renders the history as a tree with an options record. The reference config
-provides two ready-made settings, `tree` and `treeFull` (§9).
+provides ready-made settings, including `tree` and `treeFull` (§10).
 
 ```
-treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = "auto" })
+treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
     -- a full tree with ages and authors in the margin
 ```
+
+Branches beyond the `lanes` limit retain their state marker beside `»`.
+Increase `lanes` to display more rails. Long file paths in detail rows wrap
+to the available terminal width.
 
 ### `extract` — every subvalue of a shape
 
@@ -630,7 +677,9 @@ top = \repo -> top (up repo) or repo
 ```
 
 Moves the focus all the way to the top of history (where `context = []`). The
-`or repo` is the base case: when `up` crashes at the top, stop.
+`or repo` is the base case: when `up` crashes at the top, stop. Use it inside
+an inspection such as `commits . top` or `tree . top`; `j top` alone cannot
+save a focus on the protected root commit.
 
 ```
 top                     -- refocus at the very first commit
@@ -811,17 +860,14 @@ is `new . goto trunk`, never `goto trunk` alone.
 
 **`goto : Revset -> Edit`** — refocus on *the one commit* a revset names. This
 is the only place a revset must have exactly one member; otherwise it crashes
-with `expected one revision, got N`.
+with `expected one revision, got N` and recovery guidance. An empty selector
+points to `j tree` and remote/fetch setup; an ambiguous selector shows up to
+eight candidate ids and descriptions, with commands to select a mutable commit
+or create a child. Candidate ids are complete copyable id literals.
 
 ```
-goto = \rs repo ->
-  let is = rs repo
-  in if length is == 1 then by (head is) repo
-     else crash ("expected one revision, got " ++ show (length is))
-```
-
-```
-goto %main              -- refocus on main (crash if it names 0 or 2+ commits)
+new . goto %main        -- start a mutable child on main
+tree . goto %main       -- inspect main without moving the working copy
 goto parents            -- == prev
 ```
 
@@ -830,10 +876,12 @@ The reference definition uses `lookupCommit`, which indexes the repository
 once and retrieves commits without moving the focus. Its result is the same
 as `(by i repo).root`.
 
-**`prev : Edit`** — to the parent (`goto parents`).
+**`prev : Edit`** — to the parent (`goto parents`). Like every navigation edit,
+it checks out the selected commit. A protected parent cannot remain focused;
+inspect it with `tree . prev` or start a new child instead.
 
-**`next : Edit`** — to the only child (`goto kids`; crashes if the focus has
-other than exactly one child).
+**`next : Edit`** — to the only child. At a tip it suggests `j new`; at a fork
+it lists candidates to choose with `by`.
 
 **`tip : Edit`** — the end of the line of only-children (`tip = \repo -> tip
 (next repo) or repo`).
@@ -1017,6 +1065,9 @@ Crashes at the top.
 
 `j push EXPR` evaluates `EXPR` to a list of `Push` and `Drop` records. These
 functions build such lists.
+Push sends recorded commits. Unrecorded file edits produce a warning before
+the recorded content is sent. Run `j id`, then push again to include those
+edits. Inspection commands such as `j status` do not record them.
 
 **`label : Label -> Revset -> Repo -> [Push]`** — label every commit of a
 revset.
@@ -1049,7 +1100,8 @@ j 'push relabel'        -- after rewriting, re-point the remote's bookmarks
 
 ## 10. Inspection
 
-These return printable values rather than a `Repo`.
+These return printable values rather than a `Repo`. They include current
+file edits in the displayed snapshot without recording those edits.
 
 **`focus : Repo -> Commit`** — the focused commit.
 
@@ -1090,44 +1142,63 @@ contentAt ./missing []    => blob ""
 **`changed : Repo -> [Path]`** — paths whose content differs between the focus
 and its parent.
 
+**`unrecorded : Repo -> [Path]`** — paths changed in the working directory
+since the recorded snapshot at the start of this invocation. This builtin
+compares the loaded and snapshotted focus files, independently of edits to
+the repository value later in the expression. It returns `[]` when no
+snapshot context exists, including in a push expression.
+
 **`diffs : Repo -> [{ path : Path, diff : Text }]`** — what the focus changes,
-rendered by difftastic, one record per changed path. (Replace `difft` with
-`(\p -> diff)` to use the built-in unified diff instead.)
+rendered by difftastic, one record per changed path, with unified diffs as
+the fallback when difftastic is missing.
 
 **`review : Repo -> Text`** — the same, as one page of text, or
 `"no changes\n"` when the focus changes nothing. A `Text` result prints raw,
-so `j review` is readable in the terminal. Like `diffs`, it crashes when
-`difft` cannot be run (not on `PATH`); otherwise whatever `difft` prints,
-even nothing, is the page, and what it says on stderr reaches the terminal.
+so `j review` is readable in the terminal even without difftastic. When
+`difft` runs, whatever it prints, even nothing, is the page, and what it says
+on stderr reaches the terminal. Other launch errors still fail the review.
 
 ```
 j 'review'              -- the focus's changes, as difftastic renders them
 ```
 
-**`status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }`** — a summary of the focus.
+**`status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], unrecorded : [Path], conflicts : [Path] }`** — a summary of the focus and unsaved file edits.
 
 ```
 j 'status'
 -- id       @wqzt…
 -- message  add the lexer
 -- labels   [feature]
--- changed  [src/lexer.rs]
--- conflicts []
+-- in commit [src/lexer.rs]
+-- conflicts No conflicts
+-- unrecorded All edits recorded
 ```
+
+Empty changed paths, labels, and descriptions read `No changes`, `No labels`,
+and `No description` respectively. The display calls `changed` **in commit**;
+the underlying field keeps its name. It compares the focus with its
+parent. `unrecorded` lists paths that still need saving and reads
+`All edits recorded` when empty. Run `j save` to record them; `changed`
+continues to show the commit's changes after saving.
 
 **`log : Repo -> [{ id : Id, message : Text, labels : [Label], focus : Bool }]`**
 — a summary of every commit, top first, in preorder (`focus` marks the focused
-commit).
+commit). The display shows short ids and label names, fits columns to the
+terminal, and switches to fields on separate lines when necessary. Redirected
+output preserves full cell text.
 
 **`tree : Repo -> Text`** and **`treeFull : Repo -> Text`** — the history as a
-tree, built with `treeWith`. `tree` is compact (`detail = 1`, elided);
+tree, built with `treeWith`. `tree` shows every commit (`detail = 1`);
 `treeFull` shows ages and authors in the margin (`detail = 2`, `margin =
 true`). Edit these definitions to change what `j tree` shows.
 
 ```
-tree = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto" })
-treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto" })
+tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
+treeFull = treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 ```
+
+Use `treeCompact` to fold uninteresting runs and distant subtrees, or
+`treeData` for extra date, files-changed, and author columns.
 
 ```
 j 'tree'
@@ -1228,6 +1299,7 @@ j 'tree'
 | `parents` | `Revset` | §7.3 |
 | `pick` | `Revset -> Edit` | §8 |
 | `prev` | `Edit` | §7.4 |
+| `preview` | `Edit -> Repo -> Text` | §2 |
 | `range` | `Int -> Int -> [Int]` | §4 |
 | `rebase` | `Revset -> Edit` | §8 |
 | `relabel` | `Repo -> [Push]` | §9 |
@@ -1239,6 +1311,7 @@ j 'tree'
 | `restrict` | `Fileset -> Snapshot -> Snapshot` | §7.2 |
 | `review` | `Repo -> Text` | §10 |
 | `rewrite` | `(Commit -> Commit) -> Edit` | §8 |
+| `save` | `Edit` | §2 |
 | `select` | `Fileset -> Snapshot -> Snapshot -> Snapshot` | §7.2 |
 | `show` | `a -> Text` | §3 |
 | `siblings` | `Revset` | §7.3 |
@@ -1262,6 +1335,7 @@ j 'tree'
 | `under` | `Path -> Fileset` | §7.2 |
 | `union` | `Revset -> Revset -> Revset` | §7.3 |
 | `unlabel` | `Label -> [Drop]` | §9 |
+| `unrecorded` | `Repo -> [Path]` | §10 |
 | `unresolved` | `Blob -> Bool` | §5 |
 | `up` | `Edit` | §6 |
 | `user` | `{ name : Text, email : Text }` | §1.1 |

@@ -3,8 +3,14 @@
 `j` is a small, pure, functional language. Every `j` command evaluates one
 expression in this language against the current repository. The language is
 the whole interface: there are no subcommands beyond a handful of reserved
-words, and no general flags. As the first word, `--help` and `-h` are aliases
-for `help`; use `j help` for a command guide or `j commands` to browse names.
+words, and no general flags apart from help. `--help` and `-h` open help as
+the first word or as a separate argument after a command: `j new --help`
+shows help without executing `new`. Inside a single expression argument or
+stdin, `--` still starts a language comment, so `j 'new --help'` executes
+`new`. Use `j help` for a command guide, `j commands` for everyday tasks,
+and `j commands all` for the complete vocabulary. `j setup NAME EMAIL`
+creates a new configuration with your identity without replacing an existing
+file.
 
 This document describes the language itself — its values, syntax, semantics,
 and the builtins — with examples throughout. Every example shows an expression
@@ -18,16 +24,17 @@ and what it evaluates to, exactly as `j` prints it.
 
 ## 1. The big picture
 
-A run of `j` looks like this:
+An expression run of `j` looks like this:
 
 1. Read the expression (from the command line or stdin).
-2. Snapshot the working directory into the working-copy commit.
+2. Snapshot the working directory for evaluation.
 3. Build a value `repo` describing the repository, focused on the
    working-copy commit.
 4. Evaluate the expression.
 5. If the result is a function, apply it to `repo`.
 6. If the final value is a `Repo` that differs from the one loaded, persist
-   the difference; otherwise print the value and change nothing.
+   the difference. An unchanged `Repo` saves nothing; other values print
+   without saving.
 
 So the most common thing you write is an **edit** — a function `Repo -> Repo`
 (or a value that becomes one). `describe "wip"` is an edit. `new` is an edit.
@@ -554,6 +561,9 @@ crash "my message"
 
 Parse errors, configuration errors, and `Id`-resolution failures happen
 *before* evaluation and are **not** catchable.
+CLI diagnostics identify the source and line for syntax errors and offer
+quoting, missing-argument, or spelling hints where available. Configuration
+errors name the file to repair; `j help config` works even with broken config.
 
 ---
 
@@ -768,7 +778,8 @@ prev                  -- to the parent (crashes at the top)
 next                  -- to the only child (crashes if not exactly one)
 up                    -- like prev, the raw zipper move
 by @wqzt              -- refocus on a specific commit
-goto %main            -- refocus on what the remote calls main
+tree . goto %main     -- inspect main without moving the working copy
+new . goto %main      -- start a mutable child on main
 parents               -- the focus's parents, as a Revset
 kids                  -- its children
 ancestors             -- it and its ancestors
@@ -781,6 +792,7 @@ Edits — functions `Repo -> Repo`:
 
 ```
 new                       -- a new empty child of the focus
+save                      -- record file edits without changing the description
 describe "wip"            -- set the focus's message
 squash                    -- fold the focus into its parent
 abandon                   -- drop the focus; children join the parent
@@ -795,7 +807,9 @@ And the inspections:
 
 ```
 tree                    -- the history as a tree (a Text)
-status                  -- { id, message, labels, changed, conflicts }
+status                  -- { id, message, labels, changed, conflicts, unrecorded }
+unrecorded              -- paths edited since the last recording
+preview squash          -- validate and show the resulting tree without saving
 review                  -- the focus's changes as one page of diffs
 files                   -- the focus's snapshot (its files)
 commits . top           -- every commit, preorder
@@ -820,10 +834,13 @@ j 'tree'
 -- the second commit was a mistake; fold it into the first
 j 'squash'
 
--- rename the combined commit
+-- squash leaves a fresh empty child; move back and rename the combined commit
+j prev
 j 'describe "add the front end"'
 
--- undo the squash entirely
+-- undo the rename, the focus move, then the squash
+j undo
+j undo
 j undo
 
 -- move back to the first commit to fix something
@@ -852,17 +869,22 @@ diff (blob "a\nb\n") (blob "a\nc\n")
     => "@@ -1,2 +1,2 @@\n a\n-b\n+c\n"
 ```
 
-`difft p a b` renders the comparison with **difftastic** (which must be on
-`PATH`; the Nix package provides it). `review` uses `difft` per changed path.
+`difft p a b` renders the comparison with **difftastic** when it is on `PATH`
+(the Nix package provides it). When it is absent, the builtin returns a
+unified diff with path headers, or a summary for binary changes. `review`
+uses `difft` per changed path; other errors starting the tool still fail.
 
 `treeWith options repo` renders the history tree with an options record:
 
 ```
-treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = "auto" })
+treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 ```
 
-The reference config gives two ready-made versions: `tree` (compact) and
-`treeFull` (with ages and authors in the margin).
+The reference config provides `tree`, `treeCompact` (folded runs and distant
+subtrees), `treeFull` (ages and authors in the margin), and `treeData` (extra
+date, files-changed, and author columns). Branches beyond `lanes` keep their
+state marker beside `»`; increase `lanes` to show more rails. Long file paths
+in detail rows wrap to fit the terminal.
 
 ---
 
@@ -941,5 +963,11 @@ the algebra they are.
 **Blobs/repos:** `blob` `blobHex` `text` `unresolved` `replay` `by` `meta` `extract`
 `diff` `difft` `treeWith` `validate`
 
-**Reserved commands** (not expressions): `init` `clone URL [DIR]` `remote URL`
+**Reserved commands** (not expressions): `help [NAME]` `commands [QUERY]`
+`setup [NAME EMAIL]` `init` `clone URL [DIR]` `remote URL`
 `fetch` `push EXPR` `undo` `redo` `ops`.
+
+Literal reserved-command arguments preserve shell quoting boundaries, as in
+`j clone URL 'my project'`. A whole reserved command passed as one string or
+on stdin is split on whitespace. Expression arguments still use language
+syntax: quote the whole expression, as in `j 'describe "my change"'`.

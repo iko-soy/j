@@ -860,7 +860,9 @@ fn crash_names_the_innermost_definition_executing() {
         ("sameAsInner 0", Some("inner")),
         ("sameAsInner \"x\"", Some("sameAsInner")),
         (prev.as_str(), Some("goto")),
-        (next.as_str(), Some("goto")),
+        // next now handles an empty child list itself to suggest `j new`;
+        // the direct goto and prev cases above still cover delegated errors.
+        (next.as_str(), Some("next")),
         // a builtin is no definition: outside every definition, none
         ("head []", None),
         ("crash \"top\"", None),

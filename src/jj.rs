@@ -45,6 +45,15 @@ fn block_on<F: Future>(f: F) -> F::Output {
 
 type OpenError = (u8, String);
 
+/// The successful effects of a push, after duplicate requests are merged.
+/// All zeroes means no bookmarks were selected and nothing was sent or saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PushOutcome {
+    pub published: usize,
+    pub deleted: usize,
+    pub unchanged: usize,
+}
+
 // ----------------------------------------------------------------------
 // locating and opening the repository (§7.1)
 // ----------------------------------------------------------------------
@@ -1760,10 +1769,10 @@ impl JjBackend {
         current: &Value,
         new: &Value,
         text: &str,
-    ) -> Result<(), Crash> {
+    ) -> Result<bool, Crash> {
         // §1.2 step 8: unchanged, up to the order of snapshot entries (§7.3)
         if crate::repo::same_repo(loaded, new)? {
-            return Ok(());
+            return Ok(false);
         }
         *interp.old_repo.borrow_mut() = Some(loaded.clone());
         crate::repo::validate_repo(interp, new)?;
@@ -1988,7 +1997,8 @@ impl JjBackend {
                 state.or_else(|_| block_on(self.wc_commit(&base)).map(|c| c.tree()).map_err(|e| Crash::new(e.1)))?
             }
         };
-        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), Some(", and `j undo` goes back")))
+        block_on(self.checkout(&focus_commit, Some(&on_disk), Some(unpublished), Some(", and `j undo` goes back")))?;
+        Ok(true)
     }
 
     /// Check `commit` out: write its files to the working directory and
@@ -2188,7 +2198,8 @@ impl JjBackend {
     }
 
     fn user_signature(&self, cfg: &Config) -> Result<Signature, Crash> {
-        let (name, email) = crate::config::eval_user_only(&mut Interp::dummy(), cfg)?;
+        let (name, email) = validated_identity(cfg)
+            .map_err(|(_, message)| Crash::new(message))?;
         Ok(Signature {
             name,
             email,
@@ -2322,16 +2333,38 @@ impl JjBackend {
         let _ = block_on(self.publish_tx(tx, "fetch"))?;
         Ok(())
     }
-    pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<(), OpenError> {
+    pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<PushOutcome, OpenError> {
         self.enter_workspace_root()?;
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
         let (value, vis, immutable) = self.eval_push_expr(cfg, expr_text, &base)?;
         let records = parse_push_records(&value, &vis, &base)?;
+        if records.is_empty() {
+            return Ok(PushOutcome::default());
+        }
         let deletes_wait = check_push_records(&records, &base, &vis, &immutable)?;
+        let mut outcome = PushOutcome::default();
+        for (name, target) in &records {
+            let before = base.view()
+                .get_remote_bookmark(RefName::new(name).to_remote_symbol(origin))
+                .target.as_resolved().cloned().unwrap_or(None);
+            if &before == target {
+                outcome.unchanged += 1;
+            } else if target.is_none() {
+                outcome.deleted += 1;
+            } else {
+                outcome.published += 1;
+            }
+        }
+        let (_, clean) = self.inspect_working_copy(&base, false)?;
+        if !clean {
+            crate::terminal::report(format_args!(
+                "j: warning: working copy has unrecorded changes; push sends recorded content only, so these edits will not be sent. Run `j id` to record them, then push again to include them."
+            ));
+        }
         let description = format!("push {}", expr_text);
         let _ = self.push_to_origin(&base, origin, &records, deletes_wait, &description)?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// evaluate `EXPR` against the recorded repository, without snapshotting
@@ -2345,7 +2378,7 @@ impl JjBackend {
     ) -> Result<(Value, Arc<VisibleRepo>, BTreeSet<String>), OpenError> {
         let outer = Rc::new(cfg.global_names.clone());
         let expr = crate::parse::parse_expr(expr_text, outer)
-            .map_err(|p| (3, format!("line {}: {}", p.line, p.msg)))?;
+            .map_err(|p| (3, crate::diagnostics::format_source_error("expression", expr_text, p.line, &p.msg)))?;
         let (mut interp, _loaded, current) = self.build_interp(cfg, expr_text, false)?;
         let expr = crate::config::resolve_ids(&expr, &interp).map_err(|failures| {
             let (prefix, candidates) = &failures[0];
@@ -2360,15 +2393,26 @@ impl JjBackend {
         // evaluated it for this value to place the focus, so it is cached
         let immutable = crate::repo::compute_immutable(&mut interp, &current)
             .map_err(|c| (1, format!("crash: {}", c.msg)))?;
+        let expression_error = |crash: Crash| {
+            let mut message = format!("crash: {}", crash.msg);
+            match &crash.def {
+                Some(name) => message.push_str(&format!("\n   in {}, from push {}", name, expr_text)),
+                None => message.push_str(&format!("\n   from push {}", expr_text)),
+            }
+            if let Some(hint) = crate::diagnostics::push_expression_hint(expr_text, cfg, &crash) {
+                message.push_str(&format!("\n   {}", hint));
+            }
+            (1, message)
+        };
         let env = interp.global_env();
         let expr_rc = Rc::new(expr);
         let mut v = interp
             .eval(&expr_rc, &env)
-            .map_err(|c| (1, format!("crash: {}", c.msg)))?;
+            .map_err(&expression_error)?;
         if matches!(v, Value::Fun(_)) {
             v = interp
                 .apply(v, current)
-                .map_err(|c| (1, format!("crash: {}", c.msg)))?;
+                .map_err(expression_error)?;
         }
         let _ = base;
         let vis = self
@@ -2393,6 +2437,11 @@ impl JjBackend {
         deletes_wait: bool,
         description: &str,
     ) -> Result<Arc<ReadonlyRepo>, OpenError> {
+        // Never hand an empty refspec list to git, whose push.default could
+        // select branches the expression did not request.
+        if records.is_empty() {
+            return Ok(base.clone());
+        }
         let mut targets = jj_lib::git::GitPushRefTargets::default();
         let mut deletes = jj_lib::git::GitPushRefTargets::default();
         for (name, after) in records {
@@ -2411,16 +2460,6 @@ impl JjBackend {
                 .push((jj_lib::ref_name::RefNameBuf::from(name.clone()), Diff::new(before, after.clone())));
         }
         let mut tx = base.start_transaction();
-        if records.is_empty() {
-            // nothing to set or delete; push_refs would still run `git push
-            // origin` without refspecs, which pushes whatever git's
-            // push.default picks
-            if !remote_has_url(git_backend(base.store())?, origin) {
-                return Err((1, "no remote origin".to_string()));
-            }
-            let (_, repo) = block_on(self.publish_tx(tx, &truncate_chars(description, 200)))?;
-            return Ok(repo);
-        }
         let subprocess_options = self.git_subprocess_options()?;
         let mut callback = QuietGitCallback;
         let mut push = |tx: &mut jj_lib::transaction::Transaction, targets| {
@@ -2498,7 +2537,7 @@ impl JjBackend {
         Ok(repo)
     }
 
-    pub fn cmd_undo(&self, redo: bool) -> Result<(), OpenError> {
+    pub fn cmd_undo(&self, redo: bool) -> Result<String, OpenError> {
         let base = self.head_repo()?;
         let on_disk = self.check_wc_clean(&base)?;
         let loader = self.repo_loader();
@@ -2621,6 +2660,10 @@ impl JjBackend {
                 .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
         }
         let target_op_id = target_op.id().clone();
+        // Report the expression whose state is being reversed or restored,
+        // following restore markers left by repeated undo/redo commands.
+        let affected = if redo { &target_op } else { &cur };
+        let affected_description = restored_operation_description(&loader, affected);
         let target_view = block_on(
             loader
                 .op_store()
@@ -2663,7 +2706,14 @@ impl JjBackend {
         let back = if redo { ", and `j undo` goes back" } else { ", and `j redo` goes back" };
         block_on(self.checkout(&wc_commit, Some(&on_disk), Some(unpublished), Some(back)))
             .map_err(|c| (1, c.msg))?;
-        Ok(())
+        let focus_message = wc_commit.description().lines().next().unwrap_or("").trim();
+        Ok(format!(
+            "{} `{}`; restored focus @{} {}",
+            if redo { "Redid" } else { "Undid" },
+            affected_description,
+            wc_commit.change_id().reverse_hex(),
+            terminal_text(if focus_message.is_empty() { "(no description)" } else { focus_message }),
+        ))
     }
 
     /// Refuse, as `undo` and `redo` do before anything else (§7.7), when the
@@ -2677,7 +2727,21 @@ impl JjBackend {
     /// what a checkout cut short wrote. Reserved commands never snapshot,
     /// so nothing is recorded either way.
     fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<MergedTree, OpenError> {
-        let dirty = (1, "working copy has changes not in @; run `j id` to record them or discard them".to_string());
+        let (scanned, clean) = self.inspect_working_copy(base, true)?;
+        if !clean {
+            return Err((1, "working copy has changes not in @; run `j id` to record them or discard them. Recording creates a new operation: the next `j undo` undoes that recording, not the operation you originally wanted to undo; a new recording also clears pending redos. Use `j ops` to inspect the history".to_string()));
+        }
+        Ok(scanned)
+    }
+
+    /// Compare a scan with the recorded focus without publishing a snapshot.
+    /// Push only inspects: it must leave the saved working-copy state alone
+    /// so a later `j id` still sees every unrecorded edit.
+    fn inspect_working_copy(
+        &self,
+        base: &Arc<ReadonlyRepo>,
+        refresh_clean_state: bool,
+    ) -> Result<(MergedTree, bool), OpenError> {
         let wc_tree = block_on(self.wc_commit(base))?.tree();
         let mut ws_guard = self.inner.workspace.lock().unwrap();
         let root = ws_guard.workspace_root().to_owned();
@@ -2697,13 +2761,15 @@ impl JjBackend {
             // drop the lock without saving, or the state would claim the
             // directory was snapshotted and hide the changes from the next
             // run (§7.7)
-            return Err(dirty);
+            return Ok((scanned, false));
         }
         // saving the state only refreshes what it knows of each file, or
         // takes in what the commit already has
-        block_on(save_scan(locked_ws, &scanned, &wc_tree, base.operation().id()))
-            .map_err(|e| (2, format!("cannot finish: {}", e)))?;
-        Ok(scanned)
+        if refresh_clean_state {
+            block_on(save_scan(locked_ws, &scanned, &wc_tree, base.operation().id()))
+                .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        }
+        Ok((scanned, true))
     }
 
     /// The operation log for `ops` (§7.7), one line per operation, newest
@@ -3194,8 +3260,7 @@ async fn checkout_tree(tree: MergedTree, backend: &JjBackend) -> Result<MergedTr
 /// user settings for init/clone: a missing or malformed `user` is a
 /// configuration error (exit 3) (§7.9)
 fn user_settings_strict(cfg: &Config) -> Result<UserSettings, OpenError> {
-    let (name, email) = crate::config::eval_user_only(&mut Interp::dummy(), cfg)
-        .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+    let (name, email) = validated_identity(cfg)?;
     let mut config = StackedConfig::with_defaults();
     let text = format!(
         "[user]\nname = {}\nemail = {}\n",
@@ -3207,6 +3272,39 @@ fn user_settings_strict(cfg: &Config) -> Result<UserSettings, OpenError> {
     config.add_layer(layer);
     UserSettings::from_config(config)
         .map_err(|e| (3, format!("config.j: invalid user settings: {}", e)))
+}
+
+/// The identity shown during repository setup. Validation is deliberately
+/// confined to authoring boundaries so inspection and recovery still work
+/// with an unchanged reference configuration.
+pub fn configured_identity(cfg: &Config) -> Result<String, OpenError> {
+    let (name, email) = validated_identity(cfg)?;
+    Ok(format!("{} <{}>", terminal_text(&name), terminal_text(&email)))
+}
+
+fn terminal_text(text: &str) -> String {
+    text.chars().map(|c| {
+        if c.is_control() { c.escape_debug().to_string() } else { c.to_string() }
+    }).collect()
+}
+
+fn validated_identity(cfg: &Config) -> Result<(String, String), OpenError> {
+    let (name, email) = crate::config::eval_user_only(&mut Interp::dummy(), cfg)
+        .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+    check_identity(&name, &email)?;
+    Ok((name, email))
+}
+
+fn check_identity(name: &str, email: &str) -> Result<(), OpenError> {
+    if name.trim().is_empty() || email.trim().is_empty()
+        || name.trim() == "Your Name" || email.trim().eq_ignore_ascii_case("you@example.com")
+    {
+        return Err((3, format!(
+            "config.j: user identity is not configured ({} <{}>); set `user.name` and `user.email` in the `user` record before creating or recording commits",
+            terminal_text(name), terminal_text(email),
+        )));
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -3395,6 +3493,42 @@ fn op_parent_id(
     let op = block_on(loader.load_operation(op_id))
         .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
     Ok(op.parent_ids().first().cloned())
+}
+
+/// A restore operation represents an earlier view. Follow that view to a
+/// normal operation for useful confirmation text without changing undo's
+/// navigation or its jj-compatible metadata.
+fn restored_operation_description(
+    loader: &jj_lib::repo::RepoLoader,
+    op: &jj_lib::operation::Operation,
+) -> String {
+    let mut represented = op.clone();
+    let mut seen = BTreeSet::new();
+    while seen.insert(represented.id().clone()) {
+        let Some(marker) = op_marker(represented.metadata()) else { break };
+        let target = if marker.restores_view {
+            Some(marker.id)
+        } else if marker.authored_by_j {
+            // A legacy undo names what it discarded; a legacy redo names
+            // the undo it reversed. Either restored its target's parent.
+            op_parent_id(loader, &marker.id).ok().flatten()
+        } else {
+            // Unknown legacy jj history is best identified by its actual
+            // description instead of guessing which operation it applied.
+            None
+        };
+        let Some(target) = target else { break };
+        // Missing historical metadata must not prevent an otherwise valid
+        // recovery operation merely because its summary cannot be expanded.
+        let Ok(target_op) = block_on(loader.load_operation(&target)) else { break };
+        represented = target_op;
+    }
+    let description = represented.metadata().description.lines().next().unwrap_or("").trim();
+    if description.is_empty() {
+        format!("operation {}", truncate_chars(&represented.id().hex(), 12))
+    } else {
+        terminal_text(description)
+    }
 }
 
 /// parse the push-record list (§7.6): records of shape {id, name} set a
@@ -3644,11 +3778,23 @@ fn check_push_records(
         .map_err(|e| (2, format!("cannot list the commits to send: {}", e)))?;
     for commit in &sent {
         let change_id = commit.change_id().reverse_hex();
-        for (_path, value) in commit.tree().entries() {
+        let mut unresolved_paths = Vec::new();
+        for (path, value) in commit.tree().entries() {
             let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
             if !value.is_resolved() {
-                return Err((1, format!("push: commit `@{}` has unresolved files", change_id)));
+                unresolved_paths.push(path.as_internal_file_string().to_string());
             }
+        }
+        if !unresolved_paths.is_empty() {
+            let mut paths = unresolved_paths.iter().take(5)
+                .map(|path| format!("`{}`", terminal_text(path)))
+                .collect::<Vec<_>>().join(", ");
+            if unresolved_paths.len() > 5 {
+                paths.push_str(&format!(" and {} more", unresolved_paths.len() - 5));
+            }
+            return Err((1, format!(
+                "push: commit `@{change_id}` has unresolved files: {paths}; run `j conflicts` to inspect conflicts, then `j by @{change_id}` to edit this commit. Resolve the listed files, run `j id` to record the resolution, and check `j conflicts` before pushing again"
+            )));
         }
         if commit.description().trim().is_empty() && commit.id() != store.root_commit_id() {
             return Err((1, format!("push: commit `@{}` has an empty description", change_id)));
@@ -3691,6 +3837,12 @@ fn is_valid_git_branch_name(name: &str) -> bool {
 // ----------------------------------------------------------------------
 
 impl Backend for JjBackend {
+    fn validate_authoring(&self) -> Result<(), Crash> {
+        let repo = self.current_repo();
+        check_identity(repo.settings().user_name(), repo.settings().user_email())
+            .map_err(|(_, message)| Crash::new(message))
+    }
+
     fn visible_ids(&self) -> Vec<String> {
         match self.inner.visible.lock().unwrap().as_ref() {
             Some(v) => v.commits.keys().cloned().collect(),

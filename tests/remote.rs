@@ -29,6 +29,15 @@ fn uniq(tag: &str) -> PathBuf {
     ))
 }
 
+fn operation_heads(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut heads: Vec<_> = std::fs::read_dir(dir.join(".jj/repo/op_heads/heads"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    heads.sort();
+    heads
+}
+
 struct Env {
     dir: PathBuf,
     remote: PathBuf,
@@ -150,6 +159,273 @@ impl Drop for Env {
 }
 
 #[test]
+fn dirty_push_warns_and_keeps_edits_available_for_recording() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    env.j(&dest, &["describe \"work\""]).ok();
+    std::fs::write(dest.join("a.txt"), "unrecorded\n").unwrap();
+    // A status preview must not make a subsequent push silently appear to
+    // include the previewed contents.
+    env.j(&dest, &["status"]).ok();
+    let state_path = dest.join(".jj/working_copy/tree_state");
+    let state = std::fs::read(&state_path).unwrap();
+    let out = env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    assert!(out.stderr.contains("working copy has unrecorded changes"), "{}", out.stderr);
+    assert!(out.stderr.contains("push sends recorded content only"), "{}", out.stderr);
+    assert!(out.stderr.contains("`j id`"), "{}", out.stderr);
+    assert_eq!(git(&env.remote, &["show", "feature:a.txt"]), "one\n");
+    assert_eq!(std::fs::read(&state_path).unwrap(), state, "push changed the saved working-copy state");
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "unrecorded\n");
+
+    // Following the warning records and publishes the omitted edits.
+    env.j(&dest, &["id"]).ok();
+    let out = env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    assert!(!out.stderr.contains("unrecorded changes"), "{}", out.stderr);
+    assert_eq!(git(&env.remote, &["show", "feature:a.txt"]), "unrecorded\n");
+}
+
+#[test]
+fn dirty_push_allows_unrelated_bookmarks_and_deletions_with_warning() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "unrecorded\n").unwrap();
+    let out = env.j(&dest, &["push (label \"copy\" (labelled \"master\"))"]).ok();
+    assert!(out.stderr.contains("push sends recorded content only"), "{}", out.stderr);
+    assert_eq!(git(&env.remote, &["rev-parse", "copy"]), git(&env.remote, &["rev-parse", "master"]));
+    let out = env.j(&dest, &["push (unlabel \"copy\")"]).ok();
+    assert!(out.stderr.contains("push sends recorded content only"), "{}", out.stderr);
+    assert_eq!(git(&env.remote, &["for-each-ref", "--format=%(refname)", "refs/heads/copy"]), "");
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "unrecorded\n");
+}
+
+#[test]
+fn unrecorded_paths_distinguish_disk_edits_from_the_recorded_commit_change() {
+    let env = setup();
+    env.j(&env.dir, &["init"]).ok();
+    std::fs::write(env.dir.join("modified.txt"), "before\n").unwrap();
+    std::fs::write(env.dir.join("removed.txt"), "remove me\n").unwrap();
+    env.j(&env.dir, &["describe \"baseline\""]).ok();
+    env.j(&env.dir, &["new"]).ok();
+    assert_eq!(env.j(&env.dir, &["unrecorded"]).ok().stdout.trim(), "none");
+
+    std::fs::write(env.dir.join("modified.txt"), "after\n").unwrap();
+    std::fs::write(env.dir.join("added.txt"), "new file\n").unwrap();
+    std::fs::remove_file(env.dir.join("removed.txt")).unwrap();
+    let heads = operation_heads(&env.dir);
+    let state_path = env.dir.join(".jj/working_copy/tree_state");
+    let state = std::fs::read(&state_path).unwrap();
+    let expected = "added.txt\nmodified.txt\nremoved.txt";
+    for expression in ["unrecorded", "(.unrecorded) . status", "unrecorded . new", "unrecorded . prev"] {
+        assert_eq!(env.j(&env.dir, &[expression]).ok().stdout.trim(), expected, "{}", expression);
+    }
+    assert_eq!(operation_heads(&env.dir), heads, "inspection recorded an operation");
+    assert_eq!(std::fs::read(&state_path).unwrap(), state, "inspection saved the snapshot state");
+    assert_eq!(std::fs::read_to_string(env.dir.join("modified.txt")).unwrap(), "after\n");
+    assert_eq!(std::fs::read_to_string(env.dir.join("added.txt")).unwrap(), "new file\n");
+    assert!(!env.dir.join("removed.txt").exists());
+
+    env.j(&env.dir, &["save"]).ok();
+    assert_eq!(env.j(&env.dir, &["unrecorded"]).ok().stdout.trim(), "none");
+    assert_eq!(env.j(&env.dir, &["(.unrecorded) . status"]).ok().stdout.trim(), "none");
+    assert_eq!(env.j(&env.dir, &["changed"]).ok().stdout.trim(), expected);
+}
+
+#[test]
+fn unrecorded_paths_cover_the_snapshot_child_of_an_immutable_focus() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "recorded\n").unwrap();
+    env.j(&dest, &["describe \"feature\""]).ok();
+    env.j(&dest, &["push (label \"master\" here)"]).ok();
+    let heads = operation_heads(&dest);
+    std::fs::write(dest.join("a.txt"), "unrecorded\n").unwrap();
+    assert_eq!(env.j(&dest, &["unrecorded"]).ok().stdout.trim(), "a.txt");
+    assert_eq!(env.j(&dest, &["(.unrecorded) . status"]).ok().stdout.trim(), "a.txt");
+    assert_eq!(operation_heads(&dest), heads);
+    assert_eq!(git(&env.remote, &["show", "master:a.txt"]), "recorded\n");
+    env.j(&dest, &["save"]).ok();
+    assert_eq!(env.j(&dest, &["unrecorded"]).ok().stdout.trim(), "none");
+    assert_eq!(env.j(&dest, &["changed"]).ok().stdout.trim(), "a.txt");
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "unrecorded\n");
+}
+
+#[test]
+fn conflicted_push_names_files_and_gives_a_working_resolution_sequence() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    std::fs::write(dest.join("a.txt"), "right\n").unwrap();
+    env.j(&dest, &["describe \"right\""]).ok();
+    let right = env.j(&dest, &["show . (.id) . focus"]).ok().stdout.trim().to_string();
+    env.j(&dest, &["new . prev"]).ok();
+    std::fs::write(dest.join("a.txt"), "left\n").unwrap();
+    env.j(&dest, &["describe \"left\""]).ok();
+    env.j(&dest, &[&format!("rebase (const [{}])", right)]).ok();
+    let focus = env.j(&dest, &["show . (.id) . focus"]).ok().stdout.trim().to_string();
+    let before = operation_heads(&dest);
+    let out = env.j(&dest, &["push (label \"feature\" here)"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    for expected in ["has unresolved files: `a.txt`", "j conflicts", "Resolve the listed files", "j id"] {
+        assert!(out.stderr.contains(expected), "{}", out.stderr);
+    }
+    assert!(out.stderr.contains(&format!("j by {}", focus)), "{}", out.stderr);
+    assert_eq!(operation_heads(&dest), before);
+    assert_eq!(git(&env.remote, &["for-each-ref", "--format=%(refname)", "refs/heads/feature"]), "");
+
+    env.j(&dest, &["conflicts"]).ok();
+    env.j(&dest, &[&format!("by {}", focus)]).ok();
+    std::fs::write(dest.join("a.txt"), "resolved\n").unwrap();
+    env.j(&dest, &["id"]).ok();
+    assert_eq!(env.j(&dest, &["conflicts"]).ok().stdout.trim(), "none");
+    env.j(&dest, &["push (label \"feature\" here)"]).ok();
+    assert_eq!(git(&env.remote, &["show", "feature:a.txt"]), "resolved\n");
+}
+
+#[test]
+fn placeholder_identity_refuses_setup_before_creating_repositories() {
+    let env = setup();
+    std::fs::write(env.cfg.join("j/config.j"), include_str!("../config.j")).unwrap();
+    let out = env.j(&env.dir, &["init"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("user identity is not configured"), "{}", out.stderr);
+    assert!(out.stderr.contains(env.cfg.join("j/config.j").to_str().unwrap()), "{}", out.stderr);
+    assert!(!env.dir.join(".jj").exists());
+    assert!(!env.dir.join(".git").exists());
+    let dest = env.dir.join("clone");
+    let out = env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("user identity is not configured"), "{}", out.stderr);
+    assert!(!dest.exists());
+}
+
+#[test]
+fn placeholder_identity_allows_inspection_but_never_records_edits() {
+    let env = setup();
+    env.j(&env.dir, &["init"]).ok();
+    let reference = include_str!("../config.j");
+    for invalid in [
+        reference.replace("you@example.com", "test@example.com"),
+        reference.replace("Your Name", "Test User"),
+        reference.replace("Your Name", "   ").replace("you@example.com", "test@example.com"),
+    ] {
+        std::fs::write(env.cfg.join("j/config.j"), invalid).unwrap();
+        // An unchanged Repo and display-only expressions are safe even
+        // when setup has not been completed.
+        env.j(&env.dir, &["id"]).ok();
+        std::fs::write(env.dir.join("draft.txt"), "my draft\n").unwrap();
+        let before = operation_heads(&env.dir);
+        env.j(&env.dir, &["status"]).ok();
+        let out = env.j(&env.dir, &["describe \"draft\""]);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(out.stderr.contains("user identity is not configured"), "{}", out.stderr);
+        assert_eq!(operation_heads(&env.dir), before);
+        assert_eq!(std::fs::read_to_string(env.dir.join("draft.txt")).unwrap(), "my draft\n");
+        std::fs::remove_file(env.dir.join("draft.txt")).unwrap();
+    }
+}
+
+#[test]
+fn validated_preview_rejects_the_same_placeholder_identity_as_persistence() {
+    let env = setup();
+    env.j(&env.dir, &["init"]).ok();
+    std::fs::write(env.dir.join("draft.txt"), "recorded draft\n").unwrap();
+    env.j(&env.dir, &["describe \"draft\""]).ok();
+    std::fs::write(env.cfg.join("j/config.j"), include_str!("../config.j")).unwrap();
+    let before = operation_heads(&env.dir);
+    let state_path = env.dir.join(".jj/working_copy/tree_state");
+
+    // Read-only inspection and an unchanged Repo require no authoring.
+    // An ordinary preview remains useful while setting up an identity.
+    for expression in ["validate", "tree", "tree . validate", "tree . new"] {
+        env.j(&env.dir, &[expression]).ok();
+    }
+    let state = std::fs::read(&state_path).unwrap();
+    let preview = env.j(&env.dir, &["tree . validate . new"]);
+    assert_eq!(preview.code, 1, "{}", preview.stderr);
+    assert!(preview.stderr.contains("user identity is not configured"), "{}", preview.stderr);
+    let persisted = env.j(&env.dir, &["new"]);
+    assert_eq!(persisted.code, 3, "{}", persisted.stderr);
+    assert!(persisted.stderr.contains("user identity is not configured"), "{}", persisted.stderr);
+    assert_eq!(operation_heads(&env.dir), before);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state);
+    assert_eq!(std::fs::read_to_string(env.dir.join("draft.txt")).unwrap(), "recorded draft\n");
+
+    // A dirty snapshot is also a change that `id` would have to author.
+    std::fs::write(env.dir.join("draft.txt"), "unrecorded draft\n").unwrap();
+    let out = env.j(&env.dir, &["tree . validate"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("user identity is not configured"), "{}", out.stderr);
+    assert_eq!(operation_heads(&env.dir), before);
+    assert_eq!(std::fs::read_to_string(env.dir.join("draft.txt")).unwrap(), "unrecorded draft\n");
+}
+
+#[test]
+fn dirty_undo_explains_recording_and_reverses_that_recording_first() {
+    let env = setup();
+    env.j(&env.dir, &["init"]).ok();
+    env.j(&env.dir, &["describe \"original edit\""]).ok();
+    let before = operation_heads(&env.dir);
+    std::fs::write(env.dir.join("draft.txt"), "my draft\n").unwrap();
+    let out = env.j(&env.dir, &["undo"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("the next `j undo` undoes that recording"), "{}", out.stderr);
+    assert!(out.stderr.contains("not the operation you originally wanted to undo"), "{}", out.stderr);
+    assert_eq!(operation_heads(&env.dir), before);
+    env.j(&env.dir, &["id"]).ok();
+    env.j(&env.dir, &["undo"]).ok();
+    assert!(!env.dir.join("draft.txt").exists());
+    assert!(env.j(&env.dir, &["status"]).ok().stdout.contains("original edit"));
+    env.j(&env.dir, &["undo"]).ok();
+    assert!(!env.j(&env.dir, &["status"]).ok().stdout.contains("original edit"));
+    env.j(&env.dir, &["redo"]).ok();
+    env.j(&env.dir, &["redo"]).ok();
+    assert_eq!(std::fs::read_to_string(env.dir.join("draft.txt")).unwrap(), "my draft\n");
+}
+
+#[test]
+fn push_expression_errors_offer_the_same_guidance_as_edits() {
+    let env = setup();
+    let dest = env.dir.join("clone");
+    env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
+    let before = operation_heads(&dest);
+    let refs = git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let typo = env.j(&dest, &["push labell"]);
+    assert_eq!(typo.code, 1, "{}", typo.stderr);
+    assert!(typo.stderr.contains("unbound name `labell`"), "{}", typo.stderr);
+    assert!(typo.stderr.contains("Did you mean"), "{}", typo.stderr);
+    assert!(typo.stderr.contains("`label`"), "{}", typo.stderr);
+
+    let incomplete = env.j(&dest, &["push (label"]);
+    assert_eq!(incomplete.code, 3, "{}", incomplete.stderr);
+    assert!(incomplete.stderr.contains("expression: line 1:"), "{}", incomplete.stderr);
+    assert!(incomplete.stderr.contains("1 | (label"), "{}", incomplete.stderr);
+
+    let missing = env.j(&dest, &["push label"]);
+    assert_eq!(missing.code, 1, "{}", missing.stderr);
+    assert!(missing.stderr.contains("needs an argument of type Label"), "{}", missing.stderr);
+    assert!(missing.stderr.contains("j help label"), "{}", missing.stderr);
+    assert!(missing.stderr.contains("in label, from push label"), "{}", missing.stderr);
+    assert_eq!(operation_heads(&dest), before);
+    assert_eq!(git(&env.remote, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+}
+
+#[test]
+fn push_guidance_preserves_the_failing_definition_context() {
+    let env = setup();
+    env.j(&env.dir, &["init"]).ok();
+    let path = env.cfg.join("j/config.j");
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{}\nlabell = \\repo -> crash \"unbound name `labell`\"\n", config)).unwrap();
+    let out = env.j(&env.dir, &["push labell"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("in labell, from push labell"), "{}", out.stderr);
+    assert!(!out.stderr.contains("Did you mean"), "{}", out.stderr);
+}
+
+#[test]
 fn push_descriptions_cannot_impersonate_repository_creation() {
     let env = setup();
     let dest = env.dir.join("clone");
@@ -164,7 +440,12 @@ fn push_descriptions_cannot_impersonate_repository_creation() {
         ("init = []", "init", false),
     ] {
         std::fs::write(&path, format!("{}\n{}\n", config, definition)).unwrap();
+        let before = operation_heads(&dest);
         env.j(&dest, &[&format!("push {}", expression)]).ok();
+        if !changed {
+            assert_eq!(operation_heads(&dest), before, "empty selection created an operation");
+            continue;
+        }
         let ops = env.j(&dest, &["ops"]).ok().stdout;
         assert!(ops.lines().next().unwrap().ends_with(&format!("push {}", expression)), "{}", ops);
         if changed {
@@ -1124,29 +1405,37 @@ fn push_of_an_empty_list_pushes_nothing() {
     git(&work, &["add", "l.txt"]);
     git(&work, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "local unpushed"]);
     env.j(&work, &["init"]).ok();
-    env.j(&work, &["push []"]).ok();
+    let before_heads = operation_heads(&work);
+    let out = env.j(&work, &["push []"]).ok();
+    assert!(out.stderr.contains("No bookmarks selected; nothing published"), "{}", out.stderr);
+    assert!(out.stderr.contains("push (label \"feature\" here)"), "{}", out.stderr);
     assert_eq!(master(), before, "push [] moved the remote's master");
-    // it records one operation (§7.7)
-    let ops = env.j(&work, &["ops"]).ok().stdout;
-    assert!(ops.lines().next().unwrap_or("").ends_with(" []"), "{}", ops);
+    assert_eq!(operation_heads(&work), before_heads, "push [] recorded an operation");
 
     // a clone's git branch has no upstream
     let dest = env.dir.join("clone");
     env.j(&env.dir, &["clone", env.remote.to_str().unwrap(), dest.to_str().unwrap()]).ok();
     env.j(&dest, &["describe \"x\""]).ok();
-    env.j(&dest, &["push []"]).ok();
-    env.j(&dest, &["push (label \"nope\" (labelled \"zzz\"))"]).ok();
+    let before_heads = operation_heads(&dest);
+    let unavailable_git = env.dir.join("git-must-not-be-run");
+    env.j_env(&dest, &["push []"], &[("J_GIT", &unavailable_git)]).ok();
+    let out = env.j(&dest, &["push (label \"nope\" (labelled \"zzz\"))"]).ok();
+    assert!(out.stderr.contains("No bookmarks selected; nothing published"), "{}", out.stderr);
+    assert_eq!(operation_heads(&dest), before_heads);
     assert_eq!(master(), before);
     let refs = git(&env.remote, &["for-each-ref", "--format=%(refname)"]);
     assert_eq!(refs.trim(), "refs/heads/master");
 
-    // without origin it still exits 1
+    // No selection needs no remote, network connection, or operation.
     let plain = env.dir.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     env.j(&plain, &["init"]).ok();
-    let out = env.j(&plain, &["push []"]);
-    assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("no remote origin"), "{}", out.stderr);
+    let before_heads = operation_heads(&plain);
+    let out = env.j(&plain, &["push []"]).ok();
+    assert!(out.stderr.contains("No bookmarks selected; nothing published"), "{}", out.stderr);
+    let out = env.j(&plain, &["push relabel"]).ok();
+    assert!(out.stderr.contains("No bookmarks selected; nothing published"), "{}", out.stderr);
+    assert_eq!(operation_heads(&plain), before_heads);
 }
 
 #[test]

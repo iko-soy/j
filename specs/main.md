@@ -9,7 +9,7 @@ Nothing is implicit beyond the language itself. Every shape, builtin, and
 command is declared or defined in one user-owned file, `~/.config/j/config.j`,
 written in the language. The binary provides the language (its syntax, its
 operators and their fixities, its primitive kinds), the implementations of the
-declared builtins, ten reserved words, and the bridge to jj repositories.
+declared builtins, eleven reserved words, and the bridge to jj repositories.
 `j` does not require the `jj` binary; it uses jj's on-disk formats through
 jj-lib.
 
@@ -46,10 +46,13 @@ echo EXPRESSION | j
    usage and getting-started guide to stderr and exit 2. The guide points to
    `j help`, `j commands`, and commands for starting or inspecting a repository.
    It does not read or create configuration or open a repository.
-5. `--help` and `-h` are aliases for the reserved command `help` only when
-   they are the first whitespace-separated word (§1.1). There are no other
-   flags or trailing help flags: `j 'new --help'` is an expression whose
-   `--help` is a language comment, and `j '"--help"'` prints text.
+5. `--help` and `-h` as the first word alias `help` (§1.1). A separate
+   argument equal to either flag after the first argument requests help for
+   the first word, before repository access or evaluation: `j abandon --help`
+   is `j help abandon`. An initial `help`, `--help`, or `-h` followed by
+   another help flag opens general help. Other flags are not supported.
+   Language comments embedded within a single argument or stdin are unchanged:
+   `j 'new --help'` executes `new`, and `j '"--help"'` prints text.
 6. The expression is text: an argument that is not valid UTF-8 is a usage
    error (exit 2) naming it, and so is an expression on standard input that
    is not.
@@ -58,13 +61,14 @@ echo EXPRESSION | j
 
 Before the expression is parsed, its text is trimmed of leading and trailing
 whitespace and split on whitespace into words. If the first word is one of the
-ten reserved words below, the whole text is a reserved command. A first word
+eleven reserved words below, the whole text is a reserved command. A first word
 of `--help` or `-h` is treated as `help`.
 
 | command | operation |
 |---|---|
 | `help [NAME]` | show the command guide, or help for a reserved command or config name; §1.1.1 |
-| `commands [QUERY]` | list the vocabulary, optionally searching names, signatures, and comments; §1.1.1 |
+| `commands [QUERY]` | show common tasks, search the vocabulary, or use `all` for the full catalog; §1.1.1 |
+| `setup [NAME EMAIL]` | create the complete reference configuration, optionally setting identity; §6.1.1 |
 | `init` | create a repository in the current directory; §7.8 |
 | `clone URL [DIR]` | clone `URL` into `DIR` (default: the repository's name in `URL`); §7.8 |
 | `remote URL` | set the URL of the remote `origin`, creating it if absent; §7.8 |
@@ -75,8 +79,12 @@ of `--help` or `-h` is treated as `help`.
 | `ops` | print the operation log; §7.7 |
 
 For every reserved command except `push` and `commands`, the remaining words
-are literal arguments (no quoting, no escaping); a wrong number is a usage
-error (exit 2) and the language is not involved. `commands` takes the remaining
+are literal arguments, and the language is not involved. When the first
+shell argument is the command name, the remaining shell argument boundaries
+are preserved, so `j clone '/path/to/source repo' 'my project'` accepts both
+paths. A command supplied as one string or on stdin is split on whitespace;
+it has no additional quote or escape syntax. A wrong argument count is a
+usage error (exit 2). `commands` takes the remaining
 trimmed text as its optional search query, including spaces. For `push`, the
 remainder of the text is an expression, evaluated as in §1.2 steps 2–7 but
 against the repository as recorded, without snapshotting the working directory;
@@ -96,11 +104,18 @@ for that reserved command or for a name in the current configuration, including
 its signature when present and available documentation. `--help [NAME]` and
 `-h [NAME]` are equivalent to `help [NAME]`. These successful requests exit 0.
 An unknown name is a usage error (exit 2) with guidance to use `j commands`.
+`j help config` is a built-in topic showing the configuration path, identity
+setup, and repair instructions. It is available even with invalid configuration.
 
-`commands` lists the reserved commands and the vocabulary actually declared or
-defined in the current configuration, including custom definitions without
-signatures. `commands QUERY` searches the catalog case-insensitively by name,
-signature, and documentation comments. The catalog does not present an
+`commands` shows a concise catalog of common tasks and their commands.
+`commands all` lists the reserved commands and vocabulary actually declared
+or defined in the current configuration, including custom definitions without
+signatures. The concise catalog includes a bounded selection of custom
+definitions and points to the full list. `commands QUERY` searches the catalog case-insensitively by name,
+signature, documentation comments, and common task synonyms such as `commit`,
+`checkout`, and `branch`, ranking direct matches and everyday commands first.
+The `stash` query explains the save/new workflow when no custom `stash`
+definition exists. The catalog does not present an
 undeclared builtin as available merely because the binary implements it.
 
 General help and help for reserved commands do not depend on configuration and
@@ -131,7 +146,8 @@ resolves commit ids, snapshots the working directory, or records operations.
 7. If `v` is a function, apply it to `r`, once, and let `v` be the result.
 8. If `v` is a `Repo` (§4.4): if it equals the repository value *as loaded,
    before the snapshot of §7.4*, do nothing at all; otherwise persist it
-   (§7.5) and check out its focused commit's files (§7.4). Print nothing.
+   (§7.5) and check out its focused commit's files (§7.4). Print nothing to stdout;
+   interactive stderr reports the outcome and focus (§1.5).
    Exit 0.
 9. Otherwise display `v` (§5.1) on stdout. Persist nothing. Exit 0.
 
@@ -141,7 +157,7 @@ persist nothing, leave the working directory untouched, and exit 1.
 Step 7 applies exactly once. If the result of applying a function to `r` is
 again a function, that function is displayed, not applied again.
 
-Step 8's equality test means `j id` is a no-op when the working directory is
+Step 8's equality test means `j save` (the reference alias for `id`) is a no-op when the working directory is
 unchanged and records it when it is not: the snapshot makes `r` differ from
 the loaded value, and that difference is what gets persisted. The test may be
 implemented by comparing commit and tree hashes rather than values.
@@ -153,9 +169,11 @@ Two consequences worth knowing:
   what a rebase would produce without doing it. `validate` in the chain,
   `j tree . validate . rebase trunk`, additionally raises whatever
   persistence would refuse, so the preview is of something that could
-  actually be persisted.
-- **Do, then look.** `j squash` prints nothing. `j squash && j tree` is the
-  idiom; there is no flag for it.
+  actually be persisted. The reference `preview EDIT` is the convenient
+  form of `tree . validate . EDIT`: `j 'preview (rebase trunk)'`. Validation
+  alone returns a `Repo`, so `validate . EDIT` persists a changed result.
+- **Do, then look.** `j squash` reports the resulting focus on an interactive
+  terminal. `j squash && j tree` displays the whole tree; there is no flag for it.
 
 ### 1.3 Interrupts
 
@@ -215,6 +233,16 @@ or a nonempty `NO_COLOR`. Diagnostics use the stderr terminal; displayed
 values use stdout. Error prefixes are bright red, informational prefixes
 bright cyan, and interactive successful commands have a green checkmark.
 Color adds emphasis without replacing the text of errors or values.
+Successful edits report `Saved changes` or `No changes`, followed by the
+resulting focus's copyable, unique `@` prefix and first description line
+(`(no description)` when empty). Setup reports the effective author identity.
+Undo and redo identify the affected operation and restored focus.
+After a saved edit, conflicts newly introduced anywhere in the history and
+conflicts in the checked-out focus produce a warning with counts, paths, and
+resolution guidance. This warning remains visible when output is redirected;
+the operation still succeeds. Guidance identifies `j conflicts`, editing
+conflict markers, recording the resolution with `j save` or `j id`, and
+checking again. For another commit, navigate with `by` first.
 
 When both stdout and stderr are capable terminals, repository operations,
 configuration evaluation, and expression evaluation (including implicit application)
@@ -235,8 +263,10 @@ most 96 ms of total pacing. Its bytes and row order are unchanged. Plain
 text is written directly. `J_ANIMATIONS=never` (also `off`, `false`, or `0`,
 case-insensitive) disables all motion while retaining colors. Motion is
 also disabled by nonempty `NO_COLOR` or `CI`, `TERM=dumb`, or either output
-stream being redirected. Interactive success messages are omitted in
-these noninteractive modes; `J_ANIMATIONS` alone does not suppress them.
+stream being redirected. Success messages are omitted only when `CI` is
+nonempty or either output stream is redirected. `NO_COLOR` and `TERM=dumb`
+retain plain-text success messages on terminals; `J_ANIMATIONS` alone does
+not suppress them.
 Broken pipes and failed writes keep the behavior in §1.4.
 
 ---
@@ -573,11 +603,12 @@ as in §4.13.
 | `lookupContent p s` | `(head (filter (\e -> e.path == p) s)).content or blob ""`, with an index for ordinary paths. The full filter's errors and first-match behavior are preserved; the reference `contentAt` uses this builtin |
 | `subtreeCommits t` | every commit of the tree `t` (anything with `root` and `children`) in preorder, in time linear in its size: the value of `t.root :: (concat (map subtreeCommits t.children) or [])`. So it crashes only if `t` has no `root`, and a node whose `children` is not a list of values that have a `root` contributes only its own. The reference `commits` is this builtin (§9) |
 | `diff a b` | a unified diff from the text of `a` to the text of `b`, split into lines after each `\n` (not at a lone `\r`), no `---`/`+++` header lines, three lines of context, each hunk headed `@@ -s,n +s,n @@` with the first line and the number of lines it shows of each side, as `diff -u` writes it, a line that has no trailing newline followed by `\ No newline at end of file`; `""` if equal; crashes if either is not UTF-8 |
-| `difft p a b` | the output of difftastic comparing `a` to `b` as the file `p`; §7.10. Crashes if `difft` is not on `PATH` |
+| `difft p a b` | the output of difftastic comparing `a` to `b` as the file `p`, with a unified-diff fallback when the executable is absent; §7.10 |
+| `unrecorded repo` | paths changed between the invocation's loaded and snapshotted focus files; §7.4. Returns `[]` without snapshot context, including in a push expression |
 | `treeWith o r` | the history rendered as a tree with options record `o`; §7.11 |
 | `extract S v` | every subvalue of `v` that is an `S`; §4.12 |
 | `meta i` | `{ hash, author, email, time }` for the visible commit with change id `i`: its current git hash, author name and email, committer time. Crashes for an id with no stored commit (one minted in this program) |
-| `validate repo` | `repo` unchanged if persisting it would succeed; otherwise the crash persistence would raise (§7.5 steps 1–3, the root invariant of 4, and 6). Persistence runs the same checks |
+| `validate repo` | `repo` unchanged if persisting it would succeed; otherwise the crash persistence would raise (§7.5 steps 1–3, the root invariant of 4, and 6). A changed repository also checks the backend's author identity (§7.9). Persistence runs the same checks |
 
 ### 4.10 Ids: existing and new
 
@@ -741,6 +772,21 @@ display forms. Any other record is generic.
 | list of other scalars | `a, b, c` | same, wrapped at the terminal width |
 | any other list | `n items` | one block per item, separated by a blank line |
 
+Column tables use copyable shortest unique `@` prefixes for Id cells and
+show the actual contents of Text-list cells (such as bookmark names), not
+item counts. Empty Text-list cells are blank. On a terminal, columns are
+fitted to the available width; if minimum column widths cannot fit, rows
+are shown vertically with wrapped values. Piped tables retain untruncated
+cell contents. These presentation choices do not change `show` or values.
+
+The reference status record includes `unrecorded : [Path]` alongside
+`changed : [Path]`. The display labels `changed` as `in commit` to distinguish
+changes against the commit's parent from file edits since the last recording.
+Its empty fields read `No changes`, `No conflicts`, `No labels`,
+`No description`, and `All edits recorded` for empty `unrecorded`.
+Nonempty paths and labels remain visible. Presentation does not rename the
+underlying `changed` field. Older five-field status records remain displayable.
+
 An empty list of any kind prints `none` (dim) in block form and `0 …` in
 line form. Author and age in a `Commit` block are read from jj's commit
 metadata by id;
@@ -764,12 +810,13 @@ Examples:
 
 ```
 $ j status
-changed    src/lexer.rs
-           src/parser.rs
-conflicts  src/lexer.rs
-id         wqzt·kpqxmnrvyxskptlmzzzzabcd
-labels     feature
-message    wip
+in commit   src/lexer.rs
+            src/parser.rs
+conflicts   src/lexer.rs
+id          wqzt·kpqxmnrvyxskptlmzzzzabcd
+labels      feature
+message     wip
+unrecorded  All edits recorded
 
 $ j conflicts
 ⊗ wqzt  wip     feature
@@ -881,6 +928,14 @@ embedded reference `config.j` (§9) to that path as an editable starting point,
 readable and writable by its owner, and reports its path. An existing file is
 never overwritten, including when it cannot be read or contains invalid
 UTF-8; such errors exit 3.
+Configuration diagnostics identify the actual file; parse errors include the
+line number and a bounded source excerpt, with a pointer to `j help config`.
+Excerpts escape terminal controls and are capped at 160 display columns and
+characters, with an ellipsis when truncated. Expression parse errors, including
+push expressions, likewise identify their source line. Runtime diagnostics may
+add typo suggestions from the actual vocabulary, quoting examples for Text
+arguments, or missing-argument guidance derived from the command signature;
+they never retry an expression or change its meaning or exit code.
 An existing user configuration is not updated when the binary changes. The
 reference file is also distributed at `<prefix>/share/j/config.j`.
 
@@ -889,6 +944,23 @@ reserved-command help need no config, while the catalog and help for config
 names read it without evaluation. If it is missing they use the embedded
 reference in memory without writing a file. The empty-invocation guide does
 not read or write configuration either.
+
+### 6.1.1 Explicit setup
+
+`setup` creates the full embedded configuration at the configured path without
+opening a repository. With no arguments, it creates an editable default and
+reports the path and instructions to set `user`. With `NAME EMAIL`, it checks
+the identity rules of §6.2 and writes those values into the complete reference
+configuration, serialized as language text literals. Names containing spaces
+are supplied as a separately quoted shell argument.
+
+Setup never overwrites an existing file. Without identity arguments, an
+existing file reports its effective identity when valid, or guidance to
+edit it otherwise. With identity arguments, an
+existing file is a usage error (exit 2), with instructions to edit manually.
+Argument counts other than zero or two are usage errors. Creating the file
+also creates missing parent directories; exclusive creation preserves a file
+created concurrently by another invocation. No repository state is changed.
 
 ### 6.2 Validation
 
@@ -912,6 +984,13 @@ definition is what brings a builtin into scope; an implemented builtin that is
 not declared is simply unbound, and using it is a runtime crash.
 
 Definitions may reference each other in any order.
+
+Before authoring commits (`init`, `clone`, or an expression that persists a
+change), the effective identity must also have nonblank name/email and must
+not retain the shipped `Your Name` or `you@example.com` placeholders. Such
+identity failures are configuration errors (exit 3) and do not persist the
+edit. Inspection and unchanged expressions remain usable with placeholder
+identity, so users can inspect and repair existing repositories.
 
 ### 6.3 Definitions the interpreter reads
 
@@ -1148,6 +1227,14 @@ directory.
 
 Reserved commands never snapshot.
 
+The `unrecorded : Repo -> [Path]` builtin compares the invocation's loaded
+focus files with its snapshotted focus files, using the same path/content
+comparison as `changed`. The result describes the original working-copy
+edits, independently of changes an expression makes to its `Repo` argument.
+It returns `[]` when either snapshot context is absent, including reserved
+push evaluation. Read-only status and preview calls do not record these paths;
+`save = id` persists their snapshot through the normal expression path.
+
 ### 7.5 Persistence
 
 Given the loaded value `old` and the result `new`, one jj operation is
@@ -1287,6 +1374,13 @@ language: `fetch` and `push` are the only things that change them.
     creating it if absent;
   - `{ delete : Text }` — delete the bookmark of that name.
 
+  Before sending a valid push, inspect the working directory without saving
+  a snapshot or scan state. If it has unrecorded edits, print a warning to
+  stderr (also when piped or colors are disabled) explaining that push sends
+  recorded content only, and that `j id` followed by another push includes
+  those edits. The warning does not change the requested push's targets or
+  prevent deliberate publication of recorded commits.
+
   Duplicates are merged; two records with the same `name` and different
   effects are a crash. It is refused (exit 1, nothing pushed) if:
   - a `name` is not a valid git branch name, an `id` is not a visible commit
@@ -1330,21 +1424,24 @@ language: `fetch` and `push` are the only things that change them.
   bookmarks, and the refused push does not touch the label. After a
   successful push the labels reflect the new positions. It records one
   operation, even when it sends two git pushes. An empty list sends nothing
-  to the remote.
+  to the remote, records no operation, and always reports that no updates
+  were selected, with guidance for selecting a first bookmark. A nonempty
+  successful push reports published, deleted, and unchanged bookmark counts
+  on an interactive terminal, including an entirely unchanged selection.
   If the remote accepts some of the updates and rejects others, that
   operation records the accepted ones, whose labels move, and `push` exits 1
   naming the rejected bookmarks and any deletes it did not send.
 
 Only the remote named `origin` is supported in this version; `fetch` and
-`push` exit 1 with `j: no remote origin` when it is not configured.
+nonempty `push` exit 1 with `j: no remote origin` when it is not configured.
 Authentication is git's: the ssh agent for ssh URLs, git credential helpers
 for https, as jj-lib's git backend provides them; `j` adds no prompting.
 Bringing work up to date is a separate expression, e.g. `rebase trunk`.
 
 ### 7.7 Operations, undo, redo, and the lock
 
-Every persisting `j` program, and each of `fetch` and `push`, records exactly
-one jj operation, described by the expression or command text. A push's
+Every persisting `j` program, each `fetch`, and each nonempty `push` records
+exactly one jj operation, described by the expression or command text. A push's
 description includes its `push ` prefix, so an expression named `init` or
 `clone` cannot be mistaken for the operation that created the repository.
 Crashes record nothing, except as §7.5 step 7 says.
@@ -1385,8 +1482,10 @@ history crosses from older markers into current ones.
 Both refuse, before doing anything, if the working directory holds a change
 the focused commit does not, as a snapshot would find it (§7.4; a stale
 working copy holds none where the directory holds what was last checked out
-or what the commit has): `j: working copy has changes not in @; run \`j id\`
-to record them or discard them`. Both record their operation and then check
+or what the commit has). The refusal explains that `j id` preserves those
+edits in a new operation, and the next undo reverses that recording before
+reaching the earlier operation; users should inspect `j ops` and can recover
+the recording with redo. Both record their operation and then check
 out the restored focus, as persistence does (§7.5 step 7): a checkout that
 fails leaves the operation recorded, and `redo` or `undo` goes back.
 Undoing a `push` restores the recorded labels and leaves the remote untouched.
@@ -1439,7 +1538,9 @@ that state, §7.2 applies.
   it: the last component of `URL`'s path, a final `.git` component skipped,
   minus `.git` (`repo` for `/srv/repo/.git`, `host:repo.git` and
   `https://host/team/repo`); a `URL` that leaves no name, such as `/` or
-  `..`, is a usage error asking for `DIR`. It requires `user`.
+  `..`, is a usage error asking for `DIR`. It requires `user`. Interactive
+  confirmation includes a shell-quoted command to enter the clone directory
+  and run `j status`; cloning cannot change the caller's working directory.
 - **`remote URL`** sets the URL of `origin`, creating the remote if it does not
   exist. It does not fetch.
 
@@ -1470,7 +1571,16 @@ Commits are authored and committed as `user.name <user.email>` from
 `config.j` (§6.3). `j` reads no other configuration; jj-lib's settings object
 is constructed by `j` from `user` and fixed defaults. `init`, `clone`, and
 persistence exit 3 if `user` is missing or malformed, since that is a
-configuration error.
+configuration error. Authoring also refuses blank fields or the shipped
+`Your Name` / `you@example.com` placeholders (§6.2), with instructions to
+edit the actual config file. Read-only expressions and unchanged results
+remain available with placeholder identity. Successful interactive setup
+reports the configured identity; terminal control characters are escaped
+in confirmations without modifying the identity stored in commits.
+`validate` checks the author identity when its argument differs from the
+loaded repository, so validated previews report the same identity refusal
+before saving. That refusal is a catchable crash, like other `validate`
+failures. An unchanged `validate` and previews without `validate` remain usable.
 
 ### 7.10 External diff rendering
 
@@ -1491,15 +1601,24 @@ program.
 4. Return stdout as `Text`. A non-zero exit status is not an error (difftastic
    uses it to signal "differences found" under some options), so what a
    `difft` that fails printed, even nothing, is the result; a failure to
-   execute the program is a crash naming it.
+   execute the program because it is absent uses the fallback below. Other
+   launch failures are crashes naming the tool and the OS error.
+
+If the executable is absent (`NotFound`), return a unified diff with three
+lines of context and `--- a/PATH` / `+++ b/PATH` headers using the complete
+path `p`. Paths containing whitespace or control characters are quoted.
+Content that is not UTF-8 or contains NUL receives a binary-difference summary.
+Equal bytes produce empty output. This fallback is usable without installing
+another program or changing configuration.
 
 All rendering options are difftastic's own, set through its `DFT_*`
 environment variables. `j` adds no options of its own. `diff` remains
-available as a dependency-free unified diff; the reference `config.j` uses
-`difft` for display, so a user without difftastic edits one line.
+available as a dependency-free unified diff without path headers; the
+reference `config.j` uses `difft` for display and receives the automatic
+fallback when difftastic is absent.
 
-Packaging: difftastic is a runtime dependency; on Nix, wrap `j` with `difft`
-on its `PATH`.
+Packaging: difftastic is an optional runtime enhancement; on Nix, wrap `j`
+with `difft` on its `PATH`.
 
 ### 7.11 Tree rendering
 
@@ -1742,6 +1861,10 @@ Drop     = { delete : Label }         -- delete the remote's bookmark
 ------------------------------------------------------------------------------
 
 (.)     : (b -> c) -> (a -> b) -> a -> c   -- composition, right to left
+-- Return a value unchanged. As a repository command, `j id` records the
+-- snapshotted working-copy edits in the focused commit. `j save` is the
+-- descriptive alias in this reference config; inspections such as `j status`
+-- and `j tree` do not record those edits.
 id      : a -> a
 const   : a -> b -> a
 crash   : Text -> a                        -- abort the program with a message
@@ -1809,10 +1932,19 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 -- file ./a would, crashes, naming the path (§7.3).
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
+
+-- Paths edited in the working copy since the last recorded repository state.
+-- `j status` includes this list; `j save` records it in the focused commit.
+-- This measures the working copy, even when composed after an in-memory edit.
+unrecorded : Repo -> [Path]
+touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;
+                                           -- blobs compared by content id, bytes never read
 blob       : Text -> Blob                  -- a resolved regular file
 blobHex    : Text -> Text -> Blob          -- kind (regular/executable/symlink), hex bytes
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
+lookupCommit : Id -> Repo -> Commit       -- indexed commit lookup without moving the focus
+lookupContent : Path -> Snapshot -> Blob  -- indexed file content; an empty blob if absent
 subtreeCommits : a -> [Commit]             -- every commit of a tree in preorder, in one
                                            -- pass: what `commits` (below) is
 meta       : Id -> Meta                    -- git hash, author, email, committer time;
@@ -1822,9 +1954,11 @@ validate   : Repo -> Repo                  -- the repo unchanged, or the crash p
                                            -- focus). `tree . validate . rebase trunk` is an
                                            -- honest dry run.
 diff       : Blob -> Blob -> Text          -- unified diff from the first to the second
-difft      : Path -> Blob -> Blob -> Text  -- difftastic's rendering; needs difft on PATH.
-                                           -- Options via DFT_* environment variables.
-treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text }
+difft      : Path -> Blob -> Blob -> Text  -- difftastic when difft is on PATH; otherwise
+                                           -- unified diff with path headers and 3 context lines,
+                                           -- or a binary-files summary. DFT_* configures difft.
+treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text
+             , lanes : Int, author : Bool, date : Bool, files : Bool }
              -> Repo -> Text              -- the history as a tree; see the spec
 
 -- Every subvalue of a given shape, however deeply nested. A shape is a type
@@ -1910,6 +2044,9 @@ restrict = \m -> filter (\e -> m e.path)
 select : Fileset -> Snapshot -> Snapshot -> Snapshot            -- m from a, the rest from b
 select = \m a b -> restrict m a ++ restrict (neg m) b
 
+-- Unresolved paths in a snapshot. For the focus, inspect `j status` or
+-- `j conflicted . files`, edit the listed files to remove conflict markers,
+-- then run `j save` and inspect `j status` again. See `j help conflicts`.
 conflicted : Snapshot -> [Path]
 conflicted = \s -> map (.path) (filter (\e -> unresolved e.content) s)
 
@@ -1994,6 +2131,11 @@ minus = \a b repo -> let ys = b repo in filter (\i -> not (member i ys)) (a repo
 matching : (Commit -> Bool) -> Revset -> Revset
 matching = \p rs repo -> filter (\i -> p (commitAt i repo)) (rs repo)
 
+-- Find every commit with unresolved files. `j conflicts` lists candidates;
+-- use `j by @ID` to focus a mutable one, then `j status` to find its paths.
+-- Edit each conflicted file, remove the conflict markers, and run `j save`.
+-- Check `j status` again; `j clean` means the focus has no unresolved files,
+-- not that the working copy has no unrecorded edits. `j review` shows the diff.
 conflicts : Revset
 conflicts = matching (\c -> not (null (conflicted c.files))) all
 
@@ -2002,7 +2144,10 @@ firstOf : [Revset] -> Revset
 firstOf = \rss repo -> foldl (\acc rs -> if null acc then rs repo else acc) [] rss
 
 -- The main line: whichever of these names the remote has, first one wins.
--- Empty in a repository with no remote, in which case nothing is immutable.
+-- Empty when no fetched remote label is named main, master, or trunk;
+-- nothing is then immutable. Configure `j remote URL`, run `j fetch`, and
+-- inspect `j tree` to see remote labels. A remote with another default label
+-- needs this definition adjusted. Start work with j 'new . goto trunk'.
 trunk : Revset
 trunk = firstOf [%main %master %trunk]
 
@@ -2018,21 +2163,33 @@ immutable = ancestorsOf trunk
 -- Focusing. `goto` is the only place a revset must have exactly one member.
 ------------------------------------------------------------------------------
 
+-- Move to the single commit selected by a revset.
+-- Example: j 'goto %feature'; use j 'new . goto trunk' to start on the main line.
 goto : Revset -> Edit
 goto = \rs repo ->
   let is = rs repo
+      candidate = \i ->
+        let c = commitAt i repo
+            message = head (splitOn "\n" c.message)
+        in "  " ++ show i ++ "  " ++ (if message == "" then "(no description)" else message) ++ "\n"
   in if length is == 1
      then by (head is) repo
-     else crash ("expected one revision, got " ++ show (length is))
+     else if null is
+          then crash "expected one revision, got 0; no matching revision. Run `j tree` to inspect available revisions. For a missing remote label such as %main or trunk, configure `j remote URL`, run `j fetch`, and check the label names in `j tree`."
+          else crash ("expected one revision, got " ++ show (length is) ++ "\nCandidates:\n" ++ concat (map candidate (take 8 is)) ++ (if length is > 8 then "  More candidates: run `j tree`.\n" else "") ++ "Choose a mutable commit with `j by @ID`, or start a child with `j 'new . by @ID'`; replace @ID with a candidate above.")
 
 commitAt : Id -> Repo -> Commit
-commitAt = \i repo -> (by i repo).root
+commitAt = lookupCommit
 
 prev : Edit                                                     -- the parent
 prev = goto parents
 
-next : Edit                                                     -- the only child
-next = goto kids
+-- Move to the only child. At a tip, `j new` starts a child; when there are
+-- several children, choose one of the candidates with `j by @ID`.
+next : Edit
+next = \repo -> if null (kids repo)
+                then crash "next: this commit has no children; run `j new` to start a new child, or `j tree` to inspect the history"
+                else goto kids repo
 
 tip : Edit                                                      -- end of the line of only-children
 tip = \repo -> tip (next repo) or repo
@@ -2058,6 +2215,8 @@ eachChild = forEach kids
 guard : (Repo -> Bool) -> Edit                                  -- crash unless p holds
 guard = \p repo -> if p repo then repo else crash "guard"
 
+-- Whether the focused commit has no unresolved files. This says nothing
+-- about unrecorded working-copy edits; inspect those with `j unrecorded`.
 clean : Repo -> Bool
 clean = \repo -> null (conflicted repo.root.files)
 
@@ -2096,11 +2255,28 @@ rewrite = \f repo ->
 -- Commands
 ------------------------------------------------------------------------------
 
+-- Record the current working-copy edits in the focused commit.
+-- Example: j save; use j status first to inspect unrecorded paths.
+-- This is id restricted to a Repo: the final Repo result triggers recording.
+-- It does not publish anything. `j new` starts a child; `j id` records too.
+save : Edit
+save = id
+
+-- Preview an edit and validate that its result could be recorded, then show
+-- the resulting tree. This returns Text, so it records nothing.
+-- Examples: j 'preview squash'; j 'preview (rebase trunk)'.
+-- This helper is in the reference config. Existing custom configs are not
+-- upgraded automatically; add it there or use `tree . validate . EDIT`.
+preview : Edit -> Repo -> Text
+preview = \edit -> tree . validate . edit
+
 -- Set the message of the focused commit.
+-- Example: j 'describe "fix login"'
 describe : Text -> Edit
 describe = \m -> mapRoot (\c -> c { message = m })
 
 -- Start an empty child of the focus and move to it.
+-- Examples: j new; j 'describe "next change" . new'
 new : Edit
 new = \repo -> addChild (newCommit repo.root.files) repo
 
@@ -2108,6 +2284,7 @@ new = \repo -> addChild (newCommit repo.root.files) repo
 -- new empty commit on that parent becomes the focus (the parent may be
 -- immutable, and the focus never is). Refused for a commit the remote has a
 -- name for: push something else under that name first, or forget the name.
+-- Example: j abandon; validate a preview first with j 'preview abandon'.
 abandon : Edit
 abandon = \repo ->
   let c = repo.root
@@ -2117,17 +2294,20 @@ abandon = \repo ->
      else new (remove (eachChild (replayOnto p) repo))
 
 -- Push the files matching m from the focus down into its parent.
+-- Example: j 'contract (ext "rs")'
 contract : Fileset -> Edit
 contract = \m repo -> let a = repo.root
                       in at parents (rewrite (\q -> q { files = select m a.files q.files })) repo
 
 -- Fold the focus entirely into its parent; a new empty commit becomes the focus.
+-- Example: j squash; preview first with j 'preview squash'.
 squash : Edit
 squash = abandon . contract everything
 
 -- Push the files matching m from the focus up into a new child, which becomes
 -- the focus and inherits the old focus's children. Labels stay with the
 -- original commit, since they are the remote's.
+-- Example: j 'split (ext "rs")'; use (under ./src) to select a directory.
 split : Fileset -> Edit
 split = \m repo ->
   let a  = repo.root
@@ -2137,6 +2317,7 @@ split = \m repo ->
   in by x.id (repo { root = a', children = [{ root = x, children = repo.children }] })
 
 -- Move the focused subtree onto another commit. Returns to the moved commit.
+-- Example: j 'rebase trunk'; preview with j 'preview (rebase trunk)'.
 rebase : Revset -> Edit
 rebase = \rs repo ->
   let d = (goto rs repo).root
@@ -2147,6 +2328,7 @@ rebase = \rs repo ->
           in by me (attach x.subtree (by d.id x.rest))
 
 -- Apply the focused commit's change onto another commit, as a new child there.
+-- Example: j 'pick %main'
 pick : Revset -> Edit
 pick = \rs repo ->
   let ch = changeOf repo
@@ -2154,6 +2336,7 @@ pick = \rs repo ->
   in at rs (addChild (newCommit (replay t.files ch))) repo
 
 -- A new child of the focus that undoes the change of the given commit.
+-- Example: j 'backout %feature'
 backout : Revset -> Edit
 backout = \rs repo ->
   let ch = changeOf (goto rs repo)
@@ -2199,20 +2382,22 @@ entryAt = \p s -> filter (\e -> e.path == p) s
 
 -- The content at path p, or an empty file if absent.
 contentAt : Path -> Snapshot -> Blob
-contentAt = \p s -> (head (entryAt p s)).content or blob ""
+contentAt = lookupContent
 
 -- The paths a change touches.
 touched : Change -> [Path]
-touched = \ch ->
-  let paths = map (.path) ch.to ++ filter (\p -> not (member p (map (.path) ch.to))) (map (.path) ch.from)
-  in filter (\p -> entryAt p ch.to /= entryAt p ch.from) paths
+touched = touchedPaths
 
--- Paths whose content differs between the focus and its parent.
+-- Paths changed by the focused commit compared with its parent, including
+-- the working-copy snapshot. These can remain nonempty after `j save`;
+-- `j unrecorded` shows only working-copy edits not yet recorded.
+-- Example: j changed
 changed : Repo -> [Path]
 changed = \repo -> touched (changeOf repo)
 
--- What the focus changes, rendered by difftastic, one record per changed path.
--- Replace difft with (\p -> diff) to use the built-in unified diff instead.
+-- What the focus changes, one record per changed path. Uses difftastic when
+-- installed; a missing difft falls back to a unified diff with path headers
+-- and 3 context lines, or a binary-files summary.
 diffs : Repo -> [{ path : Path, diff : Text }]
 diffs = \repo ->
   let ch = changeOf repo
@@ -2220,23 +2405,30 @@ diffs = \repo ->
 
 -- The same, as one page of text. A Text result prints raw, so `j review` is
 -- readable in the terminal. A focus that changes nothing reads "no changes";
--- a difft that cannot be run (not on PATH) is a crash saying so, and
--- otherwise whatever difft prints, even nothing, is the page.
+-- missing difft uses the built-in unified diff (path headers, 3 context lines)
+-- or a binary-files summary. Other execution errors remain visible; an
+-- installed difft's output, even nothing, is the page.
+-- Example: j review; difftastic is optional.
 review : Repo -> Text
 review = \repo ->
   let ds = diffs repo
   in if null ds then "no changes\n" else concat (map (\d -> d.diff) ds)
 
--- A summary of the focus.
-status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path] }
+-- A summary of the focus. `changed` lists changes in the commit compared
+-- with its parent; `unrecorded` lists working-copy edits not yet recorded.
+-- Inspection does not record anything. Run `j save` to record those edits.
+-- Example: j status
+status : Repo -> { id : Id, message : Text, labels : [Label], changed : [Path], conflicts : [Path], unrecorded : [Path] }
 status = \repo ->
   { id        = repo.root.id
   , message   = repo.root.message
   , labels    = repo.root.labels
   , changed   = changed repo
-  , conflicts = conflicted repo.root.files }
+  , conflicts = conflicted repo.root.files
+  , unrecorded = unrecorded repo }
 
 -- A summary of every commit, top first, in preorder.
+-- Example: j log
 log : Repo -> [{ id : Id, message : Text, labels : [Label], focus : Bool }]
 log = \repo ->
   map (\c -> { id      = c.id
@@ -2247,11 +2439,21 @@ log = \repo ->
 
 -- The history as a tree. Edit these records to change what `j tree` shows.
 -- (The parentheses are required: `f { … }` would be a record update of f.)
+-- The default `tree` shows every commit, sorted by time (parents always above
+-- their children); `treeCompact` folds uninteresting runs and far subtrees.
+-- Examples: j tree; j 'tree . squash' previews an edit without saving it.
 tree : Repo -> Text
-tree = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto" })
+tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
+
+treeCompact : Repo -> Text
+treeCompact = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 
 treeFull : Repo -> Text
-treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto" })
+treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
+
+-- The full tree plus the extra data columns: date, files changed, author.
+treeData : Repo -> Text
+treeData = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4, author = true, date = true, files = true })
 ```
 
 ---
@@ -2297,9 +2499,10 @@ here is out of scope (§12). Nothing here uses the `jj` binary.
 **Getting a repository**
 
 ```
-$EDITOR ~/.config/j/config.j              -- set `user` once
+j setup 'Your actual name' you@your-domain.example -- create the full config once
 j init                                    -- new repository here, or adopt an existing .git
-j clone git@host:org/repo.git             -- or an existing one
+j clone git@host:org/repo.git project     -- or clone an existing one
+cd project                               -- after clone, enter its directory
 j remote git@host:org/repo.git            -- attach a remote to an init'd repo
 ```
 
@@ -2308,9 +2511,9 @@ j remote git@host:org/repo.git            -- attach a remote to an init'd repo
 ```
 j tree                                    -- the history as a tree, focus marked
 j treeFull                                -- the same with sizes, ages, authors, changed paths
-j status                                  -- id, message, labels, changed paths, conflicts of @
+j status                                  -- focus, in-commit changes, unrecorded edits, conflicts
 j log                                     -- every commit as a record
-j review                                  -- difftastic rendering of @ against its parent
+j review                                  -- difftastic or unified diff of @ against its parent
 j review . by @kpq                        -- the same for another commit, without moving
 j diffs                                   -- the same, one record per path
 j here                                    -- @'s id
@@ -2341,7 +2544,8 @@ j rebase trunk
 j guard clean . rebase trunk or id        -- only if it comes out clean
 j pick @kpq
 j 'forEach (descendantsOf here) (describe "wip")'
-j id                                      -- record the working directory, change nothing else
+j save                                    -- record the working directory, change nothing else
+j 'preview squash'                       -- validate and show the result without saving
 j tree . squash                           -- dry run: show the result, persist nothing
 j tree . validate . squash                -- the same, refusing what persistence would refuse
 j squash && j tree                        -- do, then look
@@ -2363,7 +2567,10 @@ j rebase trunk                            -- bring the stack up to date
 A rebase or fetch that conflicts leaves unresolved files in the affected
 commits. `j conflicts` lists them; `j by @…` moves there, which checks the
 files out with conflict markers; editing the files and running any persisting
-expression (`j id` at minimum) records the resolution.
+expression (`j save` or `j id` at minimum) records the resolution. Run
+`j status` to verify `No conflicts` and `All edits recorded` in the focus,
+and `j conflicts` to check the rest of the history. No continue command is
+needed.
 
 **Mistakes**
 
@@ -2378,7 +2585,7 @@ j redo
 Any definition added to `config.j` whose value is an `Edit` is a command:
 
 ```haskell
-pr = \n -> describe n . squash
+pr = \n -> describe n . prev . squash
 ```
 
 ```
@@ -2395,5 +2602,5 @@ language (blobs are opaque); workspaces other than the default; sparse working
 copies (refused; §7.1); remotes other than `origin`; tags; submodules and LFS;
 ignore rules beyond `.gitignore`; repairing a repository in which one change
 id has two visible commits (refused; §7.2); general command flags beyond the
-first-word `--help` and `-h` aliases; static typing. None of
+`--help` and `-h` discovery arguments; static typing. None of
 these are precluded by the design.

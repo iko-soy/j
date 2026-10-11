@@ -497,10 +497,45 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
         }
     }
     crate::terminal::external_stderr();
-    let out = cmd
-        .output()
-        .map_err(|_| Crash::new("difft: cannot execute `difft` (not on PATH)"))?;
+    let out = match cmd.output() {
+        Ok(out) => out,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return fallback_diff(comps, &a_bytes, &b_bytes);
+        }
+        Err(error) => return Err(Crash::new(format!("difft: cannot execute `difft`: {}", error))),
+    };
     Ok(Value::text(String::from_utf8_lossy(&out.stdout).to_string()))
+}
+
+/// Keep review usable without an optional renderer. Include the full path so
+/// concatenating several fallback diffs never loses which file each belongs to.
+fn fallback_diff(path: &[Value], a: &[u8], b: &[u8]) -> Result<Value, Crash> {
+    if a == b {
+        return Ok(Value::text(""));
+    }
+    let path = if path.is_empty() {
+        "file".to_string()
+    } else {
+        path.iter().map(|part| part.as_text().map(|s| s.to_string()))
+            .collect::<Result<Vec<_>, _>>()?.join("/")
+    };
+    let label = |prefix: &str| {
+        let label = format!("{prefix}/{path}");
+        if label.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\')) {
+            format!("{label:?}")
+        } else {
+            label
+        }
+    };
+    let old = label("a");
+    let new = label("b");
+    let body = match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(a), Ok(b)) if !a.contains('\0') && !b.contains('\0') => {
+            format!("--- {old}\n+++ {new}\n{}", unified_diff(a, b))
+        }
+        _ => format!("Binary files {old} and {new} differ\n"),
+    };
+    Ok(Value::text(body))
 }
 
 pub fn stdout_is_tty() -> bool {
